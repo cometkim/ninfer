@@ -31,6 +31,7 @@ model-index:
             value: 89.39
             name: Accuracy (0-shot, rule)
         source:
+          url: https://github.com/natpate/ninfer-windows
           name: NInfer EvalScope 1.9.0 (fork validation)
 ---
 
