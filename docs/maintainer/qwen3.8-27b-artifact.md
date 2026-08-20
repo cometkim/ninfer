@@ -878,5 +878,7 @@ the six resources.
 Greedy MTP3 acceptance was 156/256 tokens (positions 77/49/30) versus 152/256 (78/44/30) for the
 official artifact. On GPQA-Diamond under the registered serving profile (thinking, MTP=3, INT8 KV,
 262,144-token context; EvalScope 1.9.0, 0-shot, rule scoring, one sample, temperature 0.6, seed 42)
-the artifact scores **89.39% (177 / 198)**, tying the official NVFP4 artifact's published 88.38%
-(175 / 198); the 198-sample run averaged 129.3 tok/s with 11,927 output tokens per question.
+the artifact scores **89.39% (177 / 198)** against the official NVFP4 artifact's currently
+published 90.40% (179 / 198) - a two-question difference on single-sample runs, within the
+~2.1% sampling error at n=198; the 198-sample run averaged 129.3 tok/s with 11,927 output
+tokens per question.

@@ -137,7 +137,7 @@ seed 42):
 
 | Benchmark | This artifact | Official `nvfp4` (published) |
 |---|---:|---:|
-| GPQA-Diamond | 89.39% (177 / 198) | 88.38% (175 / 198) |
+| GPQA-Diamond | 89.39% (177 / 198) | 90.40% (179 / 198) |
 
 Memory and speed at the same settings (INT8 group-64 KV, CUDA Graphs):
 
