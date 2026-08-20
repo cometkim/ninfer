@@ -876,4 +876,7 @@ the six resources.
 | prefill tok/s (same run) | 913 | 703 |
 
 Greedy MTP3 acceptance was 156/256 tokens (positions 77/49/30) versus 152/256 (78/44/30) for the
-official artifact. Quality gating on GPQA-Diamond is reported in the fork's validation notes.
+official artifact. On GPQA-Diamond under the registered serving profile (thinking, MTP=3, INT8 KV,
+262,144-token context; EvalScope 1.9.0, 0-shot, rule scoring, one sample, temperature 0.6, seed 42)
+the artifact scores **89.39% (177 / 198)**, tying the official NVFP4 artifact's published 88.38%
+(175 / 198); the 198-sample run averaged 129.3 tok/s with 11,927 output tokens per question.
