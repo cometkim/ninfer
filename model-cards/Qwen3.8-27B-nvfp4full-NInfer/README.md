@@ -31,7 +31,7 @@ model-index:
             value: 89.39
             name: Accuracy (0-shot, rule)
         source:
-          url: https://github.com/natpate/ninfer-windows
+          url: https://github.com/cometkim/ninfer/tree/feat/qwen3.8-nvfp4full
           name: NInfer EvalScope 1.9.0 (fork validation)
 ---
 
@@ -41,7 +41,9 @@ This model card is the version-controlled source for
 [cometkim/Qwen3.8-27B-nvfp4full-NInfer](https://huggingface.co/cometkim/Qwen3.8-27B-nvfp4full-NInfer). The repository contains a fuller-NVFP4 weight profile of
 [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) in the native
 [NInfer](https://github.com/Neroued/ninfer) `.ninfer` artifact format, produced by the
-[natpate/ninfer-windows](https://github.com/natpate/ninfer-windows) fork. The artifact is intended
+[cometkim/ninfer](https://github.com/cometkim/ninfer) fork on its `feat/qwen3.8-nvfp4full` branch,
+which is based on the [natpate/ninfer-windows](https://github.com/natpate/ninfer-windows)
+Windows-build fork. The artifact is intended
 only for NInfer; it is not a Transformers checkpoint, Safetensors distribution, or GGUF file.
 
 This is a third weight profile for the existing `qwen3_8_27b` target — a peer of the official
@@ -101,9 +103,10 @@ which the converter validates structurally before copying a word.
 
 ## Requirements
 
-- the [natpate/ninfer-windows](https://github.com/natpate/ninfer-windows) fork on the
-  `feat/qwen3.8-nvfp4full` branch or later, which registers the `nvfp4full` weights profile
-  (upstream Neroued/ninfer does not yet know this identity);
+- the [cometkim/ninfer](https://github.com/cometkim/ninfer/tree/feat/qwen3.8-nvfp4full) fork
+  on the `feat/qwen3.8-nvfp4full` branch or later, which registers the `nvfp4full` weights
+  profile on top of the natpate/ninfer-windows Windows build (upstream Neroued/ninfer does not
+  yet know this identity);
 - Windows (MSVC + CUDA 13.1+, vcpkg for FFmpeg/curl) or 64-bit Linux (WSL2 validated);
 - NVIDIA GeForce RTX 5090 (`sm_120a`).
 
