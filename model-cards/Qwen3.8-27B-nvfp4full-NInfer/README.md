@@ -36,8 +36,8 @@ model-index:
 
 # Qwen3.8-27B fuller NVFP4 for NInfer
 
-This model card is the version-controlled source for the fork artifact
-`Qwen3.8-27B-nvfp4full-NInfer`. The repository contains a fuller-NVFP4 weight profile of
+This model card is the version-controlled source for
+[cometkim/Qwen3.8-27B-nvfp4full-NInfer](https://huggingface.co/cometkim/Qwen3.8-27B-nvfp4full-NInfer). The repository contains a fuller-NVFP4 weight profile of
 [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) in the native
 [NInfer](https://github.com/Neroued/ninfer) `.ninfer` artifact format, produced by the
 [natpate/ninfer-windows](https://github.com/natpate/ninfer-windows) fork. The artifact is intended
@@ -109,7 +109,7 @@ which the converter validates structurally before copying a word.
 ## Download and run
 
 ```bash
-hf download <this-repo> qwen3_8_27b_nvfp4full.ninfer --local-dir models
+hf download cometkim/Qwen3.8-27B-nvfp4full-NInfer qwen3_8_27b_nvfp4full.ninfer \n  --local-dir models
 
 ./build-win/apps/Release/ninfer.exe models/qwen3_8_27b_nvfp4full.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
