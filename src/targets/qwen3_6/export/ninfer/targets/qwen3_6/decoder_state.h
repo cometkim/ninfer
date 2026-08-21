@@ -12,6 +12,15 @@ namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::int32_t kKvQuantGroup = 64;
 
+// hq-e8-2b runtime KV codec tag: (DType::U8, quant_group == kKvHqQuantGroup)
+// identifies the fixed-budget E8+Rice format. Codes planes carry 64 bytes
+// per (token, kv_head) row; the metadata planes (viewed through the
+// *_scale_pages slots) carry 8 bytes = head_dim / kKvHqQuantGroup rows, so
+// the shared scale-plane extent formula keeps holding.
+inline constexpr std::int32_t kKvHqQuantGroup    = 32;
+inline constexpr std::int32_t kKvHqCodeRowBytes  = 64;
+inline constexpr std::int32_t kKvHqMetaRowBytes  = 8;
+
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;
     std::uint32_t mtp_layers                = 0;

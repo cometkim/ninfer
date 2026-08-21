@@ -688,6 +688,23 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile) {
     validate_target_options(device, options);
 
+    const auto kv_storage_dtype = [](KvCacheStorage storage) {
+        switch (storage) {
+        case KvCacheStorage::BFloat16: return DType::BF16;
+        case KvCacheStorage::Int8Group64: return DType::I8;
+        case KvCacheStorage::HqE8Rice2B: return DType::U8;
+        }
+        throw std::logic_error("unreachable KvCacheStorage");
+    };
+    const auto kv_storage_group = [](KvCacheStorage storage) {
+        switch (storage) {
+        case KvCacheStorage::BFloat16: return 0;
+        case KvCacheStorage::Int8Group64: return qwen3_6::kKvQuantGroup;
+        case KvCacheStorage::HqE8Rice2B: return qwen3_6::kKvHqQuantGroup;
+        }
+        throw std::logic_error("unreachable KvCacheStorage");
+    };
+
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
@@ -695,8 +712,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        .kv_dtype       = kv_storage_dtype(options.kv_cache),
+        .kv_quant_group = kv_storage_group(options.kv_cache),
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,
