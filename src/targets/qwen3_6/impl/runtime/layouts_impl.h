@@ -636,7 +636,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
+            // Instantiation memory grows with the captured split grids: the
+            // 128k envelope fits the flat 12 MiB bound, the 262k envelope
+            // measures ~26 MiB per batch.
+            const std::size_t per_batch =
+                impl->capacity <= 131072 ? 12ULL * kMiB : 48ULL * kMiB;
+            impl->graph_allowance_bytes = checked_mul(per_batch, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
