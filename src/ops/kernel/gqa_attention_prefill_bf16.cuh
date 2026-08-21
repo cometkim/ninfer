@@ -1,6 +1,6 @@
 #pragma once
 
-// BF16-only GQA prompt kernel. INT8 has an independent kernel body and resource
+// BF16-plane GQA prompt kernel. INT8 has an independent kernel body and resource
 // policy in gqa_attention_prefill_i8.cuh.
 //
 //   * Br = 64 query rows and Bc = 64 key columns per CTA tile.
@@ -14,12 +14,25 @@
 // then computes causal GQA attention for
 // every chunk token over all cached history using bottom-right causal alignment
 // (query row i attends to keys [0, base_pos + i]).
+//
+// Rotated frame instantiation (hq-e8-2b): the K/V planes passed by the launcher
+// are one-shot decoded bf16 scratch in the codec's rotated frame (linear
+// [kv_head][position] rows of `scratch_span` per head, see
+// gqa_attention_prefill_hq_scratch_kernel). Staged query rows are rotated into
+// that frame after landing (bf16 -> FWHT -> bf16, one rounding, same as the
+// fill-side rotation), and each output row is un-rotated once in FP32 in the
+// epilogue. Rotation is orthogonal, so scores and the online-softmax path are
+// frame-independent and stay on the shared code above.
 
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
+#include "ops/kernel/hq_codec.cuh"
 
 namespace ninfer::ops {
+
+inline constexpr std::size_t kGqaPrefillRotatedSmemBytes =
+    kGqaPrefillSmemBytes + kHqHeadDim;
 
 template <typename Geometry, typename Metadata>
 __global__ void gqa_attention_prefill_fill_bf16_kernel(
@@ -60,10 +73,13 @@ __global__ void gqa_attention_prefill_fill_bf16_kernel(
 // swizzled smem buffer. Keys beyond max_query_abs (which the causal mask always
 // drops) are zeroed so the padded/uninitialized cache tail never feeds NaNs into
 // the tensor cores. Mirrors FA's predicated K/V cp.async + Clear_OOB path.
-template <typename Geometry>
+// Rotated: `cache` is decoded linear scratch ([kv_head][position] rows of
+// scratch_span per head) and physical_page is ignored.
+template <typename Geometry, bool Rotated = false>
 __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* cache,
                                                      int kv_head, int k0, int max_query_abs,
-                                                     int physical_page, int tid) {
+                                                     int physical_page, int tid,
+                                                     std::int32_t scratch_span) {
     constexpr int D         = kGqaPrefillHeadDim;
     constexpr int Bc        = kGqaPrefillBc;
     constexpr int Threads   = kGqaPrefillThreads;
@@ -71,8 +87,9 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
     // Block base pointer computed once (int64); per-element offsets stay 32-bit.
     const __nv_bfloat16* cache_block =
-        cache + paged_kv_element_offset<kGqaPrefillHeadDim, Geometry::KVHeads>(
-                    physical_page, kv_head, k0 & kPagedKVPageMask, 0);
+        Rotated ? cache + (static_cast<std::int64_t>(kv_head) * scratch_span + k0) * D
+                : cache + paged_kv_element_offset<kGqaPrefillHeadDim, Geometry::KVHeads>(
+                              physical_page, kv_head, k0 & kPagedKVPageMask, 0);
     if (full_tile) {
 #pragma unroll
         for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
@@ -99,14 +116,15 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, bool Rotated = false>
 __launch_bounds__(kGqaPrefillThreads, 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const __nv_bfloat16* __restrict__ cache_k,
                                            const __nv_bfloat16* __restrict__ cache_v,
                                            Metadata metadata,
                                            const std::int32_t* __restrict__ positions, float scale,
-                                           __nv_bfloat16* __restrict__ out, std::int32_t width) {
+                                           __nv_bfloat16* __restrict__ out, std::int32_t width,
+                                           std::int32_t scratch_span) {
     constexpr int D             = kGqaPrefillHeadDim; // 256
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
     constexpr int Bc            = kGqaPrefillBc;      // 64 key cols
@@ -119,11 +137,15 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     constexpr unsigned FullMask = 0xffffffffu;
 
     static_assert(Threads == 128);
+    if constexpr (!Rotated) { (void)scratch_span; }
 
     extern __shared__ __align__(16) __nv_bfloat16 gqa_smem[];
     __nv_bfloat16* q_s = gqa_smem;     // [Br, D] swizzled
     __nv_bfloat16* k_s = q_s + Br * D; // [Bc, D] swizzled
     __nv_bfloat16* v_s = k_s + Bc * D; // [Bc, D] swizzled
+    // RHT diagonal for the Rotated instantiation (launcher passes the enlarged
+    // dynamic-smem size); untouched padding otherwise.
+    std::int8_t* signs = reinterpret_cast<std::int8_t*>(v_s + Bc * D);
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -222,8 +244,32 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     ninfer::ops::cp_commit();
-    gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
+    gqa_prefill_stage_kv<Geometry, Rotated>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page,
+                                            tid, scratch_span);
     ninfer::ops::cp_commit();
+
+    if constexpr (Rotated) {
+        // Rotate the staged q rows into the codec frame before any QK MMA reads
+        // them: bf16 -> FWHT(+signs) -> bf16, the same single rounding the fill
+        // side applies to K/V. Zero-padded tail rows stay exactly zero.
+        ninfer::ops::cp_wait<0>(); // Q landed (drains K(0) early; harmless)
+        __syncthreads();
+        hq_engine_signs_fill(signs);
+        __syncthreads();
+        for (int row = warp; row < Br; row += Threads / 32) {
+            float reg[8];
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                reg[s] = __bfloat162float(q_s[row * D + gqa_prefill_swz(row, s * 32 + lane)]);
+            }
+            hq_fwht256_sign(reg, signs, 0, lane);
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                q_s[row * D + gqa_prefill_swz(row, s * 32 + lane)] = __float2bfloat16(reg[s]);
+            }
+        }
+        __syncthreads();
+    }
 
     for (int kb = 0; kb < n_block_max; ++kb) {
         const int k0                 = kb * Bc;
@@ -233,8 +279,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
-        gqa_prefill_stage_kv<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
-                                       tid);
+        gqa_prefill_stage_kv<Geometry, Rotated>(v_s, cache_v, kv_head, k0, max_query_abs,
+                                                physical_page, tid, scratch_span);
         ninfer::ops::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
@@ -389,8 +435,9 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
             physical_page = next_physical_page;
-            gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
-                                           physical_page, tid);
+            gqa_prefill_stage_kv<Geometry, Rotated>(k_s, cache_k, kv_head, (kb + 1) * Bc,
+                                                    max_query_abs, physical_page, tid,
+                                                    scratch_span);
             ninfer::ops::cp_commit();
         }
 
@@ -431,21 +478,64 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     l0 = warp_sum<4>(l0, FullMask);
     l1 = warp_sum<4>(l1, FullMask);
 
-    // Normalize once per row via reciprocal-multiply instead of 128 IEEE divides.
-    const float inv_l0 = (l0 > 0.0f) ? __frcp_rn(l0) : 0.0f;
-    const float inv_l1 = (l1 > 0.0f) ? __frcp_rn(l1) : 0.0f;
+    if constexpr (Rotated) {
+        // Un-rotate each output row once in FP32, then normalize and store bf16.
+        // Each warp stages its 16 rows through a private 8-row FP32 window in
+        // the (now dead) K staging buffer — half the rows per pass — so the
+        // whole row is visible to the warp's shuffle-based inverse FWHT. Rows
+        // past `tokens` rotate with garbage accumulators but only the final
+        // store is predicated, keeping every shuffle converged.
+        float* epi = reinterpret_cast<float*>(k_s) + warp * 8 * D;
+        for (int half = 0; half < 2; ++half) {
 #pragma unroll
-    for (int n = 0; n < PVNt; ++n) {
-        const int d0    = n * 8 + 2 * lid;
-        const int qrow0 = q0 + warp_row0 + gid;
-        const int qrow1 = q0 + warp_row0 + gid + 8;
-        if (qrow0 < tokens) {
-            *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow0)]) =
-                pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+            for (int n = 0; n < PVNt; ++n) {
+                const int d0 = n * 8 + 2 * lid;
+                if (half == 0) {
+                    epi[gid * D + d0 + 0] = acc[n][0];
+                    epi[gid * D + d0 + 1] = acc[n][1];
+                } else {
+                    epi[gid * D + d0 + 0] = acc[n][2];
+                    epi[gid * D + d0 + 1] = acc[n][3];
+                }
+            }
+            __syncwarp(FullMask);
+            for (int i = 0; i < 8; ++i) {
+                // Row l lives on lanes [4i, 4i+4) of the C fragment; after the
+                // 4-lane butterfly reduction any of them holds the full sum.
+                const float lrow = __shfl_sync(FullMask, half == 0 ? l0 : l1, i << 2);
+                const float inv_l = (lrow > 0.0f) ? __frcp_rn(lrow) : 0.0f;
+                float reg[8];
+#pragma unroll
+                for (int s = 0; s < 8; ++s) { reg[s] = epi[i * D + s * 32 + lane]; }
+                hq_ifwht256_sign(reg, signs, 0, lane);
+                const int qrow = q0 + warp_row0 + half * 8 + i;
+                if (qrow < tokens) {
+#pragma unroll
+                    for (int s = 0; s < 8; ++s) {
+                        out[gqa_prefill_q_index<Geometry>(q_head, s * 32 + lane, qrow)] =
+                            __float2bfloat16(reg[s] * inv_l);
+                    }
+                }
+            }
+            __syncwarp(FullMask);
         }
-        if (qrow1 < tokens) {
-            *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow1)]) =
-                pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+    } else {
+        // Normalize once per row via reciprocal-multiply instead of 128 IEEE divides.
+        const float inv_l0 = (l0 > 0.0f) ? __frcp_rn(l0) : 0.0f;
+        const float inv_l1 = (l1 > 0.0f) ? __frcp_rn(l1) : 0.0f;
+#pragma unroll
+        for (int n = 0; n < PVNt; ++n) {
+            const int d0    = n * 8 + 2 * lid;
+            const int qrow0 = q0 + warp_row0 + gid;
+            const int qrow1 = q0 + warp_row0 + gid + 8;
+            if (qrow0 < tokens) {
+                *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow0)]) =
+                    pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+            }
+            if (qrow1 < tokens) {
+                *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow1)]) =
+                    pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+            }
         }
     }
     gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads);

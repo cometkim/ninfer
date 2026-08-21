@@ -50,7 +50,9 @@ struct GqaExecutionEnvelope {
  * Returns the transient arena capacity required for every W in the inclusive interval at one
  * exact logical batch size. Head geometry, cache dtype, and execution envelope are the fixed
  * implementation profile. Invalid profiles or intervals throw; a legal B=1 prompt route may
- * return zero.
+ * return zero for BF16/INT8 caches. The U8 (hq-e8-2b) prompt route additionally materializes
+ * the envelope's visible history into two rotated-frame BF16 scratch planes, so its capacity
+ * covers those planes sized by the envelope's key bound.
  */
 [[nodiscard]] std::size_t
 gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,

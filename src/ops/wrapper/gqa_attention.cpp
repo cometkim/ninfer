@@ -16,6 +16,11 @@ namespace {
 
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
+// hq-e8-2b planes: U8 codes [kHqCodeRowBytes, 64, Hkv, N] and U8 metadata
+// [kHqMetaRowBytes, 64, Hkv, N] carried in the *_scale_pages slots.
+constexpr std::int32_t kHqQuantGroup                 = 32;
+constexpr std::int32_t kHqCodeRowBytes               = 64;
+constexpr std::int32_t kHqMetaRowBytes               = 8;
 constexpr float kExpectedScale                       = 0.0625f;
 constexpr std::int32_t kSmallTChunkTokens            = 6;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
@@ -52,7 +57,7 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 && cache.dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -61,6 +66,9 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     }
     if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
+    }
+    if (cache.dtype == DType::U8 && cache.quant_group != kHqQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": hq-e8-2b KV cache must use quant_group 32");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -71,13 +79,16 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    const DType code_dtype = cache.dtype == DType::I8   ? DType::I8
+                             : cache.dtype == DType::U8 ? DType::U8
+                                                        : DType::BF16;
+    const std::int32_t code_leading = cache.dtype == DType::U8 ? kHqCodeRowBytes : kHeadDim;
     if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_pages, code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -91,6 +102,18 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
             throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
         }
+        return static_cast<std::uint32_t>(capacity);
+    }
+    if (cache.dtype == DType::U8) {
+        if (cache.k_scale_pages.dtype != DType::U8 || cache.v_scale_pages.dtype != DType::U8) {
+            throw std::invalid_argument(std::string(op) + ": invalid hq-e8-2b metadata dtype");
+        }
+        require_shape(cache.k_scale_pages, kHqMetaRowBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache k meta pages");
+        require_shape(cache.v_scale_pages, kHqMetaRowBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache v meta pages");
+        require_contiguous_nonnull(cache.k_scale_pages, op, "cache k meta pages");
+        require_contiguous_nonnull(cache.v_scale_pages, op, "cache v meta pages");
         return static_cast<std::uint32_t>(capacity);
     }
 
@@ -109,7 +132,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 && cache.dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -118,6 +141,9 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     }
     if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
+    }
+    if (cache.dtype == DType::U8 && cache.quant_group != kHqQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": hq-e8-2b KV cache must use quant_group 32");
     }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
@@ -129,13 +155,16 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    const DType code_dtype = cache.dtype == DType::I8   ? DType::I8
+                             : cache.dtype == DType::U8 ? DType::U8
+                                                        : DType::BF16;
+    const std::int32_t code_leading = cache.dtype == DType::U8 ? kHqCodeRowBytes : kHeadDim;
     if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_pages, code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -149,6 +178,18 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
             throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
         }
+        return static_cast<std::uint32_t>(capacity);
+    }
+    if (cache.dtype == DType::U8) {
+        if (cache.k_scale_pages.dtype != DType::U8 || cache.v_scale_pages.dtype != DType::U8) {
+            throw std::invalid_argument(std::string(op) + ": invalid hq-e8-2b metadata dtype");
+        }
+        require_shape(cache.k_scale_pages, kHqMetaRowBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache k meta pages");
+        require_shape(cache.v_scale_pages, kHqMetaRowBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache v meta pages");
+        require_contiguous_nonnull(cache.k_scale_pages, op, "cache k meta pages");
+        require_contiguous_nonnull(cache.v_scale_pages, op, "cache v meta pages");
         return static_cast<std::uint32_t>(capacity);
     }
 
@@ -355,7 +396,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
+    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) ||
+        batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
@@ -389,6 +431,24 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         const std::int32_t last = std::min(max_width, kMaximumVerifyTokens);
         for (std::int32_t width = min_width; width <= last; ++width) {
             maximum = std::max(maximum, exact_capacity(width));
+        }
+    }
+    // The U8 prompt route materializes the visible history into rotated-frame
+    // bf16 scratch (one plane per role, [head_dim, kv_heads, envelope keys])
+    // before the shared FA2 prompt kernel runs over it.
+    if (cache_dtype == DType::U8 && batch_size == 1 && max_width > kSmallTChunkTokens) {
+        bool routes_prompt = max_width > kMaximumVerifyTokens;
+        for (std::int32_t width = min_width;
+             !routes_prompt && width <= std::min(max_width, kMaximumVerifyTokens); ++width) {
+            routes_prompt = detail::gqa_attention_resolve_route(q_heads, width, 1, envelope) ==
+                            detail::GqaAttentionRoute::Prompt;
+        }
+        if (routes_prompt) {
+            const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
+            const std::size_t scratch   = 2 * static_cast<std::size_t>(envelope.max_visible_keys) *
+                                        static_cast<std::size_t>(kv_heads) * kHeadDim *
+                                        sizeof(std::uint16_t);
+            maximum = std::max(maximum, scratch);
         }
     }
     return maximum;
@@ -430,8 +490,15 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                                              partial.m, partial.l, out, stream);
         return;
     }
+    Tensor scratch_k;
+    Tensor scratch_v;
+    if (cache.dtype == DType::U8) {
+        const auto span = static_cast<std::int32_t>(envelope.max_visible_keys);
+        scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, span, 1});
+        scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, span, 1});
+    }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, out, stream);
+                                        cache, scratch_k, scratch_v, out, stream);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -480,7 +547,15 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                                                     partial.acc, partial.m, partial.l, out, stream);
         return;
     }
-    detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+    Tensor scratch_k;
+    Tensor scratch_v;
+    if (cache.dtype == DType::U8) {
+        const auto span = static_cast<std::int32_t>(envelope.max_visible_keys);
+        scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, cache.num_kv_heads, span, 1});
+        scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, cache.num_kv_heads, span, 1});
+    }
+    detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, scratch_k, scratch_v,
+                                                  out, stream);
 }
 
 } // namespace ninfer::ops

@@ -1,6 +1,6 @@
 // ninfer::ops - gqa_attention prompt-scale dispatcher: geometry, metadata, and
 // dtype route selection. The per-dtype kernels live in
-// gqa_attention_prefill_{bf16,i8}.cu; this TU instantiates no fat kernels.
+// gqa_attention_prefill_{bf16,i8,hq}.cu; this TU instantiates no fat kernels.
 #include "ops/launcher/gqa_attention.h"
 
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
@@ -14,7 +14,10 @@ namespace {
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_append_route(const Tensor& k, const Tensor& v, const Tensor& positions,
                               CacheView cache, Metadata metadata, cudaStream_t stream) {
-    if (cache.dtype == DType::I8) {
+    if (cache.dtype == DType::U8) {
+        gqa_prefill_append_hq<Geometry, CacheView, Metadata>(k, v, positions, cache, metadata,
+                                                             stream);
+    } else if (cache.dtype == DType::I8) {
         gqa_prefill_append_i8<Geometry, CacheView, Metadata>(k, v, positions, cache, metadata,
                                                              stream);
     } else {
@@ -25,9 +28,14 @@ void gqa_prefill_append_route(const Tensor& k, const Tensor& v, const Tensor& po
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_route(const Tensor& q, const Tensor& positions, float scale,
-                                 const CacheView& cache, Metadata metadata, Tensor& out,
+                                 const CacheView& cache, Metadata metadata,
+                                 const Tensor& scratch_k, const Tensor& scratch_v, Tensor& out,
                                  cudaStream_t stream) {
-    if (cache.dtype == DType::I8) {
+    if (cache.dtype == DType::U8) {
+        gqa_prefill_attention_hq<Geometry, CacheView, Metadata>(q, positions, scale, cache,
+                                                                metadata, scratch_k, scratch_v, out,
+                                                                stream);
+    } else if (cache.dtype == DType::I8) {
         gqa_prefill_attention_i8<Geometry, CacheView, Metadata>(q, positions, scale, cache,
                                                                 metadata, out, stream);
     } else {
@@ -39,16 +47,18 @@ void gqa_prefill_attention_route(const Tensor& q, const Tensor& positions, float
 } // namespace
 
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                           const PagedKVLayerView& cache, Tensor& out,
+                                           const PagedKVLayerView& cache, const Tensor& scratch_k,
+                                           const Tensor& scratch_v, Tensor& out,
                                            cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
     if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata, out,
-                                                   stream);
+        gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata, scratch_k,
+                                                   scratch_v, out, stream);
         return;
     }
-    gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, out, stream);
+    gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, scratch_k,
+                                               scratch_v, out, stream);
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -65,7 +75,8 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream) {
+                                 const Tensor& scratch_k, const Tensor& scratch_v, Tensor& out,
+                                 cudaStream_t stream) {
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -76,13 +87,13 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
         };
         if (q.ne[1] == Gqa27Geometry::QHeads) {
             gqa_prefill_append_route<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
-            gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata, out,
-                                                       stream);
+            gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata,
+                                                       scratch_k, scratch_v, out, stream);
             return;
         }
         gqa_prefill_append_route<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
-        gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, out,
-                                                   stream);
+        gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, scratch_k,
+                                                   scratch_v, out, stream);
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

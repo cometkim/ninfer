@@ -62,6 +62,18 @@ template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_append_i8(const Tensor& k, const Tensor& v, const Tensor& positions,
                            CacheView cache, Metadata metadata, cudaStream_t stream);
 
+// The hq-e8-2b routes run in their own translation units
+// (gqa_attention_prefill_hq_{27,35}.cu via gqa_attention_prefill_hq_routes.cuh);
+// the attention route owns the one-shot bf16 scratch planes.
+template <typename Geometry, typename CacheView, typename Metadata>
+void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float scale,
+                              const CacheView& cache, Metadata metadata, const Tensor& scratch_k,
+                              const Tensor& scratch_v, Tensor& out, cudaStream_t stream);
+
+template <typename Geometry, typename CacheView, typename Metadata>
+void gqa_prefill_append_hq(const Tensor& k, const Tensor& v, const Tensor& positions,
+                           CacheView cache, Metadata metadata, cudaStream_t stream);
+
 bool gqa_attention_uses_small_t(std::int32_t tokens);
 
 GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
@@ -87,13 +99,18 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& position
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream);
+                                 const Tensor& scratch_k, const Tensor& scratch_v, Tensor& out,
+                                 cudaStream_t stream);
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream);
 
+// scratch_k/scratch_v are the hq-e8-2b one-shot decode planes (BF16
+// [head_dim, kv_heads, span]); they must be empty tensors for every other
+// cache dtype.
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                           const PagedKVLayerView& cache, Tensor& out,
+                                           const PagedKVLayerView& cache, const Tensor& scratch_k,
+                                           const Tensor& scratch_v, Tensor& out,
                                            cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

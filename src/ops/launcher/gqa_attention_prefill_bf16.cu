@@ -17,20 +17,20 @@ void gqa_prefill_attention_bf16(const Tensor& q, const Tensor& positions, float 
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     static const cudaError_t attr_bf16 =
-        cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
+        cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata, false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
     CUDA_CHECK(attr_bf16);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                               static_cast<unsigned>(Geometry::QHeads), 1u);
-    gqa_attention_prefill_bf16_kernel<Geometry, Metadata>
+    gqa_attention_prefill_bf16_kernel<Geometry, Metadata, false>
         <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const __nv_bfloat16*>(cache_k.data),
             static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
             static_cast<const std::int32_t*>(positions.data), scale,
-            static_cast<__nv_bfloat16*>(out.data), tokens);
+            static_cast<__nv_bfloat16*>(out.data), tokens, 0);
     CUDA_CHECK(cudaGetLastError());
 }
 
