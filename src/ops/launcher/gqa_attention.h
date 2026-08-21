@@ -26,8 +26,8 @@ struct GqaSmallTInvocation {
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope);
 
-// Per-dtype kernel launch routes. Each route lives in its own translation unit
-// (gqa_attention_{decode,prefill}_<dtype>.cu) so the fat kernel families
+// Per-dtype small-T partial-kernel routes. Each route lives in its own
+// translation unit (gqa_attention_decode_<dtype>.cu) so the fat kernel families
 // compile in parallel; every route is explicitly instantiated there for both
 // geometries and both cache-input modes, so callers see declarations only.
 template <typename Geometry, typename CacheInput>
@@ -44,6 +44,17 @@ void gqa_small_t_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos
                             std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
                             Tensor& partial_l, cudaStream_t stream);
 
+template <typename Geometry, typename CacheInput>
+void gqa_small_t_partial_hq(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                            PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
+                            std::int32_t logical_capacity, std::int32_t splits,
+                            Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+                            cudaStream_t stream);
+
+// Per-dtype prompt/prefill routes, each compiled in its own translation unit
+// (gqa_attention_prefill_<dtype>.cu) and explicitly instantiated there for both
+// geometries, both cache views, and every metadata variant. The hq attention
+// route owns the one-shot bf16 scratch planes; every other route ignores them.
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_bf16(const Tensor& q, const Tensor& positions, float scale,
                                 const CacheView& cache, Metadata metadata, Tensor& out,
@@ -55,20 +66,17 @@ void gqa_prefill_attention_i8(const Tensor& q, const Tensor& positions, float sc
                               cudaStream_t stream);
 
 template <typename Geometry, typename CacheView, typename Metadata>
+void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float scale,
+                              const CacheView& cache, Metadata metadata, const Tensor& scratch_k,
+                              const Tensor& scratch_v, Tensor& out, cudaStream_t stream);
+
+template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_append_bf16(const Tensor& k, const Tensor& v, const Tensor& positions,
                              CacheView cache, Metadata metadata, cudaStream_t stream);
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_append_i8(const Tensor& k, const Tensor& v, const Tensor& positions,
                            CacheView cache, Metadata metadata, cudaStream_t stream);
-
-// The hq-e8-2b routes run in their own translation units
-// (gqa_attention_prefill_hq_{27,35}.cu via gqa_attention_prefill_hq_routes.cuh);
-// the attention route owns the one-shot bf16 scratch planes.
-template <typename Geometry, typename CacheView, typename Metadata>
-void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float scale,
-                              const CacheView& cache, Metadata metadata, const Tensor& scratch_k,
-                              const Tensor& scratch_v, Tensor& out, cudaStream_t stream);
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_append_hq(const Tensor& k, const Tensor& v, const Tensor& positions,

@@ -1,6 +1,6 @@
 // ninfer::ops - split-KV GQA small-T dispatcher: host split policy, dtype route
 // selection, and the split reducer. The per-dtype partial kernels live in
-// gqa_attention_decode_{bf16,i8}.cu.
+// gqa_attention_decode_{bf16,i8,hq}.cu.
 #include "ops/launcher/gqa_attention.h"
 
 #include "ops/common/math.h"
@@ -101,7 +101,8 @@ bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tok
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 6 ||
+        (cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -131,11 +132,15 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     }
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
-    // geometry inside the i8 route.
+    // geometry inside the i8 route; hq-e8-2b runs its single runtime-width kernel.
     if (cache.dtype == DType::I8) {
         gqa_small_t_partial_i8<Geometry, CacheInput>(
             q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
             splits, partial_acc, partial_m, partial_l, stream);
+    } else if (cache.dtype == DType::U8) {
+        gqa_small_t_partial_hq<Geometry, CacheInput>(q, input, pos, scale, cache, invocation,
+                                                     logical_capacity, splits, partial_acc,
+                                                     partial_m, partial_l, stream);
     } else {
         gqa_small_t_partial_bf16<Geometry, CacheInput>(q, input, pos, scale, cache, invocation,
                                                        logical_capacity, splits, partial_acc,
