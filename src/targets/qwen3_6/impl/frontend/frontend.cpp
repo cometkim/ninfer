@@ -395,20 +395,17 @@ std::size_t valid_utf8_prefix_size(std::string_view bytes) {
             codepoint = lead & 0x07U;
             minimum   = 0x10000U;
         } else {
-            throw std::invalid_argument("invalid UTF-8 leading byte in generated token stream");
+            return offset;
         }
         if (offset + length > bytes.size()) { return offset; }
         for (std::size_t index = 1; index < length; ++index) {
             const auto byte = static_cast<unsigned char>(bytes[offset + index]);
-            if ((byte & 0xc0U) != 0x80U) {
-                throw std::invalid_argument(
-                    "invalid UTF-8 continuation byte in generated token stream");
-            }
+            if ((byte & 0xc0U) != 0x80U) { return offset; }
             codepoint = (codepoint << 6U) | (byte & 0x3fU);
         }
         if (codepoint < minimum || (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
             codepoint > 0x10ffffU) {
-            throw std::invalid_argument("invalid UTF-8 codepoint in generated token stream");
+            return offset;
         }
         offset += length;
     }
@@ -554,10 +551,31 @@ void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& 
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
     state.utf8_pending += bytes;
-    const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
-    if (valid == 0) { return; }
-    const std::string text = state.utf8_pending.substr(0, valid);
-    state.utf8_pending.erase(0, valid);
+    std::string text;
+    for (;;) {
+        const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
+        if (valid > 0) {
+            text.append(state.utf8_pending, 0, valid);
+            state.utf8_pending.erase(0, valid);
+            continue;
+        }
+        if (state.utf8_pending.empty()) { break; }
+        // A plausible multi-byte lead with fewer bytes than it needs is a codepoint split
+        // across token batches: hold it for the next batch. Anything else is one invalid
+        // byte: publish the standard replacement character and resynchronize (terminalize
+        // uses the same replacement). Throwing here would let one degraded token fail the
+        // whole engine instead of one request's output stream.
+        const auto lead = static_cast<unsigned char>(state.utf8_pending.front());
+        const std::size_t need =
+            lead >= 0xf0U && lead <= 0xf4U   ? 4
+            : lead >= 0xe0U && lead <= 0xefU ? 3
+            : lead >= 0xc2U && lead <= 0xdfU ? 2
+                                             : 1;
+        if (need > 1 && state.utf8_pending.size() < need) { break; }
+        state.utf8_pending.erase(0, 1);
+        text += "ï¿½";
+    }
+    if (text.empty()) { return; }
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 
