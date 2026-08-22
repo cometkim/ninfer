@@ -12,7 +12,7 @@
 // Pipeline per row x (dim 256), all in the rotated frame:
 //   1. norm = ||x||;  u = FWHT256(x . signs) * sqrt(256) / norm
 //      (per-scalar variance ~1; signs are the fixed engine-global RHT
-//      diagonal, K-role and V-role vectors of 256 signed bytes)
+//      diagonal, one vector of 256 signed bytes shared by both roles)
 //   2. y = nearest point of 2*E8 for alpha * u  (both cosets tried, mod-4
 //      sum parity fixed by the least-cost single +/-2 flip; this is the
 //      exact Conway-Sloane decoder - the half-integer coset is NOT collapsed)
@@ -46,6 +46,12 @@
 // are computed by the attention/fill kernels via paged_kv_element_offset
 // with the extents below; this header stays pointer-free so it builds and
 // qualifies standalone.
+//
+// Stored-stream invariant (load-bearing for the group decoder): every code
+// byte at or past ceil(used/8) is ZERO (the bit writer zero-initializes its
+// buffer and the terminal fallback writes 64 zero-tail bytes), so decoders
+// may read all 16 words of a row and treat bits past `used` as unary-guard
+// padding without consulting `used` for word bounds.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -601,7 +607,8 @@ __device__ __forceinline__ void hq_decode_row_thread(const std::uint8_t* codes,
 // ---- 8-lane cooperative row decode -----------------------------------------
 //
 // Eight lanes decode one row. Each lane owns one 64-bit window of the Rice
-// stream (one coalesced u64 load), and the group resolves symbol boundaries
+// stream (two u32 loads composed MSB-first), and the group resolves symbol
+// boundaries
 // with a speculative scan plus a sequential fixup chain: window j's parse
 // depends only on the entry state handed over by window j-1, so the critical
 // path is eight ~26-symbol window scans and their shuffles instead of one
