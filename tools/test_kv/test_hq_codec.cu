@@ -451,7 +451,11 @@ int main() {
         check(row_bad == 0, "oracle rows exceed 2% relative-L2 error (zeroed or mis-scaled)");
         check(tie_flips <= 8 * kOracleSample / 200,
               "FP32/FP64 quantizer tie flips exceeded the calibration budget");
-        check(cos > 0.93, "2 bits/dim original-frame reconstruction quality collapsed");
+        // Nominal pooled cosine at alpha = 1.45 is ~0.938 (error orthogonal to signal,
+        // energy ratio 1.137); the 0.93 floor leaves ~0.008 of margin as a tripwire.
+        check(cos > 0.93,
+              "original-frame cosine fell below 0.93 (nominal ~0.938 at alpha 1.45): 2 "
+              "bits/dim reconstruction quality changed");
         check(esc_count >= 50 && esc_count <= 200,
               "escalation count left its corpus band (rescue behavior changed)");
         check(esc_oracle_bad == 0 && esc_row_bad == 0,
