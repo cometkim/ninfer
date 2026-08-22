@@ -115,9 +115,9 @@ __global__ void gqa_attention_prefill_fill_hq_kernel(const __nv_bfloat16* k,
 
 // Decode the prompt call's entire visible history [0, positions[0] + valid)
 // for every kv head and both roles into contiguous bf16 scratch rows in the
-// ROTATED frame: scratch[role][kv_head][position][256]. FOUR THREADS per row
-// (one 64-symbol segment each, starting at the encoder-recorded offsets in
-// meta[5..7]); every query tile of the shared FA2 prompt kernel then reads
+// ROTATED frame: scratch[role][kv_head][position][256]. EIGHT LANES per row
+// (the cooperative group decoder: unary fast path with prefix-sum symbol
+// boundaries); every query tile of the shared FA2 prompt kernel then reads
 // decoded bf16 rows instead of each re-walking the serial Rice stream over
 // its causal prefix.
 //
@@ -134,9 +134,9 @@ __global__ void gqa_attention_prefill_hq_scratch_kernel(
                              static_cast<std::int32_t>(threadIdx.x);
     const std::int32_t keys_total = positions[0] + metadata.valid_tokens(width);
     const std::int32_t units      = keys_total * Geometry::KVHeads * 2;
-    const std::int32_t unit = tid >> 2;
+    const std::int32_t unit = tid >> 3;
     if (unit >= units) { return; }
-    const std::int32_t segment = tid & 3;
+    const std::int32_t lane8 = tid & 7;
     const std::int32_t pos  = unit / (Geometry::KVHeads * 2);
     const std::int32_t rem  = unit - pos * (Geometry::KVHeads * 2);
     const std::int32_t head = rem >> 1;
@@ -144,9 +144,9 @@ __global__ void gqa_attention_prefill_hq_scratch_kernel(
     const std::int32_t* table = metadata.block_table();
     __nv_bfloat16* dst = (role_v ? scratch_v : scratch_k) +
                         (static_cast<std::int64_t>(head) * span + pos) * kHqHeadDim;
-    hq_decode_row_segment(hq_row_codes<Geometry>(role_v ? codes_v : codes_k, table, head, pos),
-                          hq_row_meta<Geometry>(role_v ? meta_v : meta_k, table, head, pos), dst,
-                          segment);
+    hq_decode_row_group(hq_row_codes<Geometry>(role_v ? codes_v : codes_k, table, head, pos),
+                        hq_row_meta<Geometry>(role_v ? meta_v : meta_k, table, head, pos), dst,
+                        lane8);
 }
 
 inline constexpr std::size_t kGqaHqFillSmemBytes =

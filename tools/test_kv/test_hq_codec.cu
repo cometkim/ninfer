@@ -34,6 +34,12 @@ void check(bool ok, const char* msg) {
     }
 }
 
+double bf16_bits_to_float(unsigned short bits) {
+    __nv_bfloat16 v;
+    *reinterpret_cast<unsigned short*>(&v) = bits;
+    return __bfloat162float(v);
+}
+
 // ---- device wrappers --------------------------------------------------------
 
 __global__ void e8_quantize_kernel(const float* x, int* y, int n_blocks) {
@@ -70,14 +76,14 @@ __global__ void decode_rows_kernel(const std::uint8_t* codes, const std::uint8_t
                          out + static_cast<std::size_t>(i) * kHqHeadDim);
 }
 
-__global__ void decode_rows_segment_kernel(const std::uint8_t* codes, const std::uint8_t* meta,
-                                           __nv_bfloat16* out, int n_rows) {
+__global__ void decode_rows_group_kernel(const std::uint8_t* codes, const std::uint8_t* meta,
+                                         __nv_bfloat16* out, int n_rows) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row = i >> 2;
+    const int row = i >> 3;
     if (row >= n_rows) { return; }
-    hq_decode_row_segment(codes + static_cast<std::size_t>(row) * kHqRowBudgetBytes,
-                          meta + static_cast<std::size_t>(row) * kHqMetaBytes,
-                          out + static_cast<std::size_t>(row) * kHqHeadDim, i & 3);
+    hq_decode_row_group(codes + static_cast<std::size_t>(row) * kHqRowBudgetBytes,
+                        meta + static_cast<std::size_t>(row) * kHqMetaBytes,
+                        out + static_cast<std::size_t>(row) * kHqHeadDim, i & 7);
 }
 
 // ---- host oracles --------------------------------------------------------------
@@ -226,49 +232,59 @@ int main() {
         cudaDeviceSynchronize();
         decode_rows_kernel<<<(kRows + 255) / 256, 256>>>(d_codes, d_meta, d_out2, kRows);
         cudaDeviceSynchronize();
-        // The 4-way segment decoder (engine shape) must be bit-identical to
-        // the sequential reference decoder on every row.
-        __nv_bfloat16* d_out3;
-        cudaMalloc(&d_out3, hrows_bf.size() * 2);
-        decode_rows_segment_kernel<<<(kRows * 4 + 255) / 256, 256>>>(d_codes, d_meta, d_out3,
-                                                                     kRows);
+        // The 8-lane cooperative decoder (the production row decoder) must
+        // be bit-identical to the sequential reference on every row.
+        __nv_bfloat16* d_out4;
+        cudaMalloc(&d_out4, hrows_bf.size() * 2);
+        decode_rows_group_kernel<<<(kRows * 8 + 255) / 256, 256>>>(d_codes, d_meta, d_out4,
+                                                                   kRows);
         cudaDeviceSynchronize();
 
         std::vector<std::uint8_t> hmeta(static_cast<std::size_t>(kRows) * kHqMetaBytes);
-        std::vector<__nv_bfloat16> hout(kRows * kHqHeadDim);
-        std::vector<__nv_bfloat16> hout2(kRows * kHqHeadDim);
-        std::vector<__nv_bfloat16> hout3(kRows * kHqHeadDim);
+        std::vector<std::uint16_t> hout(kRows * kHqHeadDim);
+        std::vector<std::uint16_t> hout2(kRows * kHqHeadDim);
+        std::vector<std::uint16_t> hout4(kRows * kHqHeadDim);
         cudaMemcpy(hmeta.data(), d_meta, hmeta.size(), cudaMemcpyDeviceToHost);
         cudaMemcpy(hout.data(), d_out, kRows * kHqHeadDim * 2, cudaMemcpyDeviceToHost);
         cudaMemcpy(hout2.data(), d_out2, kRows * kHqHeadDim * 2, cudaMemcpyDeviceToHost);
-        cudaMemcpy(hout3.data(), d_out3, kRows * kHqHeadDim * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hout4.data(), d_out4, kRows * kHqHeadDim * 2, cudaMemcpyDeviceToHost);
 
-        // Budget invariant + determinism + segment==sequential equivalence.
-        int budget_bad = 0, nondet = 0, seg_bad = 0;
+        // Budget invariant + determinism + group equivalence.
+        int budget_bad = 0, nondet = 0, grp_bad = 0;
         for (int r = 0; r < kRows; ++r) {
             const unsigned bits = hmeta[r * 8 + 3] | (unsigned(hmeta[r * 8 + 4] & 3) << 8);
             if (bits == 0 || bits > 512u) { ++budget_bad; }
             for (int d = 0; d < kHqHeadDim; ++d) {
-                if (*reinterpret_cast<const unsigned short*>(&hout[r * kHqHeadDim + d]) !=
-                    *reinterpret_cast<const unsigned short*>(&hout2[r * kHqHeadDim + d])) {
+                if (hout[r * kHqHeadDim + d] != hout2[r * kHqHeadDim + d]) {
                     ++nondet;
                     break;
                 }
             }
             for (int d = 0; d < kHqHeadDim; ++d) {
-                if (*reinterpret_cast<const unsigned short*>(&hout[r * kHqHeadDim + d]) !=
-                    *reinterpret_cast<const unsigned short*>(&hout3[r * kHqHeadDim + d])) {
-                    ++seg_bad;
+                if (hout[r * kHqHeadDim + d] != hout4[r * kHqHeadDim + d]) {
+                    ++grp_bad;
                     break;
                 }
             }
         }
         std::printf("[3] budget invariant bad rows: %d, nondeterministic rows: %d, "
-                    "segment-mismatched rows: %d\n",
-                    budget_bad, nondet, seg_bad);
+                    "group-mismatched rows: %d\n",
+                    budget_bad, nondet, grp_bad);
         check(budget_bad == 0, "row exceeded the 512-bit budget");
         check(nondet == 0, "decode is not deterministic");
-        check(seg_bad == 0, "4-way segment decode differs from sequential decode");
+        check(grp_bad == 0, "8-lane group decode differs from sequential decode");
+
+        // Stored-format invariant: a row that fits the 512-bit budget at all
+        // fits at k=0 with fewer-or-equal bits, and the encoder visits k=0
+        // first with strict <, so every stored row must carry Rice k = 0.
+        // The group decoder's unary fast path relies on this; k > 0 rows can
+        // only come from a foreign encoder and take the general-k fallback.
+        int k_nonzero = 0;
+        for (int r = 0; r < kRows; ++r) {
+            if ((hmeta[r * 8 + 2] & 0x0F) != 0) { ++k_nonzero; }
+        }
+        std::printf("[3b] rows with Rice k != 0: %d\n", k_nonzero);
+        check(k_nonzero == 0, "encoder stored a row with Rice k != 0 (breaks the k=0 proof)");
 
         // Oracle comparison on a sample (the exhaustive FP64 nearest-point
         // is ~400k evaluations per word; full-corpus would run for hours).
@@ -309,8 +325,8 @@ int main() {
                     e8_bf_nearest(x8, y);
                     for (int j = 0; j < 8; ++j) {
                         const double expected = y[j] * inv;
-                        const double got =
-                            __bfloat162float(hout[r * kHqHeadDim + w * 8 + j]);
+                        const double got = bf16_bits_to_float(
+                            hout[r * kHqHeadDim + w * 8 + j]);
                         if (std::fabs(got - expected) >
                             0.02 * std::fabs(expected) + 0.01 + 2.5 * lattice_step) {
                             ++oracle_bad;
@@ -326,7 +342,7 @@ int main() {
             // and compare to the source row.
             std::vector<double> g_rot(kHqHeadDim);
             for (int d = 0; d < kHqHeadDim; ++d) {
-                g_rot[d] = __bfloat162float(hout[r * kHqHeadDim + d]);
+                g_rot[d] = bf16_bits_to_float(hout[r * kHqHeadDim + d]);
             }
             host_fwht(g_rot.data(), kHqHeadDim);
             for (int d = 0; d < kHqHeadDim; ++d) {
@@ -351,7 +367,113 @@ int main() {
         cudaFree(d_meta);
         cudaFree(d_out);
         cudaFree(d_out2);
-        cudaFree(d_out3);
+        cudaFree(d_out4);
+    }
+
+    // ---- 6. Synthetic Rice k > 0 rows: general-k fallback ------------------
+    // The encoder never stores k > 0 (see [3b]), so these streams are written
+    // by a host mirror of HqBitWriter (u32 values accumulated MSB-first,
+    // stored little-endian) to exercise the group decoder's general-k branch
+    // (remainder extraction, cross-window symbols, the unary-guard tail)
+    // against the sequential reference.
+    {
+        struct HostBitWriter {
+            std::uint32_t buf[kHqRowBudgetBytes / 4] = {0};
+            std::uint32_t cur = 0;
+            int cur_bits = 0, written = 0;
+            void put(std::uint32_t v, int n) {
+                for (int i = n - 1; i >= 0; --i) {
+                    cur = (cur << 1) | ((v >> i) & 1u);
+                    if (++cur_bits == 32) {
+                        buf[written++] = cur;
+                        cur            = 0;
+                        cur_bits       = 0;
+                    }
+                }
+            }
+            void put_rice(std::uint32_t z, std::uint32_t k) {
+                std::uint32_t q = z >> k;
+                while (q >= 32) {
+                    put(0u, 31);
+                    q -= 31;
+                }
+                put(1u, q + 1);
+                if (k > 0) { put(z & ((1u << k) - 1u), static_cast<int>(k)); }
+            }
+            int flush() {
+                if (cur_bits > 0) {
+                    buf[written++] = cur << (32 - cur_bits);
+                    cur            = 0;
+                    cur_bits       = 0;
+                }
+                return written * 32;
+            }
+        };
+
+        constexpr int kSynRows = 96;
+        std::mt19937 srng2(0xC0FFEE);
+        std::vector<std::uint8_t> syn_codes(static_cast<std::size_t>(kSynRows) * kHqRowBudgetBytes, 0);
+        std::vector<std::uint8_t> syn_meta(static_cast<std::size_t>(kSynRows) * kHqMetaBytes, 0);
+        for (int r = 0; r < kSynRows; ++r) {
+            HostBitWriter w;
+            const std::uint32_t k = 1 + (r % 3);  // k in {1, 2, 3}
+            // k=1 rows can hold 256 tiny symbols; k>=2 rows exhaust the budget
+            // early, which exercises the guarded tail on both decoders.
+            std::uniform_int_distribution<int> zdist(0, static_cast<int>(1u << (k + 2)));
+            int symbols = 0;
+            while (symbols < kHqHeadDim) {
+                const int budget_left =
+                    kHqRowBudgetBytes * 8 - (w.written * 32 + w.cur_bits);
+                if (budget_left < 2 + static_cast<int>(k) + 36) { break; }
+                w.put_rice(static_cast<std::uint32_t>(zdist(srng2)), k);
+                ++symbols;
+            }
+            int used = w.flush();
+            if (r % 16 == 15) {
+                // A few all-zero-stream rows with used > 0: every symbol hits
+                // the unary guard on the sequential path.
+                w = HostBitWriter();
+                used = 256;
+            }
+            const std::uint16_t norm_bits = 0x3C00;  // 1.0f in fp16
+            syn_meta[r * 8 + 0] = static_cast<std::uint8_t>(norm_bits & 0xFF);
+            syn_meta[r * 8 + 1] = static_cast<std::uint8_t>(norm_bits >> 8);
+            syn_meta[r * 8 + 2] = static_cast<std::uint8_t>(k);
+            syn_meta[r * 8 + 3] = static_cast<std::uint8_t>(used & 0xFF);
+            syn_meta[r * 8 + 4] = static_cast<std::uint8_t>((used >> 8) & 3);
+            std::memcpy(syn_codes.data() + r * kHqRowBudgetBytes, w.buf, kHqRowBudgetBytes);
+        }
+
+        std::uint8_t* d_sc; std::uint8_t* d_sm;
+        __nv_bfloat16 *d_so, *d_so2;
+        cudaMalloc(&d_sc, syn_codes.size());
+        cudaMalloc(&d_sm, syn_meta.size());
+        cudaMalloc(&d_so, static_cast<std::size_t>(kSynRows) * kHqHeadDim * 2);
+        cudaMalloc(&d_so2, static_cast<std::size_t>(kSynRows) * kHqHeadDim * 2);
+        cudaMemcpy(d_sc, syn_codes.data(), syn_codes.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_sm, syn_meta.data(), syn_meta.size(), cudaMemcpyHostToDevice);
+        decode_rows_kernel<<<(kSynRows + 255) / 256, 256>>>(d_sc, d_sm, d_so, kSynRows);
+        cudaDeviceSynchronize();
+        decode_rows_group_kernel<<<(kSynRows * 8 + 255) / 256, 256>>>(d_sc, d_sm, d_so2, kSynRows);
+        cudaDeviceSynchronize();
+        std::vector<std::uint16_t> so(kSynRows * kHqHeadDim), so2(kSynRows * kHqHeadDim);
+        cudaMemcpy(so.data(), d_so, so.size() * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(so2.data(), d_so2, so2.size() * 2, cudaMemcpyDeviceToHost);
+        int syn_bad = 0;
+        for (int r = 0; r < kSynRows; ++r) {
+            for (int d = 0; d < kHqHeadDim; ++d) {
+                if (so[r * kHqHeadDim + d] != so2[r * kHqHeadDim + d]) {
+                    ++syn_bad;
+                    break;
+                }
+            }
+        }
+        std::printf("[6] synthetic k>0 fallback mismatched rows: %d\n", syn_bad);
+        check(syn_bad == 0, "group decoder general-k fallback differs from sequential decode");
+        cudaFree(d_sc);
+        cudaFree(d_sm);
+        cudaFree(d_so);
+        cudaFree(d_so2);
     }
 
     if (g_failed != 0) {

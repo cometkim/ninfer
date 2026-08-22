@@ -177,11 +177,14 @@ __global__ void gqa_attention_decode_hq_kernel(
 
     for (std::int32_t k0 = key_lo; k0 < key_hi; k0 += kKeys) {
         const int chunk = min(kKeys, key_hi - k0);
+        // Eight lanes per K row (one 64-bit Rice window each): the boundary
+        // fixup chain replaces the 64-symbol serial segment walk, and all
+        // 256 threads decode the chunk's rows in a single wave.
         {
-            const int drow = tid >> 2;
-            const int dseg = tid & 3;
+            const int drow = tid >> 3;
+            const int dseg = tid & 7;
             if (drow < chunk) {
-                hq_decode_row_segment(
+                hq_decode_row_group(
                     hq_row_codes<Geometry>(codes_k, block_table, kv_head, k0 + drow),
                     hq_row_meta<Geometry>(meta_k, block_table, kv_head, k0 + drow),
                     kv_smem + static_cast<std::size_t>(drow) * kGqaHeadDim, dseg);
@@ -229,10 +232,10 @@ __global__ void gqa_attention_decode_hq_kernel(
         }
         __syncthreads();
         {
-            const int drow = tid >> 2;
-            const int dseg = tid & 3;
+            const int drow = tid >> 3;
+            const int dseg = tid & 7;
             if (drow < chunk) {
-                hq_decode_row_segment(
+                hq_decode_row_group(
                     hq_row_codes<Geometry>(codes_v, block_table, kv_head, k0 + drow),
                     hq_row_meta<Geometry>(meta_v, block_table, kv_head, k0 + drow),
                     kv_smem + static_cast<std::size_t>(drow) * kGqaHeadDim, dseg);

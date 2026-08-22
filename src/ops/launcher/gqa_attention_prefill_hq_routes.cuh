@@ -32,11 +32,12 @@ void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float sc
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(kGqaPrefillRotatedSmemBytes));
     CUDA_CHECK(attr_rot);
-    // Materialize the visible history once (rotated-frame bf16, one thread
-    // per row), then run the shared FA2 prompt kernel over the scratch.
+    // Materialize the visible history once (rotated-frame bf16, eight lanes
+    // per row via the cooperative group decoder), then run the shared FA2
+    // prompt kernel over the scratch.
     const auto tokens       = static_cast<std::int32_t>(q.ne[2]);
     const auto span         = static_cast<std::int32_t>(scratch_k.ne[2]);
-    const auto units_bound  = static_cast<std::int64_t>(span) * Geometry::KVHeads * 2 * 4;
+    const auto units_bound  = static_cast<std::int64_t>(span) * Geometry::KVHeads * 2 * 8;
     const int scratch_grid  = static_cast<int>(
         div_up(units_bound, static_cast<std::int64_t>(kGqaHqScratchThreads)));
     gqa_attention_prefill_hq_scratch_kernel<Geometry, Metadata>

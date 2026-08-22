@@ -598,59 +598,267 @@ __device__ __forceinline__ void hq_decode_row_thread(const std::uint8_t* codes,
     }
 }
 
-// Decode one QUARTER of a row's codes[64] + meta[8] (words
-// [segment*8, segment*8+8), elements [segment*64, segment*64+64)) into bf16
-// (rotated frame). FOUR THREADS per row, one segment each: each thread's
-// serial Rice scan starts at the byte offset recorded by the encoder in
-// meta[5..7], cutting the per-row dependency chain (and the exposed latency
-// at low warp occupancy) by 4x. Produces bit-identical values to
-// hq_decode_row_thread.
-__device__ __forceinline__ void hq_decode_row_segment(const std::uint8_t* codes,
-                                                      const std::uint8_t* meta,
-                                                      __nv_bfloat16* out, int segment) {
-    const std::uint16_t norm_bits = static_cast<std::uint16_t>(meta[0]) |
-                                    (static_cast<std::uint16_t>(meta[1]) << 8);
-    __half h;
-    *reinterpret_cast<std::uint16_t*>(&h) = norm_bits;
-    const float norm = __half2float(h);
-    const std::uint32_t k = meta[2] & 0x0Fu;
-    const std::uint32_t escalation = (meta[2] >> 4) & 0x3u;
-    const float inv_scale =
-        1.0f / (kHqAlpha * static_cast<float>(1u << escalation) *
-                sqrtf(static_cast<float>(kHqHeadDim)));
+// ---- 8-lane cooperative row decode -----------------------------------------
+//
+// Eight lanes decode one row. Each lane owns one 64-bit window of the Rice
+// stream (one coalesced u64 load), and the group resolves symbol boundaries
+// with a speculative scan plus a sequential fixup chain: window j's parse
+// depends only on the entry state handed over by window j-1, so the critical
+// path is eight ~26-symbol window scans and their shuffles instead of one
+// 256-symbol serial walk (the 4-way segment decoder's chain is 64 symbols per
+// thread with per-word global promotes on the chain). Zigzag symbols are
+// staged as u16 codes into the output row itself; after a group barrier each
+// lane unstrips four complete E8 words reassembled from the staged row, so
+// lattice words split across lane boundaries need no exchange. Produces
+// bit-identical values to hq_decode_row_thread.
+//
+// Contract: the eight lanes [gbase, gbase+8) of the warp are converged and
+// active when called; `lane` is the group-local lane index (0..7).
 
-    const unsigned used_bits =
-        static_cast<unsigned>(meta[3]) | (static_cast<unsigned>(meta[4] & 0x3) << 8);
+// k bits at window positions [p, p+k), p <= 64; bits past the window come
+// from w_next (zeros beyond the row budget).
+__device__ __forceinline__ std::uint32_t hq_group_read(unsigned long long w,
+                                                       unsigned long long w_next, int p,
+                                                       std::uint32_t k) {
+    if (k == 0) { return 0u; }
+    if (p + static_cast<int>(k) <= 64) {
+        return static_cast<std::uint32_t>((w << p) >> (64 - k));
+    }
+    const int here = 64 - p;
+    const std::uint32_t lo =
+        here > 0 ? static_cast<std::uint32_t>((w << p) >> (64 - here)) : 0u;
+    const std::uint32_t hi = static_cast<std::uint32_t>(w_next >> (64 - (k - here)));
+    return (lo << (k - here)) | hi;
+}
+
+// Walk one 64-bit window from an entry state: entry >= 0 with boundary=true
+// means a symbol starts at that bit; boundary=false means an unary run from a
+// previous window is pending (find its terminator first, own nothing there).
+// At most `cap` symbols are taken (the row decode stops at 256 symbols, so
+// trailing padding never spawns phantom symbols). Reports the state handed to
+// the next window and how many symbols START in this window (a symbol whose
+// terminator lies beyond the window still counts here; its owner decodes it
+// by chasing later windows).
+__device__ __forceinline__ void hq_group_scan_window(unsigned long long w, std::uint32_t k,
+                                                     int entry, bool boundary, int cap,
+                                                     int& exit_pos, int& exit_boundary,
+                                                     int& count) {
+    int cursor = boundary ? entry : -1;
+    count = 0;
+    while (cursor < 64 && count < cap) {
+        const int from = cursor >= 0 ? cursor : 0;
+        const unsigned long long tail = w << from;
+        if (tail == 0ull) {
+            if (cursor >= 0) { ++count; }
+            exit_pos      = 0;
+            exit_boundary = 0;
+            return;
+        }
+        const int t = from + __clzll(tail);
+        if (cursor >= 0) { ++count; }
+        cursor = t + 1 + static_cast<int>(k);
+    }
+    if (cursor < 64) {
+        // Cap reached mid-window: later windows own nothing (their cap is 0),
+        // so the hand-off state is never consumed.
+        exit_pos      = cursor;
+        exit_boundary = 1;
+    } else {
+        exit_pos      = cursor - 64;
+        exit_boundary = 1;
+    }
+}
+
+__device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
+                                                    const std::uint8_t* meta,
+                                                    __nv_bfloat16* out, int lane) {
+    const std::uint32_t mw0 = *reinterpret_cast<const std::uint32_t*>(meta);
+    const std::uint32_t mw1 = *reinterpret_cast<const std::uint32_t*>(meta + 4);
+    const unsigned used_bits = ((mw0 >> 24) & 0xFFu) | ((mw1 & 0x3u) << 8);
+    const std::uint32_t k = (mw0 >> 16) & 0xFu;
     if (used_bits == 0 || k > kHqMaxRiceK) {
         // Never-written row (zeroed metadata): decodes to exact zeros.
 #pragma unroll 1
-        for (int i = 0; i < kHqHeadDim / 4; ++i) {
-            out[segment * (kHqHeadDim / 4) + i] = __float2bfloat16(0.0f);
-        }
+        for (int i = lane; i < kHqHeadDim; i += 8) { out[i] = __float2bfloat16(0.0f); }
         return;
     }
-    const unsigned start_bit =
-        segment == 0 ? 0u
-                     : static_cast<unsigned>(meta[4 + segment]) |
-                           (((static_cast<unsigned>(meta[4]) >> (segment + 1)) & 1u) << 8);
-    HqBitReader br(reinterpret_cast<const std::uint32_t*>(codes) + (start_bit >> 5),
-                   (kHqRowBudgetBytes >> 2) - static_cast<int>(start_bit >> 5));
-    const unsigned skip = start_bit & 31u;
-    if (skip != 0u) { br.read_bits(static_cast<int>(skip)); }
-    std::uint32_t z[8];
+
+    const int warp_lane = static_cast<int>(threadIdx.x & 31u);
+    const int gbase     = warp_lane & ~7;
+    const unsigned gmask = 0xFFu << gbase;
+
+    // Stream layout: 16 u32 words; each word's VALUE carries its 32 stream
+    // bits MSB-first (HqBitWriter accumulates into u32 values stored
+    // little-endian). Lane L's 64-bit window = stream bits [64L, 64L+64) =
+    // words {2L, 2L+1} concatenated MSB-first.
+    const std::uint32_t* w32 = reinterpret_cast<const std::uint32_t*>(codes);
+    const unsigned long long w =
+        (static_cast<unsigned long long>(w32[2 * lane]) << 32) | w32[2 * lane + 1];
+
+    int idx_total;
+    if (k == 0) {
+        // Unary fast path. Every stored row is k = 0 (a row that fits the
+        // 512-bit budget at all fits at k = 0, and the encoder selects the
+        // minimum-bit k), so every 1-bit terminates exactly one symbol and
+        // symbol boundaries are prefix-sum computable — no serial parse.
+        const int c = static_cast<int>(__popcll(w));
+        // Exclusive prefix sum of per-window symbol counts -> this window's
+        // first symbol index.
+        int inc = c;
+#pragma unroll
+        for (int delta = 1; delta < 8; delta <<= 1) {
+            const int left = __shfl_up_sync(gmask, inc, delta, 8);
+            if (lane >= delta) { inc += left; }
+        }
+        const int base = inc - c;
+        idx_total      = __shfl_sync(gmask, inc, gbase + 7);
+        // Segmented scan of (all-zero, trailing zeros): carry-in zeros since
+        // the last 1-bit of the previous windows (an open unary run).
+        int run = (w == 0ull) ? 64 : (static_cast<int>(__ffsll(w)) - 1);
+        int az  = (w == 0ull) ? 1 : 0;
+#pragma unroll
+        for (int delta = 1; delta < 8; delta <<= 1) {
+            const int lrun = __shfl_up_sync(gmask, run, delta, 8);
+            const int laz  = __shfl_up_sync(gmask, az, delta, 8);
+            if (lane >= delta && az != 0) {
+                run += lrun;
+                az &= laz;
+            }
+        }
+        int carry = __shfl_up_sync(gmask, run, 1, 8);
+        if (lane == 0) { carry = 0; }
+        // Decode this window's symbols: z = zeros before each 1-bit.
+        std::uint16_t* out16 = reinterpret_cast<std::uint16_t*>(out);
+        unsigned long long v = w;
+        int n                = 0;
+        while (v != 0ull && base + n < kHqHeadDim) {
+            const int p = __clzll(v);
+            int z       = carry + p;
+            if (z >= static_cast<int>(kHqUnaryGuard)) { z = 0; }
+            out16[base + n] = static_cast<std::uint16_t>(z);
+            ++n;
+            v = (v << p) << 1;  // two shifts: p can be 63
+            carry = 0;
+        }
+    } else {
+        // General-k fallback (defensive; the in-tree encoder never stores
+        // k > 0). Speculative scan + sequential fixup over the eight windows.
+        unsigned long long remote[8];
+#pragma unroll
+        for (int m = 1; m <= 8; ++m) {
+            const unsigned long long v = __shfl_sync(gmask, w, gbase + ((lane + m) & 7));
+            remote[m - 1] = (lane + m <= 7) ? v : 0ull;
+        }
+        int exit_pos = 0, exit_cnt = 0, exit_bnd = 1;
+        hq_group_scan_window(w, k, 0, true, kHqHeadDim, exit_pos, exit_bnd, exit_cnt);
+        int u = 0, idx = 0, bnd = 1;
+        int my_e = 0, my_i = 0, my_b = 1;
+        for (int j = 0; j < 8; ++j) {
+            int eu = 0, ec = 0, eb = 1;
+            if (lane == j) {
+                my_e = u;
+                my_i = idx;
+                my_b = bnd;
+                const int cap = kHqHeadDim - idx;
+                if (cap <= 0) {
+                    eu = 0;
+                    eb = 1;
+                    ec = 0;
+                } else if (u != 0 || bnd == 0 || exit_cnt > cap) {
+                    hq_group_scan_window(w, k, u, bnd != 0, cap, eu, eb, ec);
+                } else {
+                    eu = exit_pos;
+                    eb = exit_bnd;
+                    ec = exit_cnt;
+                }
+            }
+            u   = __shfl_sync(gmask, eu, gbase + j);
+            bnd = __shfl_sync(gmask, eb, gbase + j);
+            idx += __shfl_sync(gmask, ec, gbase + j);
+        }
+        idx_total = idx;
+
+        std::uint16_t* out16 = reinterpret_cast<std::uint16_t*>(out);
+        int pending = -1;
+        int s       = my_i;
+        {
+            const int cap = kHqHeadDim - my_i;
+            int cursor    = my_b != 0 ? my_e : -1;
+            int n         = 0;
+            while (cursor < 64 && n < cap) {
+                const int from = cursor >= 0 ? cursor : 0;
+                const unsigned long long tail = w << from;
+                if (tail == 0ull) {
+                    if (cursor >= 0) { pending = cursor; }
+                    break;
+                }
+                const int t = from + __clzll(tail);
+                if (cursor >= 0) {
+                    const std::uint32_t q = static_cast<std::uint32_t>(t - cursor);
+                    const std::uint32_t r = hq_group_read(w, remote[0], t + 1, k);
+                    out16[s++] = static_cast<std::uint16_t>((q << k) | r);
+                    ++n;
+                }
+                cursor = t + 1 + static_cast<int>(k);
+            }
+        }
+        if (pending >= 0) {
+            std::uint32_t z = 0;
+            int d           = 64 - pending;
+#pragma unroll
+            for (int m = 1; m <= 8; ++m) {
+                const unsigned long long pw = remote[m - 1];
+                if (pw == 0ull) {
+                    if (m == 8) { break; }  // past the row budget: guarded symbol is 0
+                    d += 64;
+                    continue;
+                }
+                const int t2 = __clzll(pw);
+                d += t2;
+                if (d < static_cast<int>(kHqUnaryGuard)) {
+                    const std::uint32_t r =
+                        hq_group_read(pw, m < 8 ? remote[m] : 0ull, t2 + 1, k);
+                    z = (static_cast<std::uint32_t>(d) << k) | r;
+                }
+                break;
+            }
+            out16[s] = static_cast<std::uint16_t>(z);
+        }
+    }
+
+    // Defensive tail: symbols beyond the last parseable boundary decode to
+    // zero, exactly like the sequential reader's unary guard. Well-formed
+    // rows always parse 256 symbols, so this never runs in the engine.
+    if (idx_total < kHqHeadDim && lane == 0) {
+        std::uint16_t* out16 = reinterpret_cast<std::uint16_t*>(out);
 #pragma unroll 1
-    for (int w = segment * 8; w < segment * 8 + 8; ++w) {
+        for (int t = idx_total; t < kHqHeadDim; ++t) { out16[t] = 0; }
+    }
+    __syncwarp(gmask);
+
+    // Unstrip/scale four complete E8 words per lane, reassembled from the
+    // staged row (word ownership is static, so lane-boundary words need no
+    // cross-lane exchange).
+    const std::uint32_t escalation = (mw0 >> 20) & 0x3u;
+    __half h;
+    *reinterpret_cast<std::uint16_t*>(&h) = static_cast<std::uint16_t>(mw0 & 0xFFFFu);
+    const float norm = __half2float(h);
+    const float inv_scale =
+        1.0f / (kHqAlpha * static_cast<float>(1u << escalation) *
+                sqrtf(static_cast<float>(kHqHeadDim)));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int word = lane + 8 * i;
+        std::uint32_t z[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            const std::uint32_t q = br.read_unary();
-            const std::uint32_t r = br.read_bits(static_cast<int>(k));
-            z[j] = (q >= kHqUnaryGuard) ? 0u : ((q << k) | r);
+            z[j] = reinterpret_cast<const std::uint16_t*>(out)[word * 8 + j];
         }
         int y[8];
         hq_unstrip_word(z, y);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            out[w * 8 + j] =
+            out[word * 8 + j] =
                 __float2bfloat16(static_cast<float>(y[j]) * norm * inv_scale);
         }
     }
