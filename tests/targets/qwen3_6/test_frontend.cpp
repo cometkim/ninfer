@@ -131,7 +131,7 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     result.tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"},
-          {"vocab", {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
+          {"vocab", {{std::string("\xff", 1), 13}, {"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
           {"merges", nlohmann::json::array()}}},
         {"added_tokens",
          tokens}}.dump();
@@ -277,6 +277,30 @@ bool throws_processor_budget(Callable&& callable) {
         return error.kind() == fi::ProcessorErrorKind::BudgetExceeded;
     }
     return false;
+}
+
+int test_utf8_replacement_bytes(const Frontend& frontend) {
+    // An invalid UTF-8 lead byte in the generated stream publishes exactly one U+FFFD
+    // (EF BF BD) and generation continues. Token 13 decodes to the byte 0xFF.
+    auto prompt    = frontend.prepare_tokens({0});
+    auto session   = frontend.make_output_session(prompt, {});
+    int failures   = 0;
+    std::uint32_t remaining = 8;
+    const auto bad = session.preview(std::array<ninfer::TokenId, 1>{13}, remaining,
+                                     ninfer::FinishReason::OutputLimit);
+    failures += check(bad.accepted_tokens == 1 && !bad.finished(),
+                      "invalid UTF-8 lead byte unexpectedly ended generation");
+    const auto replaced = session.commit_preview();
+    const std::string replaced_text = channel_text(replaced, ninfer::OutputChannel::Content);
+    failures += check(replaced_text == std::string("\xef\xbf\xbd", 3),
+                      "invalid lead byte did not publish exactly one U+FFFD");
+    remaining -= bad.accepted_tokens;
+    const auto ok = session.preview(std::array<ninfer::TokenId, 1>{0}, remaining,
+                                    ninfer::FinishReason::OutputLimit);
+    const auto after = session.commit_preview();
+    const std::string after_text = channel_text(after, ninfer::OutputChannel::Content);
+    failures += check(after_text == "x", "valid token after a replacement byte was dropped");
+    return failures;
 }
 
 int test_official_tokenizer_merge() {
@@ -1325,6 +1349,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
+    failures += test_utf8_replacement_bytes(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();
     failures += test_media_live_bytes_follow_last_payload_reference();
