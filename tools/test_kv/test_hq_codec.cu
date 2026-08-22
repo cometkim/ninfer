@@ -322,7 +322,7 @@ int main() {
         constexpr int kOracleSample = 200;
         double max_rel = 0.0;
         double sig = 0.0, noise = 0.0, cos_xy = 0.0, cos_xx = 0.0, cos_yy = 0.0;
-        int oracle_bad = 0;
+        int oracle_bad = 0, row_bad = 0, tie_flips = 0;
         for (int r = 0; r < kNormal; ++r) {
             const unsigned esc = (hmeta[r * 8 + 2] >> 4) & 3u;
             std::vector<double> rot(kHqHeadDim);
@@ -341,11 +341,14 @@ int main() {
             // and the decoded rotated value = y*norm*(2^esc)/(alpha*sqrt(256)).
             const double scale = kHqAlpha / (static_cast<double>(1 << esc) * norm);
             const double inv = norm * static_cast<double>(1 << esc) / (kHqAlpha * 16.0);
-            // One E8int lattice step in decoded-value space. The device
-            // quantizes the FP32-staged row while this oracle quantizes FP64,
-            // so rare boundary ties legitimately flip the nearest point (a
-            // one-step value difference, occasionally in two coordinates).
-            const double lattice_step = 2.0 * norm * inv;
+            // One 2*E8 coordinate step in decoded space is 2*inv. The device
+            // quantizes FP32-staged rows while this oracle quantizes FP64, so
+            // boundary ties legitimately flip one coordinate by exactly one
+            // step; anything else is an error. A row-level 2% relative-L2
+            // bound catches zeroed or wrongly-scaled rows that per-coordinate
+            // slack alone cannot.
+            const double lattice_step = 2.0 * inv;
+            double row_err2 = 0.0, row_sig2 = 0.0;
             if (r < kOracleSample) {
                 for (int w = 0; w < kHqWordsPerRow; ++w) {
                     double x8[8];
@@ -356,16 +359,23 @@ int main() {
                         const double expected = y[j] * inv;
                         const double got = bf16_bits_to_float(
                             hout[r * kHqHeadDim + w * 8 + j]);
-                        if (std::fabs(got - expected) >
-                            0.02 * std::fabs(expected) + 0.01 + 2.5 * lattice_step) {
-                            ++oracle_bad;
+                        const double err = std::fabs(got - expected);
+                        if (err > 0.02 * std::fabs(expected) + 0.01) {
+                            if (std::fabs(err - lattice_step) <= 0.1 * lattice_step) {
+                                ++tie_flips;
+                            } else {
+                                ++oracle_bad;
+                            }
                         }
+                        row_err2 += err * err;
+                        row_sig2 += expected * expected;
                         const double denom = std::fabs(expected) + 0.01;
-                        max_rel = std::max(max_rel, std::fabs(got - expected) / denom);
+                        max_rel = std::max(max_rel, err / denom);
                         sig += expected * expected;
-                        noise += (got - expected) * (got - expected);
+                        noise += err * err;
                     }
                 }
+                if (row_sig2 > 0.0 && row_err2 > 0.0004 * row_sig2) { ++row_bad; }
             }
             // Quality in the ORIGINAL frame: inverse-rotate the decoded row
             // and compare to the source row.
@@ -385,14 +395,16 @@ int main() {
         }
         const double snr = 10.0 * std::log10(sig / noise);
         const double cos = cos_xy / (std::sqrt(cos_xx) * std::sqrt(cos_yy) + 1e-300);
-        // Heavy-tailed rows are the escalation corpus: they overflow the
-        // budget at alpha and must be rescued (halved alpha) with fidelity,
-        // not zeroed by the terminal fallback. Oracle-check a sample with the
-        // same per-row escalation the device recorded.
-        int heavy_oracle_bad = 0, heavy_escalated = 0;
-        for (int r = kNormal; r < kNormal + kOracleSample && r < kRows; ++r) {
+        // Escalation fidelity: oracle-check EVERY escalated row on the corpus
+        // (the census proves they exist; a fixed sample would gate on seed
+        // luck), and band the count so both "escalation stopped firing" and
+        // "escalation exploded" trip. On this corpus the fixed seed produces
+        // 78 normal + 11 heavy escalated rows.
+        int esc_oracle_bad = 0, esc_row_bad = 0, esc_count = 0;
+        for (int r = 0; r < kRows; ++r) {
             const unsigned esc = (hmeta[r * 8 + 2] >> 4) & 3u;
-            if (esc != 0) { ++heavy_escalated; }
+            if (esc == 0) { continue; }
+            ++esc_count;
             std::vector<double> rot(kHqHeadDim);
             double norm = 0.0;
             for (int d = 0; d < kHqHeadDim; ++d) {
@@ -407,7 +419,8 @@ int main() {
             host_fwht(rot.data(), kHqHeadDim);
             const double scale = kHqAlpha / (static_cast<double>(1 << esc) * norm);
             const double inv = norm * static_cast<double>(1 << esc) / (kHqAlpha * 16.0);
-            const double lattice_step = 2.0 * norm * inv;
+            const double lattice_step = 2.0 * inv;
+            double row_err2 = 0.0, row_sig2 = 0.0;
             for (int w = 0; w < kHqWordsPerRow; ++w) {
                 double x8[8];
                 for (int j = 0; j < 8; ++j) { x8[j] = rot[w * 8 + j] * scale; }
@@ -416,21 +429,33 @@ int main() {
                 for (int j = 0; j < 8; ++j) {
                     const double expected = y[j] * inv;
                     const double got = bf16_bits_to_float(hout[r * kHqHeadDim + w * 8 + j]);
-                    if (std::fabs(got - expected) >
-                        0.02 * std::fabs(expected) + 0.01 + 2.5 * lattice_step) {
-                        ++heavy_oracle_bad;
+                    const double err = std::fabs(got - expected);
+                    if (err > 0.02 * std::fabs(expected) + 0.01 &&
+                        std::fabs(err - lattice_step) > 0.1 * lattice_step) {
+                        ++esc_oracle_bad;
                     }
+                    row_err2 += err * err;
+                    row_sig2 += expected * expected;
                 }
             }
+            if (row_sig2 > 0.0 && row_err2 > 0.0004 * row_sig2) { ++esc_row_bad; }
         }
-        std::printf("[2] oracle mismatches (rel>2%%): %d, max rel %.4f\n", oracle_bad, max_rel);
-        std::printf("[5] rotated-frame SNR %.2f dB, original-frame cosine %.6f\n", snr, cos);
-        std::printf("[2b] heavy-row sample: %d escalated, %d oracle mismatches\n",
-                    heavy_escalated, heavy_oracle_bad);
-        check(oracle_bad == 0, "decoded rows deviate from the FP64 oracle beyond bf16 rounding");
-        check(snr > 15.0 && cos > 0.90, "2 bits/dim reconstruction quality collapsed");
-        check(heavy_escalated > 0, "heavy-row corpus no longer exercises escalation");
-        check(heavy_oracle_bad == 0, "escalated rows deviate from the FP64 oracle");
+        std::printf("[2] oracle mismatches: %d, tie flips: %d, bad rows: %d, max rel %.4f\n",
+                    oracle_bad, tie_flips, row_bad, max_rel);
+        std::printf("[5] rotated-frame decoder-vs-oracle SNR %.2f dB, original-frame cosine %.6f\n",
+                    snr, cos);
+        std::printf("[2b] escalated rows: %d (band 50-200), %d oracle mismatches, %d bad rows\n",
+                    esc_count, esc_oracle_bad, esc_row_bad);
+        check(oracle_bad == 0,
+              "decoded rows deviate from the FP64 oracle beyond tie flips");
+        check(row_bad == 0, "oracle rows exceed 2% relative-L2 error (zeroed or mis-scaled)");
+        check(tie_flips <= 8 * kOracleSample / 200,
+              "FP32/FP64 quantizer tie flips exceeded the calibration budget");
+        check(cos > 0.93, "2 bits/dim original-frame reconstruction quality collapsed");
+        check(esc_count >= 50 && esc_count <= 200,
+              "escalation count left its corpus band (rescue behavior changed)");
+        check(esc_oracle_bad == 0 && esc_row_bad == 0,
+              "escalated rows deviate from the FP64 oracle");
 
         cudaFree(d_rows);
         cudaFree(d_signs);

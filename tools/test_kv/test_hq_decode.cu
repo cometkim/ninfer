@@ -175,6 +175,10 @@ int main() {
         // A window large enough that every split runs many chunks, exercising
         // the online-softmax rescale chain across chunk boundaries.
         {"H window=2560",       1, 1,  1, 0, 2560, -1, false, false, -1},
+        // Full MTP-verify tile (width 6 -> 12 append units over 8 warps, two
+        // rounds with per-warp scratch reuse) across two batches with
+        // disjoint tables, so the append's offsets run together with batch.
+        {"G2 append w6 b2",     2, 6,  6, 0, 150,  -1, true,  false, -1},
         // logical_capacity below the last position: every split must write
         // neutral partials instead of indexing the block table out of range.
         {"I oob guard",         1, 1,  1, 0, 200,  -1, false, false, 199},
