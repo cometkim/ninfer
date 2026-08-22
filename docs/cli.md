@@ -141,6 +141,7 @@ measured recommendation rather than a semantic limit.
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|hq-e8-2b` | KV-cache storage | `bf16` |
+| `--rope-scaling none\|yarn:F` | text RoPE position scaling; `yarn:2`/`yarn:4` select YaRN with that factor (HF/vLLM semantics) | `none` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -180,12 +181,17 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 
 ## Context and memory
 
-The registered model IDs have a native context limit of 262,144 tokens. The practical
+The engine context envelope is 1,048,576 tokens with `--kv-dtype hq-e8-2b` and 262,144 tokens
+with `bf16` or `int8` (the BF16/I8 decode kernels stage a fixed number of page ids per split).
+The checkpoint's trained position capacity is 262,144 tokens: contexts past it require
+`--rope-scaling yarn:F` (use factor 2 for a 524k deployment, factor 4 for 1M; Qwen notes YaRN
+degrades short prompts, so leave it off at or below the native range). The practical
 allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
 Use `--kv-dtype int8` for large context allocations; `hq-e8-2b` (fixed-budget
 E8-lattice + Rice entropy coding at ~2.25 bits/scalar) cuts KV memory ~3.7x
-below int8 at comparable speed. The prepared prompt must fit
+below int8 at comparable speed and is the only format that fits contexts beyond ~400k on one
+32 GB device. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
