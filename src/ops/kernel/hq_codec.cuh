@@ -172,71 +172,6 @@ __device__ __forceinline__ void hq_unstrip_word(const std::uint32_t (&z)[8], int
 
 // ---- Rice bit primitives (row-local, word-aligned) -------------------------
 
-__device__ __forceinline__ std::uint32_t hq_rice_bits(std::uint32_t z, std::uint32_t k) {
-    return (z >> k) + 1u + k;
-}
-
-struct HqBitWriter {
-    std::uint32_t cur;          // partial word being assembled MSB-first
-    int cur_bits;               // bits currently in cur (0..31)
-    int written;                // whole words committed to the row buffer
-    std::uint32_t buf[kHqRowBudgetBytes / 4];
-    bool overflow;
-
-    __device__ HqBitWriter() : cur(0u), cur_bits(0), written(0), overflow(false) {
-#pragma unroll
-        for (int i = 0; i < kHqRowBudgetBytes / 4; ++i) { buf[i] = 0u; }
-    }
-
-    // Append the low n bits of v (n <= 32), MSB first, one bit at a time.
-    // Deliberately simple: the funnel-shift version showed length-dependent
-    // word corruption on sm_120a that resisted root-causing; at ~500 bits
-    // per row the bit-loop cost is negligible for the append path.
-    __device__ __forceinline__ void put(std::uint32_t v, int n) {
-        if (n <= 0) { return; }
-        v &= (n == 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
-        for (int i = n - 1; i >= 0; --i) {
-            cur = (cur << 1) | ((v >> i) & 1u);
-            if (++cur_bits == 32) {
-                if (written >= kHqRowBudgetBytes / 4) {
-                    overflow = true;
-                    cur_bits = 0;
-                    cur      = 0u;
-                    return;
-                }
-                buf[written++] = cur;
-                cur            = 0u;
-                cur_bits       = 0;
-            }
-        }
-    }
-
-    __device__ __forceinline__ void put_rice(std::uint32_t z, std::uint32_t k) {
-        std::uint32_t q = z >> k;
-        while (q >= 32) {
-            put(0u, 31);
-            if (overflow) { return; }
-            q -= 31;
-        }
-        put(1u, q + 1);
-        if (overflow) { return; }
-        if (k > 0) { put(z & ((1u << k) - 1u), static_cast<int>(k)); }
-    }
-
-    __device__ __forceinline__ int bit_pos() const { return written * 32 + cur_bits; }
-
-    __device__ int flush() {
-        if (overflow) { return -1; }
-        if (cur_bits > 0) {
-            if (written >= kHqRowBudgetBytes / 4) { return -1; }
-            buf[written++] = cur << (32 - cur_bits);
-            cur      = 0u;
-            cur_bits = 0;
-        }
-        return written * 32;
-    }
-};
-
 struct HqBitReader {
     const std::uint32_t* words;
     int n_words;
@@ -423,9 +358,8 @@ __device__ __forceinline__ void hq_encode_row_warp(const __nv_bfloat16* row,
 
     int escalation = 0;
     int used_bits  = -1;
-    std::uint32_t best_k = 0;
     int seg_off[3] = {0, 0, 0};
-    HqBitWriter bw;
+    const std::uint32_t best_k = 0;  // k=0 invariant; see the packer below
 #pragma unroll 1
     for (int attempt = 0; attempt < 3; ++attempt) {
         if (attempt > 0) {
@@ -439,67 +373,58 @@ __device__ __forceinline__ void hq_encode_row_warp(const __nv_bfloat16* row,
             for (int i = lane * 8; i < lane * 8 + 8; ++i) { u_scaled[i] *= 0.5f; }
             __syncwarp();
         }
-        // lane w owns word w: quantize + strip into syms.
+        // lane w owns lattice word w: quantize + strip into registers.
+        std::uint32_t z8[8];
         {
             float x8[8];
             int y8[8];
 #pragma unroll
             for (int j = 0; j < 8; ++j) { x8[j] = u_scaled[lane * 8 + j]; }
             hq_quantize_e8int(x8, y8);
-            std::uint32_t z8[8];
             hq_strip_word(y8, z8);
-#pragma unroll
-            for (int j = 0; j < 8; ++j) { syms[lane * 8 + j] = z8[j]; }
         }
-        // Exact per-row Rice k from 8 shift-accumulators (warp reduction).
-        std::uint32_t acc[kHqMaxRiceK + 1] = {0, 0, 0, 0, 0, 0, 0, 0};
+        // Parallel pack. Rice k = 0 is invariant for every storable row (a
+        // row that fits at all fits at k=0, and this encoder always selects
+        // the minimum-bit k), so each symbol is z unary zeros plus one
+        // terminator 1: the whole row is zero words with 256 set bits, and
+        // packing reduces to a per-lane length prefix-sum plus one atomicOr
+        // per symbol into a zeroed staging row. The row total is known
+        // BEFORE any write, so budget overflow needs no rollback. This
+        // replaces the former lane-0 bit-serial writer, whose dynamically
+        // indexed word buffer lived in local memory (47k LDL/STL per
+        // instantiation in SASS).
+        int len8 = 0;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const std::uint32_t zz = syms[lane * 8 + j];
+        for (int j = 0; j < 8; ++j) { len8 += static_cast<int>(z8[j]) + 1; }
+        int incl = len8;
 #pragma unroll
-            for (int k = 0; k <= kHqMaxRiceK; ++k) { acc[k] += zz >> k; }
+        for (int d = 1; d < 32; d <<= 1) {
+            const int up = __shfl_up_sync(0xFFFFFFFFu, incl, d);
+            if (lane >= d) { incl += up; }
         }
+        const int total = __shfl_sync(0xFFFFFFFFu, incl, 31);
+        const int base  = incl - len8;
+        if (total <= kHqRowBudgetBytes * 8) {
+            escalation = attempt;
+            used_bits  = total;
+            seg_off[0] = __shfl_sync(0xFFFFFFFFu, base, 8);
+            seg_off[1] = __shfl_sync(0xFFFFFFFFu, base, 16);
+            seg_off[2] = __shfl_sync(0xFFFFFFFFu, base, 24);
+            // Stage the bit row in the first 16 words of the symbol scratch.
+            if (lane < kHqRowBudgetBytes / 4) { syms[lane] = 0u; }
+            __syncwarp();
+            int pos = base;
 #pragma unroll
-        for (int k = 0; k <= kHqMaxRiceK; ++k) {
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                acc[k] += __shfl_down_sync(0xFFFFFFFFu, acc[k], off);
+            for (int j = 0; j < 8; ++j) {
+                pos += static_cast<int>(z8[j]);
+                atomicOr(&syms[pos >> 5], 1u << (31 - (pos & 31)));
+                ++pos;
             }
+            __syncwarp();
+            break;
         }
-        std::uint32_t best_bits = 0xFFFFFFFFu;
-        best_k = 0;
-#pragma unroll
-        for (int k = 0; k <= kHqMaxRiceK; ++k) {
-            const std::uint32_t bits = acc[k] + kHqHeadDim * (1u + k);
-            if (bits < best_bits) {
-                best_bits = bits;
-                best_k    = static_cast<std::uint32_t>(k);
-            }
-        }
-        // Lane 0 packs the WHOLE row from shared memory written by all lanes;
-        // __shfl_*_sync in the reduction above converges execution but is not
-        // a shared-memory fence, so an explicit warp barrier is required
-        // before the cross-lane reads.
-        __syncwarp();
-        if (lane == 0) {
-            bw           = HqBitWriter();
-            escalation   = attempt;
-            for (int w = 0; w < kHqWordsPerRow && !bw.overflow; ++w) {
-                for (int j = 0; j < 8 && !bw.overflow; ++j) {
-                    bw.put_rice(syms[w * 8 + j], best_k);
-                }
-                if (w == 7 || w == 15 || w == 23) {
-                    seg_off[w == 7 ? 0 : (w == 15 ? 1 : 2)] = bw.bit_pos();
-                }
-            }
-            used_bits = bw.flush();
-        }
-        used_bits = __shfl_sync(0xFFFFFFFFu, used_bits, 0);
-        if (used_bits >= 0) { break; }
     }
     __syncwarp();
-    best_k  = __shfl_sync(0xFFFFFFFFu, best_k, 0);
-    escalation = __shfl_sync(0xFFFFFFFFu, escalation, 0);
 
     if (lane == 0) {
         __half h = __float2half_rn(norm);
@@ -513,7 +438,7 @@ __device__ __forceinline__ void hq_encode_row_warp(const __nv_bfloat16* row,
                                                     (static_cast<std::uint32_t>(escalation) << 4));
 #pragma unroll
             for (int b = 0; b < kHqRowBudgetBytes; ++b) {
-                codes_out[b] = reinterpret_cast<const std::uint8_t*>(bw.buf)[b];
+                codes_out[b] = reinterpret_cast<const std::uint8_t*>(syms)[b];
             }
             meta_out[5] = static_cast<std::uint8_t>(seg_off[0]);
             meta_out[6] = static_cast<std::uint8_t>(seg_off[1]);
