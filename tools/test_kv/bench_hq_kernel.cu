@@ -46,152 +46,303 @@ __global__ void decode_rows_group_bench(const std::uint8_t* codes, const std::ui
                         out + static_cast<std::size_t>(row) * kHqHeadDim, i & 7);
 }
 
-// Bench-local copy of the engine decode kernel with runtime phase switches
-// (uniform across the block, so no divergence is introduced): isolates the
-// Rice K/V decode phases from the score/rescale/PV phases at the engine shape.
+// Bench-local copy of the tensor-core hq decode kernel with runtime phase
+// switches (uniform across the block, so no divergence is introduced): skips
+// the group-decode tile staging (zero-filled instead) and/or the whole
+// QK/softmax/PV MMA chain at the engine shape.
 __global__ void hq_decode_phase_bench_kernel(
     const __nv_bfloat16* q, const std::int32_t* pos, std::int32_t tokens,
     const std::uint8_t* codes_k, const std::uint8_t* codes_v, const std::uint8_t* meta_k,
     const std::uint8_t* meta_v, const std::int32_t* block_tables, std::int32_t table_stride,
     std::int32_t column_begin, float scale, __nv_bfloat16* partial_acc, float* partial_m,
-    float* partial_l, int do_decode_k, int do_score, int do_decode_v, int do_pv) {
-    constexpr int kKeys = kGqaHqDecodeKeys;
+    float* partial_l, int do_decode, int do_mma) {
     using Geometry = Gqa27Geometry;
-    extern __shared__ float smem[];
-    __nv_bfloat16* q_rot = reinterpret_cast<__nv_bfloat16*>(smem);
-    __nv_bfloat16* kv_smem =
-        q_rot + kGqaHqDecodeMaxRows * kGqaHeadDim;
-    float* p_smem = reinterpret_cast<float*>(kv_smem + kKeys * kGqaHeadDim);
-    float* m_smem = p_smem + kGqaHqDecodeMaxRows * kKeys;
-    float* l_smem = m_smem + kGqaHqDecodeMaxRows;
-    float* corr_smem = l_smem + kGqaHqDecodeMaxRows;
-    float* acc = corr_smem + kGqaHqDecodeMaxRows;
-    std::int8_t* signs = reinterpret_cast<std::int8_t*>(acc + kGqaHqDecodeMaxRows * kGqaHeadDim);
+    constexpr int Wc = 4, Br = 64, Bc = 32, D = 256, Threads = 128;
+    constexpr int QKNt = 4, QKKs = 16, PVNt = 32, PVKs = 2;
+    constexpr float Log2E = 1.4426950408889634074f;
+    constexpr unsigned FullMask = 0xffffffffu;
+    __shared__ __align__(16) __nv_bfloat16 qkv_s[2 * Bc * D];
+    __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
+    __shared__ std::int32_t physical_pages_s[64];
+    __shared__ std::int8_t signs_s[256];
+    __nv_bfloat16* k_s = qkv_s;
+    __nv_bfloat16* v_s = qkv_s + Bc * D;
 
-    const int tid  = static_cast<int>(threadIdx.x);
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
     const int kv_head = static_cast<int>(blockIdx.x);
     const int split   = static_cast<int>(blockIdx.y);
+    const int tid     = static_cast<int>(threadIdx.x);
+    const int warp    = tid >> 5;
+    const int lane    = tid & 31;
     const int rows    = tokens * Geometry::GroupSize;
 
-    const std::int32_t* block_table =
-        block_tables;
+    q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_begin;
+    pos += column_begin;
+    const std::int32_t* block_table = block_tables;
 
-    const std::int32_t first_pos = pos[column_begin];
-    const std::int32_t last_pos  = pos[column_begin + tokens - 1];
+    const std::int32_t first_pos = pos[0];
+    const std::int32_t last_pos  = pos[tokens - 1];
     const std::int32_t window    = last_pos + 1;
     const int active_splits =
         gqa_small_t_active_splits<Geometry, false>(window, gridDim.y, tokens);
     if (split >= active_splits) { return; }
 
-    hq_engine_signs_fill(signs);
-    for (int i = tid; i < rows * kGqaHeadDim; i += kGqaHqDecodeThreads) { acc[i] = 0.0f; }
-    for (int r = 0; r < rows; ++r) {
-        if (tid == 0) { m_smem[r] = -INFINITY; }
-    }
+    hq_engine_signs_fill(signs_s);
     __syncthreads();
 
-    for (int r = warp; r < rows; r += kGqaHqDecodeThreads / 32) {
-        const int token = r / Geometry::GroupSize;
-        const int g     = r - token * Geometry::GroupSize;
-        const int q_head = kv_head * Geometry::GroupSize + g;
+    for (int idx = tid; idx < Br * D; idx += Threads) {
+        const int row = idx / D;
+        const int d   = idx - row * D;
+        int q_head = 0, token = 0;
+        gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+        __nv_bfloat16 value = __float2bfloat16(0.0f);
+        if (row < rows && gqa_valid_q_head<Geometry>(kv_head, q_head)) {
+            value = q[gqa_q_index<Geometry>(q_head, d, token)];
+        }
+        qkv_s[row * D + gqa_small_t_tc_swz(row, d)] = value;
+    }
+    __syncthreads();
+    for (int row = warp; row < rows; row += Wc) {
         float reg[8];
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
-            reg[s] = __bfloat162float(q[gqa_q_index<Geometry>(q_head, s * 32 + lane, token)]);
+            reg[s] = __bfloat162float(qkv_s[row * D + gqa_small_t_tc_swz(row, s * 32 + lane)]);
         }
-        hq_fwht256_sign(reg, signs, 0, lane);
+        hq_fwht256_sign(reg, signs_s, 0, lane);
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
-            q_rot[r * kGqaHeadDim + s * 32 + lane] = __float2bfloat16(reg[s]);
+            qkv_s[row * D + gqa_small_t_tc_swz(row, s * 32 + lane)] = __float2bfloat16(reg[s]);
         }
     }
     __syncthreads();
 
-    const std::int32_t span = window - column_begin;
-    const std::int32_t kps  = div_up(span, active_splits);
-    const std::int32_t key_lo = column_begin + split * kps;
-    const std::int32_t key_hi = min(key_lo + kps, window);
+    const int gid = lane >> 2;
+    const int lid = lane & 3;
+    const int a_mat    = lane >> 3;
+    const int a_rin    = lane & 7;
+    const int a_rowoff = a_rin + ((a_mat & 1) << 3);
+    const int a_coloff = (a_mat >> 1) << 3;
+    const int b_rin    = lane & 7;
+    const int b_koff   = ((lane >> 3) & 1) << 3;
+    const int warp_row0 = warp * 16;
+    __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];
 
-    for (std::int32_t k0 = key_lo; k0 < key_hi; k0 += kKeys) {
-        const int chunk = min(kKeys, key_hi - k0);
-        if (do_decode_k) {
-            const int drow = tid >> 3;
-            const int dseg = tid & 7;
-            if (drow < chunk) {
+    unsigned af_q[QKKs][4];
+#pragma unroll
+    for (int k = 0; k < QKKs; ++k) {
+        const int arow = warp_row0 + a_rowoff;
+        const int acol = k * 16 + a_coloff;
+        ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
+                    smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
+    }
+    __syncthreads();
+
+    const int logical_tiles = div_up(window, Bc);
+    const bool tile_split   = logical_tiles >= active_splits;
+    const int units_per_split =
+        tile_split ? div_up(logical_tiles, active_splits) : div_up(window, active_splits);
+    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
+    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+    const int split_end   = (split_limit < window) ? split_limit : window;
+    const int first_tile  = (split_start / Bc) * Bc;
+    const int key_blocks  = div_up(split_end - first_tile, Bc);
+
+    float acc[PVNt][4];
+#pragma unroll
+    for (int n = 0; n < PVNt; ++n) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
+    }
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+
+    for (int kb = 0; kb < key_blocks; ++kb) {
+        const int k0 = first_tile + kb * Bc;
+        for (int slot = tid; slot < 2 * Bc * 8; slot += Threads) {
+            const bool role_v = slot >= Bc * 8;
+            const int key_l   = (slot >> 3) & (Bc - 1);
+            const int lane8   = slot & 7;
+            __nv_bfloat16* row_dst = (role_v ? v_s : k_s) + key_l * D;
+            const int key = k0 + key_l;
+            if (do_decode && key >= split_start && key < split_end) {
                 hq_decode_row_group(
-                    hq_row_codes<Geometry>(codes_k, block_table, kv_head, k0 + drow),
-                    hq_row_meta<Geometry>(meta_k, block_table, kv_head, k0 + drow),
-                    kv_smem + static_cast<std::size_t>(drow) * kGqaHeadDim, dseg);
+                    hq_row_codes<Geometry>(role_v ? codes_v : codes_k, block_table, kv_head, key),
+                    hq_row_meta<Geometry>(role_v ? meta_v : meta_k, block_table, kv_head, key),
+                    row_dst, lane8, key_l & 7);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int chunk = ((lane8 * 4 + j) ^ (key_l & 7)) << 3;
+                    store_vec(row_dst + chunk, make_int4(0, 0, 0, 0));
+                }
             }
         }
         __syncthreads();
-        if (do_score) {
-            for (int i = tid; i < rows * kKeys; i += kGqaHqDecodeThreads) {
-                const int r  = i / kKeys;
-                const int kk = i - r * kKeys;
-                const int token = r / Geometry::GroupSize;
-                float s = 0.0f;
-                if (kk < chunk && k0 + kk <= pos[column_begin + token]) {
-                    const __nv_bfloat16* qr = q_rot + r * kGqaHeadDim;
-                    const __nv_bfloat16* kr = kv_smem + kk * kGqaHeadDim;
-                    for (int d = 0; d < kGqaHeadDim; ++d) {
-                        s += __bfloat162float(qr[d]) * __bfloat162float(kr[d]);
-                    }
-                    s *= scale;
-                } else {
-                    s = -INFINITY;
+        if (do_mma) {
+            float score[QKNt][4];
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+#pragma unroll
+                for (int k = 0; k < QKKs; ++k) {
+                    unsigned bf[2];
+                    const int brow = nt * 8 + b_rin;
+                    const int bcol = k * 16 + b_koff;
+                    ldmatrix_x2(bf[0], bf[1],
+                                smem_addr(&k_s[brow * D + gqa_small_t_tc_swz(brow, bcol)]));
+                    mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[k][0],
+                             af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
                 }
-                p_smem[i] = s;
             }
-            __syncthreads();
-            for (int r = tid; r < rows; r += kGqaHqDecodeThreads) {
-                float m = m_smem[r];
-                for (int kk = 0; kk < kKeys; ++kk) { m = fmaxf(m, p_smem[r * kKeys + kk]); }
-                const float correction = (m_smem[r] == -INFINITY) ? 0.0f : __expf(m_smem[r] - m);
-                float l = 0.0f;
-                for (int kk = 0; kk < kKeys; ++kk) {
-                    const float e = (p_smem[r * kKeys + kk] == -INFINITY)
-                                        ? 0.0f
-                                        : __expf(p_smem[r * kKeys + kk] - m);
-                    p_smem[r * kKeys + kk] = e;
-                    l += e;
+            const int row0 = warp_row0 + gid;
+            const int row1 = row0 + 8;
+            int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head0, token0);
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head1, token1);
+            const int qabs0 = (row0 < rows) ? pos[token0] : -1;
+            const int qabs1 = (row1 < rows) ? pos[token1] : -1;
+            float bm0 = -INFINITY, bm1 = -INFINITY;
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                const int col0 = nt * 8 + 2 * lid;
+                const int col1 = col0 + 1;
+                const int key0 = k0 + col0;
+                const int key1 = col1 + k0;
+                score[nt][0] = (row0 < rows && key0 >= split_start && key0 < split_end &&
+                                key0 <= qabs0)
+                                   ? score[nt][0] * scale
+                                   : -INFINITY;
+                score[nt][1] = (row0 < rows && key1 >= split_start && key1 < split_end &&
+                                key1 <= qabs0)
+                                   ? score[nt][1] * scale
+                                   : -INFINITY;
+                score[nt][2] = (row1 < rows && key0 >= split_start && key0 < split_end &&
+                                key0 <= qabs1)
+                                   ? score[nt][2] * scale
+                                   : -INFINITY;
+                score[nt][3] = (row1 < rows && key1 >= split_start && key1 < split_end &&
+                                key1 <= qabs1)
+                                   ? score[nt][3] * scale
+                                   : -INFINITY;
+                bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+                bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+            }
+            bm0 = warp_max<4>(bm0, FullMask);
+            bm1 = warp_max<4>(bm1, FullMask);
+            const float nm0    = fmaxf(m0, bm0);
+            const float nm1    = fmaxf(m1, bm1);
+            const float alpha0 = (m0 == -INFINITY) ? 0.0f : exp2_approx((m0 - nm0) * Log2E);
+            const float alpha1 = (m1 == -INFINITY) ? 0.0f : exp2_approx((m1 - nm1) * Log2E);
+            float bl0 = 0.0f, bl1 = 0.0f;
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                const int col0  = nt * 8 + 2 * lid;
+                const int col1  = col0 + 1;
+                const float p00 = (nm0 > -INFINITY && score[nt][0] > -INFINITY)
+                                      ? exp2_approx((score[nt][0] - nm0) * Log2E)
+                                      : 0.0f;
+                const float p01 = (nm0 > -INFINITY && score[nt][1] > -INFINITY)
+                                      ? exp2_approx((score[nt][1] - nm0) * Log2E)
+                                      : 0.0f;
+                const float p10 = (nm1 > -INFINITY && score[nt][2] > -INFINITY)
+                                      ? exp2_approx((score[nt][2] - nm1) * Log2E)
+                                      : 0.0f;
+                const float p11 = (nm1 > -INFINITY && score[nt][3] > -INFINITY)
+                                      ? exp2_approx((score[nt][3] - nm1) * Log2E)
+                                      : 0.0f;
+                bl0 += p00 + p01;
+                bl1 += p10 + p11;
+                p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col0)]           = __float2bfloat16(p00);
+                p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col1)]           = __float2bfloat16(p01);
+                p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col0)] = __float2bfloat16(p10);
+                p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+            }
+            bl0 = warp_sum<4>(bl0, FullMask);
+            bl1 = warp_sum<4>(bl1, FullMask);
+            l0 = l0 * alpha0 + bl0;
+            l1 = l1 * alpha1 + bl1;
+            m0 = nm0;
+            m1 = nm1;
+#pragma unroll
+            for (int n = 0; n < PVNt; ++n) {
+                acc[n][0] *= alpha0;
+                acc[n][1] *= alpha0;
+                acc[n][2] *= alpha1;
+                acc[n][3] *= alpha1;
+            }
+            __syncwarp();
+#pragma unroll
+            for (int n = 0; n < PVNt; ++n) {
+#pragma unroll
+                for (int k = 0; k < PVKs; ++k) {
+                    unsigned pf[4];
+                    const int pcol = k * 16 + a_coloff;
+                    ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
+                                smem_addr(&p_sw[a_rowoff * Bc +
+                                                gqa_small_t_tc_swz32(a_rowoff, pcol)]));
+                    unsigned vf[2];
+                    const int vrow = k * 16 + b_koff + b_rin;
+                    const int vcol = n * 8;
+                    ldmatrix_x2_t(vf[0], vf[1],
+                                  smem_addr(&v_s[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
+                    mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2],
+                             pf[3], vf[0], vf[1]);
                 }
-                m_smem[r]    = m;
-                l_smem[r]    = l_smem[r] * correction + l;
-                corr_smem[r] = correction;
-            }
-            __syncthreads();
-            for (int i = tid; i < rows * kGqaHeadDim; i += kGqaHqDecodeThreads) {
-                const int r = i / kGqaHeadDim;
-                acc[i] *= corr_smem[r];
-            }
-            __syncthreads();
-        }
-        if (do_decode_v) {
-            const int drow = tid >> 3;
-            const int dseg = tid & 7;
-            if (drow < chunk) {
-                hq_decode_row_group(
-                    hq_row_codes<Geometry>(codes_v, block_table, kv_head, k0 + drow),
-                    hq_row_meta<Geometry>(meta_v, block_table, kv_head, k0 + drow),
-                    kv_smem + static_cast<std::size_t>(drow) * kGqaHeadDim, dseg);
             }
         }
         __syncthreads();
-        if (do_pv) {
-            for (int i = tid; i < rows * kGqaHeadDim; i += kGqaHqDecodeThreads) {
-                const int r = i / kGqaHeadDim;
-                const int d = i - r * kGqaHeadDim;
-                float a = acc[r * kGqaHeadDim + d];
-                const float* pr = p_smem + r * kKeys;
-                for (int kk = 0; kk < chunk; ++kk) {
-                    a += pr[kk] * __bfloat162float(kv_smem[kk * kGqaHeadDim + d]);
-                }
-                acc[r * kGqaHeadDim + d] = a;
-            }
-            __syncthreads();
+    }
+
+    if (lid == 0) {
+        const int row0 = warp_row0 + gid;
+        const int row1 = row0 + 8;
+        if (row0 < rows) {
+            int q_head = 0, token = 0;
+            gqa_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head, token);
+            partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = m0;
+            partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = l0;
+        }
+        if (row1 < rows) {
+            int q_head = 0, token = 0;
+            gqa_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head, token);
+            partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = m1;
+            partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = l1;
+        }
+    }
+#pragma unroll
+    for (int n = 0; n < PVNt; ++n) {
+        const int d0   = n * 8 + 2 * lid;
+        const int d1   = d0 + 1;
+        const int row0 = warp_row0 + gid;
+        const int row1 = row0 + 8;
+        if (row0 < rows) {
+            qkv_s[row0 * D + d0] = __float2bfloat16(acc[n][0]);
+            qkv_s[row0 * D + d1] = __float2bfloat16(acc[n][1]);
+        }
+        if (row1 < rows) {
+            qkv_s[row1 * D + d0] = __float2bfloat16(acc[n][2]);
+            qkv_s[row1 * D + d1] = __float2bfloat16(acc[n][3]);
+        }
+    }
+    __syncthreads();
+    for (int row = warp; row < rows; row += Wc) {
+        float reg[8];
+#pragma unroll
+        for (int s = 0; s < 8; ++s) { reg[s] = __bfloat162float(qkv_s[row * D + s * 32 + lane]); }
+        hq_ifwht256_sign(reg, signs_s, 0, lane);
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            qkv_s[row * D + s * 32 + lane] = __float2bfloat16(reg[s]);
+        }
+    }
+    __syncthreads();
+    for (int chunk = tid; chunk < rows * (D / 8); chunk += Threads) {
+        const int row = chunk / (D / 8);
+        const int d   = (chunk - row * (D / 8)) * 8;
+        int q_head = 0, token = 0;
+        gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+        if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
+            const std::int64_t dst =
+                gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens);
+            store_vec(&partial_acc[dst], load_vec<int4>(&qkv_s[row * D + d]));
         }
     }
 }
@@ -276,9 +427,6 @@ int main() {
     // appended row's meta is read back so an escalating row (three packing
     // attempts) cannot silently inflate the timing.
     {
-        cudaFuncSetAttribute(gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(gqa_hq_decode_smem_bytes<Gqa27Geometry>()));
         __nv_bfloat16 *d_q1, *d_knew, *d_vnew;
         std::int32_t* d_posa;
         std::uint8_t *d_cka, *d_cva, *d_mka, *d_mva;
@@ -303,10 +451,11 @@ int main() {
             const std::int32_t last = window - 1;
             cudaMemcpy(d_posa, &last, 4, cudaMemcpyHostToDevice);
             GqaAppendInput input{d_knew, d_vnew};
-            gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>
-                <<<dim3(4, 32, 1), 256, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
-                    d_q1, input, d_posa, 1, d_cka, d_cva, d_mka, d_mva, d_table, nullptr,
-                    nullptr, 32, 1, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
+            const GqaTcKVHq hq_cache{d_cka, d_cva, d_mka, d_mva};
+            gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaAppendInput, GqaTcKVHq>
+                <<<dim3(4, 32, 1), kGqaHqDecodeThreads>>>(
+                    d_q1, input, d_posa, hq_cache, d_table, nullptr, nullptr, 32, 1, 1, 0, window,
+                    0.0625f, d_pacc, d_pm, d_pl);
             cudaDeviceSynchronize();
             {
                 const int page = last >> 6, off = last & 63;
@@ -322,10 +471,10 @@ int main() {
             cudaEventCreate(&b4);
             cudaEventRecord(a4);
             for (int rep = 0; rep < 8; ++rep) {
-                gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>
-                    <<<dim3(4, 32, 1), 256, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
-                        d_q1, input, d_posa, 1, d_cka, d_cva, d_mka, d_mva, d_table,
-                        nullptr, nullptr, 32, 1, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
+                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaAppendInput, GqaTcKVHq>
+                    <<<dim3(4, 32, 1), kGqaHqDecodeThreads>>>(
+                        d_q1, input, d_posa, hq_cache, d_table, nullptr, nullptr, 32, 1, 1, 0,
+                        window, 0.0625f, d_pacc, d_pm, d_pl);
             }
             cudaEventRecord(b4);
             cudaEventSynchronize(b4);
@@ -355,27 +504,23 @@ int main() {
             const std::int32_t last = window - 1;
             cudaMemcpy(d_pos2, &last, 4, cudaMemcpyHostToDevice);
             GqaCachedInput no_append{};
+            const GqaTcKVHq hq_cache{d_codes, d_codes, d_meta, d_meta};
             cudaEvent_t a2, b2;
             cudaEventCreate(&a2);
             cudaEventCreate(&b2);
-            cudaFuncSetAttribute(
-                gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaCachedInput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(gqa_hq_decode_smem_bytes<Gqa27Geometry>()));
             cudaGetLastError();
             // Warm-up (cold launch measures setup, not steady state).
-            gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaCachedInput>
-                <<<dim3(4, gridsplit, 1), 256, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
-                    d_out, no_append, d_pos2, 1, d_codes, d_codes, d_meta, d_meta, d_table,
-                    nullptr, nullptr, kRows / 64, window, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
+            gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaCachedInput, GqaTcKVHq>
+                <<<dim3(4, gridsplit, 1), kGqaHqDecodeThreads>>>(
+                    d_out, no_append, d_pos2, hq_cache, d_table, nullptr, nullptr, kRows / 64,
+                    1, window, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
             cudaDeviceSynchronize();
             cudaEventRecord(a2);
             for (int rep = 0; rep < 8; ++rep) {
-                gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaCachedInput>
-                    <<<dim3(4, gridsplit, 1), 256, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
-                        d_out, no_append, d_pos2, 1, d_codes, d_codes, d_meta, d_meta, d_table,
-                        nullptr, nullptr, kRows / 64, window, 0, window, 0.0625f, d_pacc, d_pm,
-                        d_pl);
+                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaCachedInput, GqaTcKVHq>
+                    <<<dim3(4, gridsplit, 1), kGqaHqDecodeThreads>>>(
+                        d_out, no_append, d_pos2, hq_cache, d_table, nullptr, nullptr,
+                        kRows / 64, 1, window, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
             }
             cudaEventRecord(b2);
             cudaEventSynchronize(b2);
@@ -386,52 +531,49 @@ int main() {
             cudaFree(d_pos2);
         }
     }
-    // Phase attribution at the engine shape (grid.y=85, window=32768): decode
-    // phases vs score/rescale/PV phases, plus achieved occupancy.
+    // Phase attribution at the engine shape (grid.y=85, window=32768): the
+    // group-decode tile staging vs the QK/softmax/PV MMA chain, plus achieved
+    // occupancy of the production kernel.
     {
         int blocks_per_sm = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks_per_sm, hq_decode_phase_bench_kernel,
-            kGqaHqDecodeThreads, static_cast<int>(gqa_hq_decode_smem_bytes<Gqa27Geometry>()));
+            &blocks_per_sm,
+            gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaCachedInput, GqaTcKVHq>, kGqaHqDecodeThreads, 0);
         std::printf("phase-bench occupancy: %d blocks/SM\n", blocks_per_sm);
 
         std::int32_t* d_pos3;
         cudaMalloc(&d_pos3, 4);
         const std::int32_t last3 = 32768 - 1;
         cudaMemcpy(d_pos3, &last3, 4, cudaMemcpyHostToDevice);
-        cudaFuncSetAttribute(
-            hq_decode_phase_bench_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            static_cast<int>(gqa_hq_decode_smem_bytes<Gqa27Geometry>()));
         cudaGetLastError();
         const char* names[] = {"full", "no-decode", "no-score/pv"};
-        const int modes[3][4] = {{1, 1, 1, 1}, {0, 1, 0, 1}, {1, 0, 1, 0}};
+        const int modes[3][2] = {{1, 1}, {0, 1}, {1, 0}};
+        float times[3] = {0, 0, 0};
         for (int m = 0; m < 3; ++m) {
             // Warm-up.
-            hq_decode_phase_bench_kernel<<<dim3(4, 85, 1), 256,
-                                           gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
+            hq_decode_phase_bench_kernel<<<dim3(4, 85, 1), 128>>>(
                 d_out, d_pos3, 1, d_codes, d_codes, d_meta, d_meta, d_table, kRows / 64, 0, 0.0625f,
-                d_pacc, d_pm, d_pl, modes[m][0], modes[m][1], modes[m][2], modes[m][3]);
+                d_pacc, d_pm, d_pl, modes[m][0], modes[m][1]);
             cudaDeviceSynchronize();
             cudaEvent_t a3, b3;
             cudaEventCreate(&a3);
             cudaEventCreate(&b3);
             cudaEventRecord(a3);
             for (int rep = 0; rep < 8; ++rep) {
-                hq_decode_phase_bench_kernel<<<dim3(4, 85, 1), 256,
-                                               gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
+                hq_decode_phase_bench_kernel<<<dim3(4, 85, 1), 128>>>(
                     d_out, d_pos3, 1, d_codes, d_codes, d_meta, d_meta, d_table, kRows / 64, 0,
-                    0.0625f, d_pacc, d_pm, d_pl, modes[m][0], modes[m][1], modes[m][2],
-                    modes[m][3]);
+                    0.0625f, d_pacc, d_pm, d_pl, modes[m][0], modes[m][1]);
             }
             cudaEventRecord(b3);
             cudaEventSynchronize(b3);
-            float ms3 = 0;
-            cudaEventElapsedTime(&ms3, a3, b3);
-            std::printf("phase-bench %-11s: %.3f ms/call\n", names[m], ms3 / 8);
+            cudaEventElapsedTime(&times[m], a3, b3);
+            times[m] /= 8;
+            std::printf("phase-bench %-11s: %.3f ms/call\n", names[m], times[m]);
             cudaEventDestroy(a3);
             cudaEventDestroy(b3);
         }
+        std::printf("phase-bench decode-only: %.3f ms/call\n", times[0] - times[1]);
+        std::printf("phase-bench score/pv  : %.3f ms/call\n", times[0] - times[2]);
         cudaFree(d_pos3);
     }
 

@@ -31,6 +31,25 @@ struct GqaCachedInput {
     static constexpr bool writes_cache = false;
 };
 
+// KV-source policies for the tensor-core small-T partial kernel
+// (gqa_attention_decode_bf16.cuh): where each 32-key tile's bf16 rows come
+// from, and whether attention runs in the hq codec's rotated frame.
+struct GqaTcKVLinear {
+    static constexpr bool hq      = false;
+    static constexpr bool rotated = false;
+    __nv_bfloat16* k; // paged bf16 K cache (also the append write target)
+    __nv_bfloat16* v;
+};
+
+struct GqaTcKVHq {
+    static constexpr bool hq      = true;
+    static constexpr bool rotated = true;
+    std::uint8_t* codes_k; // paged hq code/meta planes (also the append targets)
+    std::uint8_t* codes_v;
+    std::uint8_t* meta_k;
+    std::uint8_t* meta_v;
+};
+
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_cache_index(int physical_page, int kv_head, int d,
                                                         int page_offset) {

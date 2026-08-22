@@ -316,28 +316,22 @@ int main() {
         cudaMalloc(&d_pacc, pacc_n * 2);
         cudaMalloc(&d_pm, pstat_n * 4);
         cudaMalloc(&d_pl, pstat_n * 4);
-        cudaFuncSetAttribute(gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaCachedInput>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(gqa_hq_decode_smem_bytes<Gqa27Geometry>()));
-        cudaFuncSetAttribute(gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(gqa_hq_decode_smem_bytes<Gqa27Geometry>()));
-        cudaGetLastError();
         const dim3 grid(kKVHeads, kSplits, sc.batch);
+        const GqaTcKVHq hq_cache{d_ck, d_cv, d_mk, d_mv};
         const auto launch = [&]() {
             if (sc.append) {
                 GqaAppendInput input{d_knew, d_vnew};
-                gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>
-                    <<<grid, kGqaHqDecodeThreads, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
-                        d_q, input, d_pos, sc.width, d_ck, d_cv, d_mk, d_mv, d_table, d_vc,
-                        d_trows, sc.window + 1, sc.full_width, sc.column_begin,
+                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaAppendInput, GqaTcKVHq>
+                    <<<grid, kGqaHqDecodeThreads, 0>>>(
+                        d_q, input, d_pos, hq_cache, d_table, d_vc, d_trows, sc.window + 1,
+                        sc.width, sc.full_width, sc.column_begin,
                         sc.capacity >= 0 ? sc.capacity : sc.window, kScale, d_pacc, d_pm, d_pl);
             } else {
                 GqaCachedInput no_append{};
-                gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaCachedInput>
-                    <<<grid, kGqaHqDecodeThreads, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
-                        d_q, no_append, d_pos, sc.width, d_ck, d_cv, d_mk, d_mv, d_table, d_vc,
-                        d_trows, sc.window + 1, sc.full_width, sc.column_begin,
+                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaCachedInput, GqaTcKVHq>
+                    <<<grid, kGqaHqDecodeThreads, 0>>>(
+                        d_q, no_append, d_pos, hq_cache, d_table, d_vc, d_trows, sc.window + 1,
+                        sc.width, sc.full_width, sc.column_begin,
                         sc.capacity >= 0 ? sc.capacity : sc.window, kScale, d_pacc, d_pm, d_pl);
             }
             cudaDeviceSynchronize();

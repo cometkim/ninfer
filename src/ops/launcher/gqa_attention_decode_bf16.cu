@@ -23,20 +23,22 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     Tensor& cache_v = cache.v_pages;
     // bf16 kernel uses only static smem (no dynamic staging).
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
-                                                 Masked, CacheInput><<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), input,
-        static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
-        static_cast<__nv_bfloat16*>(cache_v.data),
-        static_cast<const std::int32_t*>(cache.block_tables.data),
-        invocation.valid_columns == nullptr
-            ? nullptr
-            : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-        invocation.table_rows == nullptr
-            ? nullptr
-            : static_cast<const std::int32_t*>(invocation.table_rows->data),
-        cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
-        logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                                                 Masked, CacheInput, GqaTcKVLinear>
+        <<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data),
+            GqaTcKVLinear{static_cast<__nv_bfloat16*>(cache_k.data),
+                          static_cast<__nv_bfloat16*>(cache_v.data)},
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
+            logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

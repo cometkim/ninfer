@@ -569,6 +569,15 @@ __device__ __forceinline__ std::uint32_t hq_group_read(unsigned long long w,
     return (lo << (k - here)) | hi;
 }
 
+// Element index remap for decoding a row directly into an XOR-swizzled tile
+// (gqa_small_t_tc_swz): the swizzle moves whole 8-element chunks (chunk ^
+// xor_chunk) and keeps each chunk's 8 elements contiguous, so both the u16
+// symbol staging and the final bf16 values land at ldmatrix-visible positions
+// through the same map. xor_chunk = 0 is the linear layout.
+__device__ __forceinline__ int hq_swz_element(int e, int xor_chunk) {
+    return e ^ (xor_chunk << 3);  // flips only bits 3..5: the 8-element chunk index
+}
+
 // Walk one 64-bit window from an entry state: entry >= 0 with boundary=true
 // means a symbol starts at that bit; boundary=false means an unary run from a
 // previous window is pending (find its terminator first, own nothing there).
@@ -609,7 +618,8 @@ __device__ __forceinline__ void hq_group_scan_window(unsigned long long w, std::
 
 __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
                                                     const std::uint8_t* meta,
-                                                    __nv_bfloat16* out, int lane) {
+                                                    __nv_bfloat16* out, int lane,
+                                                    int xor_chunk = 0) {
     const std::uint32_t mw0 = *reinterpret_cast<const std::uint32_t*>(meta);
     const std::uint32_t mw1 = *reinterpret_cast<const std::uint32_t*>(meta + 4);
     const unsigned used_bits = ((mw0 >> 24) & 0xFFu) | ((mw1 & 0x3u) << 8);
@@ -617,7 +627,9 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
     if (used_bits == 0 || k > kHqMaxRiceK) {
         // Never-written row (zeroed metadata): decodes to exact zeros.
 #pragma unroll 1
-        for (int i = lane; i < kHqHeadDim; i += 8) { out[i] = __float2bfloat16(0.0f); }
+        for (int i = lane; i < kHqHeadDim; i += 8) {
+            out[hq_swz_element(i, xor_chunk)] = __float2bfloat16(0.0f);
+        }
         return;
     }
 
@@ -673,7 +685,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
             const int p = __clzll(v);
             int z       = carry + p;
             if (z >= static_cast<int>(kHqUnaryGuard)) { z = 0; }
-            out16[base + n] = static_cast<std::uint16_t>(z);
+            out16[hq_swz_element(base + n, xor_chunk)] = static_cast<std::uint16_t>(z);
             ++n;
             v = (v << p) << 1;  // two shifts: p can be 63
             carry = 0;
@@ -734,7 +746,8 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
                 if (cursor >= 0) {
                     const std::uint32_t q = static_cast<std::uint32_t>(t - cursor);
                     const std::uint32_t r = hq_group_read(w, remote[0], t + 1, k);
-                    out16[s++] = static_cast<std::uint16_t>((q << k) | r);
+                    out16[hq_swz_element(s, xor_chunk)] = static_cast<std::uint16_t>((q << k) | r);
+                    ++s;
                     ++n;
                 }
                 cursor = t + 1 + static_cast<int>(k);
@@ -760,7 +773,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
                 }
                 break;
             }
-            out16[s] = static_cast<std::uint16_t>(z);
+            out16[hq_swz_element(s, xor_chunk)] = static_cast<std::uint16_t>(z);
         }
     }
 
@@ -770,13 +783,14 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
     if (idx_total < kHqHeadDim && lane == 0) {
         std::uint16_t* out16 = reinterpret_cast<std::uint16_t*>(out);
 #pragma unroll 1
-        for (int t = idx_total; t < kHqHeadDim; ++t) { out16[t] = 0; }
+        for (int t = idx_total; t < kHqHeadDim; ++t) { out16[hq_swz_element(t, xor_chunk)] = 0; }
     }
     __syncwarp(gmask);
 
     // Unstrip/scale four complete E8 words per lane, reassembled from the
     // staged row (word ownership is static, so lane-boundary words need no
-    // cross-lane exchange).
+    // cross-lane exchange). The staged u16 codes and the final bf16 values
+    // share the same (possibly swizzled) element slots.
     const std::uint32_t escalation = (mw0 >> 20) & 0x3u;
     __half h;
     *reinterpret_cast<std::uint16_t*>(&h) = static_cast<std::uint16_t>(mw0 & 0xFFFFu);
@@ -787,17 +801,17 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int word = lane + 8 * i;
+        const int base = hq_swz_element(word * 8, xor_chunk);
         std::uint32_t z[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            z[j] = reinterpret_cast<const std::uint16_t*>(out)[word * 8 + j];
+            z[j] = reinterpret_cast<const std::uint16_t*>(out)[base + j];
         }
         int y[8];
         hq_unstrip_word(z, y);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            out[word * 8 + j] =
-                __float2bfloat16(static_cast<float>(y[j]) * norm * inv_scale);
+            out[base + j] = __float2bfloat16(static_cast<float>(y[j]) * norm * inv_scale);
         }
     }
 }

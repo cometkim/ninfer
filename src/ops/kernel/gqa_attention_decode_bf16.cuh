@@ -1,30 +1,45 @@
 #pragma once
 
-// ninfer::ops - split-KV GQA small-T attention, BF16 KV-cache partial kernel.
+// ninfer::ops - split-KV GQA small-T attention, tensor-core partial kernel.
 // Standalone from the int8 kernel (gqa_attention_decode_i8.cuh): shared scaffolding
 // lives in gqa_attention_decode.cuh, but the body/append/load are not shared so the
 // bf16 path can be tuned independently. Processes one KV head, one query-head
 // subgroup, and one token tile; a reducer combines the split-local partials.
+//
+// Templated on a KV-source policy: GqaTcKVLinear stages bf16 pages with
+// cp.async; GqaTcKVHq decodes each 32-key tile from the hq-e8-2b code/meta
+// planes straight into the swizzled tile positions with the 8-lane cooperative
+// row decoder (hq_decode_row_group), runs QK/PV on the same ldmatrix+mma path,
+// and works in the codec's rotated frame: staged q rows are FWHT-rotated after
+// landing (bf16 -> FWHT -> bf16, one rounding, same as the fill side) and each
+// output row is un-rotated once before the partial stores, so the shared
+// reducer combines original-frame partials unchanged. The fused append encodes
+// the round's new K/V rows into the code planes (per-warp encoder scratch
+// aliases the qkv tile, unused before q staging).
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_decode.cuh"
+#include "ops/kernel/gqa_attention_prefill_hq.cuh"
+#include "ops/kernel/hq_codec.cuh"
 
 #include <cstdint>
 
 namespace ninfer::ops {
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput>
+          typename CacheInput, typename KvSource>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
-    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
-    __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
+    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, KvSource kv,
+    const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
+    static_assert(KvSource::hq == KvSource::rotated, "hq tiles only exist in the rotated frame");
+    static_assert(!KvSource::rotated || kHqHeadDim == kGqaHeadDim);
 
     constexpr int Wc      = WarpsPerCta;
     constexpr int Br      = Wc * 16;
@@ -46,6 +61,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
     __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
     __shared__ std::int32_t physical_pages_s[PageIds];
+    __shared__ std::int8_t signs_s[KvSource::rotated ? kGqaHeadDim : 1];
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
 
@@ -58,9 +74,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const int lane        = tid & 31;
     int valid_tokens      = tokens;
     if constexpr (Masked) {
-        const int remaining = valid_columns[batch] - column_begin;
-        valid_tokens        = remaining <= 0 ? 0 : (remaining < tokens ? remaining : tokens);
-    }
+        // nullptr valid_columns = unmasked (the hq route shares one runtime-width
+        // instantiation across masked and unmasked launches; the bf16 route never
+        // passes null when Masked).
+        if (valid_columns != nullptr) {
+            const int remaining = valid_columns[batch] - column_begin;
+            valid_tokens        = remaining <= 0 ? 0 : (remaining < tokens ? remaining : tokens);
+        }    }
     const int row_count = tokens * Geometry::GroupSize;
 
     std::int64_t column_base = column_begin;
@@ -124,7 +144,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const int window = last_pos + 1;
     const int active_split_count =
         gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
-    if (split >= active_split_count) { return; }
+    if (split >= active_split_count) {
+        // The hq route's public partials contract neutralizes inactive splits
+        // (the shared reducer may read partials buffers that carry earlier,
+        // non-zero contents); the bf16 route leaves them unwritten and relies
+        // on the engine's zero-initialized partial workspace instead.
+        if constexpr (KvSource::hq) { write_neutral(); }
+        return;
+    }
 
     const int logical_tiles = div_up(window, Bc);
     const bool tile_split   = logical_tiles >= active_split_count;
@@ -145,23 +172,60 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         physical_pages_s[page] = block_table[first_page + page];
     }
 
+    if constexpr (KvSource::rotated) {
+        hq_engine_signs_fill(signs_s);
+        __syncthreads();
+    }
+
     if constexpr (CacheInput::writes_cache) {
         // The owning split writes each new row. Current attention reads those rows directly from
         // input below, so no split depends on another split's cache write.
-        for (int chunk = tid; chunk < valid_tokens * (D / 8); chunk += Threads) {
-            const int token = chunk / (D / 8);
-            const int d     = (chunk - token * (D / 8)) * 8;
-            const int p_tok = pos[token];
-            if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 &&
-                p_tok < logical_capacity) {
-                const std::int64_t new_off = gqa_kv_new_index<Geometry>(kv_head, d, token);
-                const int lane             = tid & 31;
-                int physical_page = lane == 0 ? paged_kv_physical_page(block_table, p_tok) : 0;
-                physical_page     = __shfl_sync(FullMask, physical_page, 0);
-                const std::int64_t cache_off =
-                    gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
-                store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
-                store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
+        if constexpr (KvSource::hq) {
+            // Fused append in the hq route: every split encodes the new K/V rows whose
+            // positions fall in its own key range before any block reads them (each key
+            // row belongs to exactly one split, so the writer block is also the only
+            // reader of those rows). (token, role) units are flattened over the warps
+            // — one encode per unit, no duplicate work — and the per-warp encoder
+            // scratch aliases the qkv tile, which is unused until q staging below.
+            static_assert(WarpsPerCta * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow) *
+                                  sizeof(float) <=
+                              QkvRows * D * sizeof(__nv_bfloat16),
+                          "per-warp append scratch must fit the qkv tile it aliases");
+            float* append_scratch = reinterpret_cast<float*>(qkv_s);
+            for (int unit = warp; unit < valid_tokens * 2; unit += Wc) {
+                const int t         = unit >> 1;
+                const bool role_v   = (unit & 1) != 0;
+                const std::int32_t p = pos[t];
+                if (p < split_start || p >= split_end) { continue; }
+                float* u = append_scratch + warp * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow);
+                std::uint32_t* syms = reinterpret_cast<std::uint32_t*>(u + kHqSmemFloatsPerRow);
+                const std::int64_t base =
+                    static_cast<std::int64_t>(t) * Geometry::KVHeads * kGqaHeadDim;
+                const __nv_bfloat16* src = (role_v ? input.v : input.k) + base +
+                                           gqa_kv_new_index<Geometry>(kv_head, 0, 0);
+                hq_encode_row_warp(src, signs_s, 0, u, syms,
+                                   hq_row_codes_mut<Geometry>(role_v ? kv.codes_v : kv.codes_k,
+                                                              block_table, kv_head, p),
+                                   hq_row_meta_mut<Geometry>(role_v ? kv.meta_v : kv.meta_k,
+                                                             block_table, kv_head, p));
+            }
+        } else {
+            for (int chunk = tid; chunk < valid_tokens * (D / 8); chunk += Threads) {
+                const int token = chunk / (D / 8);
+                const int d     = (chunk - token * (D / 8)) * 8;
+                const int p_tok = pos[token];
+                if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 &&
+                    p_tok < logical_capacity) {
+                    const std::int64_t new_off = gqa_kv_new_index<Geometry>(kv_head, d, token);
+                    const int lane             = tid & 31;
+                    int physical_page = lane == 0 ? paged_kv_physical_page(block_table, p_tok) : 0;
+                    physical_page     = __shfl_sync(FullMask, physical_page, 0);
+                    const std::int64_t cache_off =
+                        gqa_cache_index<Geometry>(physical_page, kv_head, d,
+                                                  p_tok & kPagedKVPageMask);
+                    store_vec(&kv.k[cache_off], load_vec<int4>(&input.k[new_off]));
+                    store_vec(&kv.v[cache_off], load_vec<int4>(&input.v[new_off]));
+                }
             }
         }
         __syncthreads();
@@ -180,6 +244,26 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         qkv_s[row * D + gqa_small_t_tc_swz(row, d)] = value;
     }
     __syncthreads();
+
+    if constexpr (KvSource::rotated) {
+        // Rotate the staged q rows into the codec frame before any QK MMA reads
+        // them: bf16 -> FWHT(+signs) -> bf16, the same single rounding the fill
+        // side applies to K/V. Zero-padded tail rows stay exactly zero.
+        for (int row = warp; row < row_count; row += Wc) {
+            float reg[8];
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                reg[s] = __bfloat162float(qkv_s[row * D + gqa_small_t_tc_swz(row, s * 32 + lane)]);
+            }
+            hq_fwht256_sign(reg, signs_s, 0, lane);
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                qkv_s[row * D + gqa_small_t_tc_swz(row, s * 32 + lane)] =
+                    __float2bfloat16(reg[s]);
+            }
+        }
+        __syncthreads();
+    }
 
     const int gid = lane >> 2;
     const int lid = lane & 3;
@@ -214,47 +298,81 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
-        if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
-            physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
-        }
-        // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
-        // Current-step tokens come from k_new/v_new; tail slots are zeroed.
+        if constexpr (KvSource::hq) {
+            // Tile source: group-decode the K/V rows straight into the swizzled
+            // tile positions. Under the XOR swizzle each lattice word's 8
+            // outputs stay contiguous, so the decoder only remaps the word base
+            // (chunk ^ (key row & 7)). Rows outside this split's key range are
+            // zeroed so stale shared memory (possibly NaN) never reaches the
+            // MMA path. 128 threads cover the 2 x 32 rows in four 16-row waves.
 #pragma unroll 1
-        for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
-            const int key_l      = chunk / (D / 8);
-            const int d          = (chunk - key_l * (D / 8)) * 8;
-            const int key        = k0 + key_l;
-            __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
-            __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
-            if (key >= split_start && key < split_end) {
-                if constexpr (CacheInput::writes_cache) {
-                    const int new_token = key - first_pos;
-                    const bool from_new =
-                        new_token >= 0 && new_token < valid_tokens && key >= first_pos;
-                    if (from_new) {
-                        const std::int64_t off = gqa_kv_new_index<Geometry>(kv_head, d, new_token);
-                        ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
-                        ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
+            for (int slot = tid; slot < 2 * Bc * 8; slot += Threads) {
+                const bool role_v = slot >= Bc * 8;
+                const int key_l   = (slot >> 3) & (Bc - 1);
+                const int lane8   = slot & 7;
+                __nv_bfloat16* row_dst = (role_v ? v_s : k_s) + key_l * D;
+                const int key = k0 + key_l;
+                if (key >= split_start && key < split_end) {
+                    hq_decode_row_group(
+                        hq_row_codes<Geometry>(role_v ? kv.codes_v : kv.codes_k, block_table,
+                                              kv_head, key),
+                        hq_row_meta<Geometry>(role_v ? kv.meta_v : kv.meta_k, block_table, kv_head,
+                                             key),
+                        row_dst, lane8, key_l & 7);
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const int chunk = ((lane8 * 4 + j) ^ (key_l & 7)) << 3;
+                        store_vec(row_dst + chunk, make_int4(0, 0, 0, 0));
+                    }
+                }
+            }
+            __syncthreads();
+        } else {
+            if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
+                physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+            }
+            // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
+            // Current-step tokens come from k_new/v_new; tail slots are zeroed.
+#pragma unroll 1
+            for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
+                const int key_l      = chunk / (D / 8);
+                const int d          = (chunk - key_l * (D / 8)) * 8;
+                const int key        = k0 + key_l;
+                __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
+                __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
+                if (key >= split_start && key < split_end) {
+                    if constexpr (CacheInput::writes_cache) {
+                        const int new_token = key - first_pos;
+                        const bool from_new =
+                            new_token >= 0 && new_token < valid_tokens && key >= first_pos;
+                        if (from_new) {
+                            const std::int64_t off =
+                                gqa_kv_new_index<Geometry>(kv_head, d, new_token);
+                            ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
+                            ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                        } else {
+                            const std::int64_t off = gqa_cache_index<Geometry>(
+                                physical_page, kv_head, d, key & kPagedKVPageMask);
+                            ninfer::ops::cp_async<16>(k_dst, &kv.k[off]);
+                            ninfer::ops::cp_async<16>(v_dst, &kv.v[off]);
+                        }
                     } else {
-                        const std::int64_t off = gqa_cache_index<Geometry>(
-                            physical_page, kv_head, d, key & kPagedKVPageMask);
-                        ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
-                        ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                        const std::int64_t off = gqa_cache_index<Geometry>(physical_page, kv_head,
+                                                                           d,
+                                                                           key & kPagedKVPageMask);
+                        ninfer::ops::cp_async<16>(k_dst, &kv.k[off]);
+                        ninfer::ops::cp_async<16>(v_dst, &kv.v[off]);
                     }
                 } else {
-                    const std::int64_t off = gqa_cache_index<Geometry>(physical_page, kv_head, d,
-                                                                       key & kPagedKVPageMask);
-                    ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
-                    ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                    store_vec(k_dst, make_int4(0, 0, 0, 0));
+                    store_vec(v_dst, make_int4(0, 0, 0, 0));
                 }
-            } else {
-                store_vec(k_dst, make_int4(0, 0, 0, 0));
-                store_vec(v_dst, make_int4(0, 0, 0, 0));
             }
+            ninfer::ops::cp_commit();
+            ninfer::ops::cp_wait<0>();
+            __syncthreads();
         }
-        ninfer::ops::cp_commit();
-        ninfer::ops::cp_wait<0>();
-        __syncthreads();
 
         float score[QKNt][4];
 #pragma unroll
@@ -411,6 +529,24 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         }
     }
     __syncthreads();
+
+    if constexpr (KvSource::rotated) {
+        // Partials are written in the original frame: un-rotate each output row
+        // once (FP32 registers over the staged bf16 row, one extra rounding)
+        // before the contiguous partial stores, so the shared reducer and the
+        // other cache dtypes combine identical-frame partials.
+        for (int row = warp; row < row_count; row += Wc) {
+            float reg[8];
+#pragma unroll
+            for (int s = 0; s < 8; ++s) { reg[s] = __bfloat162float(qkv_s[row * D + s * 32 + lane]); }
+            hq_ifwht256_sign(reg, signs_s, 0, lane);
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+                qkv_s[row * D + s * 32 + lane] = __float2bfloat16(reg[s]);
+            }
+        }
+        __syncthreads();
+    }
 
     for (int chunk = tid; chunk < row_count * (D / 8); chunk += Threads) {
         const int row = chunk / (D / 8);
