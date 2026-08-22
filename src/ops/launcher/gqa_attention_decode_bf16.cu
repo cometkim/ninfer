@@ -51,6 +51,9 @@ void gqa_small_t_partial_bf16(const Tensor& q, CacheInput input, const Tensor& p
                               Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                               cudaStream_t stream) {
     // BF16 keeps its row-tile warp count (2 warps at T=1, 4 warps above).
+    // The kernel treats valid_columns == nullptr under Masked=true as unmasked
+    // (the hq route shares the template that way); this route only instantiates
+    // Masked=true when valid_columns is non-null, and must keep that invariant.
 #define NINFER_GQA_SMALL_T_BF16_DISPATCH(TOKENS, WARPS)                                             \
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
