@@ -185,7 +185,10 @@ The engine context envelope is 1,048,576 tokens with `--kv-dtype hq-e8-2b` and 2
 with `bf16` or `int8` (the BF16/I8 decode kernels stage a fixed number of page ids per split).
 The checkpoint's trained position capacity is 262,144 tokens: contexts past it require
 `--rope-scaling yarn:F` (use factor 2 for a 524k deployment, factor 4 for 1M; Qwen notes YaRN
-degrades short prompts, so leave it off at or below the native range). The practical
+degrades short prompts, so leave it off at or below the native range). On the 35B-A3B target
+the text route honors the scaling but DFlash rejects it. A context above the native range
+without scaling, or scaling active below it, is reported as a note in the CLI summary and
+the server request log. The practical
 allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
 Use `--kv-dtype int8` for large context allocations; `hq-e8-2b` (fixed-budget

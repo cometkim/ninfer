@@ -421,6 +421,10 @@ struct MemorySummary {
     std::uint32_t kv_capacity_page_groups     = 0;
     std::uint32_t kv_capacity_max_page_groups = 0;
     KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
+    float rope_scaling_factor                 = 0.0F;
+    // Set when the resolved configuration deserves an operator-visible caution (static rope
+    // scaling active below the checkpoint's native range, or an unscaled context past it).
+    const char* rope_note                     = nullptr;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;

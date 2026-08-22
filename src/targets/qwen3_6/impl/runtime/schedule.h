@@ -40,7 +40,9 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
-    const ops::RopeFrequencies* rope_frequencies;
+    // Reference, not pointer: a positional aggregate that omits it fails to compile
+    // instead of silently nulling (the session-10 segfault class).
+    const ops::RopeFrequencies& rope_frequencies;
 };
 
 struct PrefillContext {

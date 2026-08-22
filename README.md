@@ -419,7 +419,9 @@ from one to fifteen.
 - NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
   multi-GPU execution, CPU/GPU offload, or distributed serving.
 - `--max-context` is the logical ceiling of each sequence and is configurable up to the registered
-  models' native 262,144-token limit. `--kv-capacity N` explicitly sizes the shared Main Text KV
+  models' per-dtype context envelope: 262,144 tokens with `bf16`/`int8` KV and 1,048,576
+with `hq-e8-2b` (YaRN `--rope-scaling yarn:F` past the checkpoint's trained 262,144
+positions). `--kv-capacity N` explicitly sizes the shared Main Text KV
   pool for all active and retained sequences, while `--kv-capacity auto` selects the largest usable
   capacity from the memory remaining after weights are loaded while preserving 1 GiB of sizing
   headroom. Omission defaults to one `--max-context` worth of pages. The resolved pool is fixed at

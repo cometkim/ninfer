@@ -544,6 +544,13 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
         throw std::invalid_argument("max_context exceeds the variant native context capacity");
     }
+    if (options.kv_cache != KvCacheStorage::HqE8Rice2B &&
+        options.max_context > ops::kGqaAttentionMaximumLinearVisibleKeys) {
+        throw std::invalid_argument(
+            "max_context beyond " +
+            std::to_string(ops::kGqaAttentionMaximumLinearVisibleKeys) +
+            " requires --kv-dtype hq-e8-2b: bf16/int8 KV envelopes stay at the linear limit");
+    }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }

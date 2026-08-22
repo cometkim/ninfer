@@ -181,7 +181,8 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
-      rope_frequencies(plan.text_rope), max_concurrency(plan.max_concurrency),
+      rope_frequencies(plan.text_rope), rope_scaling_factor(plan.rope_scaling_factor),
+      max_concurrency(plan.max_concurrency),
       prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
@@ -1236,7 +1237,7 @@ void ProgramImplCore::prepare_graphs() {
                                        prefill_hidden,
                                        prefill_chunk,
                                        proposal_head,
-                                       &rope_frequencies};
+                                       rope_frequencies};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1500,7 +1501,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
     schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
                                          replay_records ? &*replay_records : nullptr, io,
                                          prefill_hidden, prefill_chunk, proposal_head,
-                                         &rope_frequencies},
+                                         rope_frequencies},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts, lane_tensor,
@@ -1531,7 +1532,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, &rope_frequencies},
+             proposal_head, rope_frequencies},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1789,7 +1790,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, &rope_frequencies},
+             proposal_head, rope_frequencies},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -1921,7 +1922,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head,
-                                                  &rope_frequencies},
+                                                  rope_frequencies},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -2083,7 +2084,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head, &rope_frequencies},
+                                                     proposal_head, rope_frequencies},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,
@@ -2218,6 +2219,17 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         if (kv_dtype == DType::U8) { return KvCacheStorage::HqE8Rice2B; }
         return KvCacheStorage::Int8Group64;
     }();
+    out.rope_scaling_factor = rope_scaling_factor;
+    if (rope_scaling_factor > 1.0F) {
+        if (capacity <= TextConfig::original_positions) {
+            out.rope_note =
+                "rope scaling is active below the checkpoint's native position range; this "
+                "costs short-prompt quality";
+        }
+    } else if (capacity > TextConfig::original_positions) {
+        out.rope_note =
+            "max-context exceeds the checkpoint's trained positions without rope scaling";
+    }
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

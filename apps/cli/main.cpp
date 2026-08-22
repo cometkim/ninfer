@@ -193,6 +193,11 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("gpu weights used", format_arena_used(memory.weights));
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
+    print_metric("rope scaling",
+                 memory.rope_scaling_factor > 1.0F
+                     ? "yarn:" + std::to_string(memory.rope_scaling_factor)
+                     : "none");
+    if (memory.rope_note != nullptr) { print_metric("rope note", memory.rope_note); }
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
