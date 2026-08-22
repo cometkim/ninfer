@@ -79,15 +79,19 @@ template <typename Geometry, bool Rotated = false>
 __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* cache,
                                                      int kv_head, int k0, int max_query_abs,
                                                      int physical_page, int tid,
-                                                     std::int32_t scratch_span) {
+                                                     std::int32_t scratch_span, int key_base = 0,
+                                                     int key_limit = 0x7fffffff) {
     constexpr int D         = kGqaPrefillHeadDim;
     constexpr int Bc        = kGqaPrefillBc;
     constexpr int Threads   = kGqaPrefillThreads;
     constexpr int VecPerRow = D / 8; // 8 bf16 per 16B cp.async
-    const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
+    // Banded (Rotated scratch) staging is band-local: absolute key k0 addresses scratch row
+    // k0 - key_base, and rows past key_limit are beyond the decoded band - zero-fill them.
+    const int bound         = min(max_query_abs, key_limit);
+    const bool full_tile    = (k0 + Bc - 1) <= bound;
     // Block base pointer computed once (int64); per-element offsets stay 32-bit.
     const __nv_bfloat16* cache_block =
-        Rotated ? cache + (static_cast<std::int64_t>(kv_head) * scratch_span + k0) * D
+        Rotated ? cache + (static_cast<std::int64_t>(kv_head) * scratch_span + k0 - key_base) * D
                 : cache + paged_kv_element_offset<kGqaPrefillHeadDim, Geometry::KVHeads>(
                               physical_page, kv_head, k0 & kPagedKVPageMask, 0);
     if (full_tile) {
@@ -104,7 +108,7 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
             const int key_l  = chunk >> 5;        // / VecPerRow (32)
             const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
             __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
-            if ((k0 + key_l) <= max_query_abs) {
+            if ((k0 + key_l) <= bound) {
                 cp_async<16, Cache::cg>(p, &cache_block[key_l * D + d]);
             } else {
                 store_vec(p, make_int4(0, 0, 0, 0));
@@ -116,7 +120,13 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata, bool Rotated = false>
+// Carry (banded hq prompt route): the kernel covers only keys [key_begin, key_end) of the
+// scratch, starts its online-softmax state from the carried (m, l, acc) buffers when key_begin
+// > 0, and writes the state back unnormalized instead of normalizing into `out` when
+// store_carry is set. The buffers use `out`'s [head_dim, q_heads, width] layout for acc and
+// [q_heads, width] for m/l; acc crosses band boundaries as bf16, matching the decode split
+// partial contract. Single-band launches pass the defaults and stay on the original path.
+template <typename Geometry, typename Metadata, bool Rotated = false, bool Carry = false>
 __launch_bounds__(kGqaPrefillThreads, 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const __nv_bfloat16* __restrict__ cache_k,
@@ -124,7 +134,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                                            Metadata metadata,
                                            const std::int32_t* __restrict__ positions, float scale,
                                            __nv_bfloat16* __restrict__ out, std::int32_t width,
-                                           std::int32_t scratch_span) {
+                                           std::int32_t scratch_span,
+                                           std::int32_t key_begin = 0,
+                                           std::int32_t key_end   = 0x7fffffff,
+                                           __nv_bfloat16* __restrict__ carry_acc   = nullptr,
+                                           float* __restrict__ carry_m             = nullptr,
+                                           float* __restrict__ carry_l             = nullptr,
+                                           std::int32_t store_carry                = 0) {
+    static_assert(!Carry || Rotated, "band carry exists only on the rotated scratch route");
     constexpr int D             = kGqaPrefillHeadDim; // 256
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
     constexpr int Bc            = kGqaPrefillBc;      // 64 key cols
@@ -138,6 +155,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     static_assert(Threads == 128);
     if constexpr (!Rotated) { (void)scratch_span; }
+    if constexpr (!Carry) {
+        (void)key_begin;
+        (void)key_end;
+        (void)carry_acc;
+        (void)carry_m;
+        (void)carry_l;
+        (void)store_carry;
+    }
 
     extern __shared__ __align__(16) __nv_bfloat16 gqa_smem[];
     __nv_bfloat16* q_s = gqa_smem;     // [Br, D] swizzled
@@ -235,17 +260,81 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
-    const int n_block_max   = (max_query_abs / Bc) + 1; // n_block_min == 0
+    const int key_limit     = Carry ? min(key_end, max_query_abs + 1) : (max_query_abs + 1);
+    const int kb_begin      = Carry ? (key_begin / Bc) : 0;
+    const int n_block_max   = (key_limit + Bc - 1) / Bc; // tiles [kb_begin, n_block_max)
+
+    if constexpr (Carry) {
+        if (key_begin > 0) {
+            // Resume the online softmax from the previous band's state. The carried acc is
+            // stored un-rotated (out frame): load each row, FWHT-rotate into the codec frame,
+            // stage through the same 8-row smem window the epilogue uses, and rebuild the C
+            // fragments. Runs before Q/K(0) staging, so k_s is dead storage here.
+            hq_engine_signs_fill(signs);
+            __syncthreads();
+            float* epi = reinterpret_cast<float*>(k_s) + warp * 8 * D;
+            for (int half = 0; half < 2; ++half) {
+                for (int i = 0; i < 8; ++i) {
+                    const int qrow = q0 + warp_row0 + half * 8 + i;
+                    float reg[8];
+                    if (qrow < tokens) {
+#pragma unroll
+                        for (int si = 0; si < 8; ++si) {
+                            reg[si] = __bfloat162float(
+                                carry_acc[gqa_prefill_q_index<Geometry>(q_head, si * 32 + lane,
+                                                                        qrow)]);
+                        }
+                        hq_fwht256_sign(reg, signs, 0, lane);
+                    } else {
+#pragma unroll
+                        for (int si = 0; si < 8; ++si) { reg[si] = 0.0f; }
+                    }
+#pragma unroll
+                    for (int si = 0; si < 8; ++si) { epi[i * D + si * 32 + lane] = reg[si]; }
+                }
+                __syncwarp(FullMask);
+#pragma unroll
+                for (int n = 0; n < PVNt; ++n) {
+                    const int d0 = n * 8 + 2 * lid;
+                    if (half == 0) {
+                        acc[n][0] = epi[gid * D + d0 + 0];
+                        acc[n][1] = epi[gid * D + d0 + 1];
+                    } else {
+                        acc[n][2] = epi[gid * D + d0 + 0];
+                        acc[n][3] = epi[gid * D + d0 + 1];
+                    }
+                }
+                __syncwarp(FullMask);
+            }
+            // l runs as per-lane partials inside the key loop (the epilogue's warp_sum<4>
+            // completes the row), so the full carried l splits evenly across the row's four
+            // lanes; m is row-uniform after each tile's warp_max.
+            const int row0_c = q0 + warp_row0 + gid;
+            const int row1_c = row0_c + 8;
+            if (row0_c < tokens) {
+                const std::int64_t stat = static_cast<std::int64_t>(q_head) * width + row0_c;
+                m0 = carry_m[stat];
+                l0 = 0.25f * carry_l[stat];
+            }
+            if (row1_c < tokens) {
+                const std::int64_t stat = static_cast<std::int64_t>(q_head) * width + row1_c;
+                m1 = carry_m[stat];
+                l1 = 0.25f * carry_l[stat];
+            }
+            __syncthreads();
+        }
+    }
 
     // Fold softmax_scale into the exp2 (FA-style): scores stay raw, so the
     // per-element "* scale" multiply drops out of the QK epilogue entirely.
     const float scale_l2 = scale * Log2E;
-    int physical_page    = block_table[0];
+    int physical_page    = block_table[kb_begin];
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     ninfer::ops::cp_commit();
-    gqa_prefill_stage_kv<Geometry, Rotated>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page,
-                                            tid, scratch_span);
+    gqa_prefill_stage_kv<Geometry, Rotated>(k_s, cache_k, kv_head, kb_begin * Bc, max_query_abs,
+                                            physical_page, tid, scratch_span,
+                                            Carry ? key_begin : 0, Carry ? key_end : 0x7fffffff);
     ninfer::ops::cp_commit();
 
     if constexpr (Rotated) {
@@ -271,7 +360,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         __syncthreads();
     }
 
-    for (int kb = 0; kb < n_block_max; ++kb) {
+    for (int kb = kb_begin; kb < n_block_max; ++kb) {
         const int k0                 = kb * Bc;
         const int next_physical_page = (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
 
@@ -280,7 +369,9 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
         // Overlap V(kb) load against the QK MMA below.
         gqa_prefill_stage_kv<Geometry, Rotated>(v_s, cache_v, kv_head, k0, max_query_abs,
-                                                physical_page, tid, scratch_span);
+                                                physical_page, tid, scratch_span,
+                                                Carry ? key_begin : 0,
+                                                Carry ? key_end : 0x7fffffff);
         ninfer::ops::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
@@ -334,7 +425,9 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const int qrow1            = q0 + row1;
         const int qabs0            = (qrow0 < tokens) ? base_pos + qrow0 : -1;
         const int qabs1            = (qrow1 < tokens) ? base_pos + qrow1 : -1;
-        const bool full_score_tile = (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0));
+        const bool full_score_tile =
+            (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0)) &&
+            (!Carry || (k0 + Bc) <= key_end);
 
         // block row-max on raw (unscaled) scores; scale is folded into exp2 below
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
@@ -349,10 +442,18 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                score[nt][0]   = (qrow0 < tokens && key0 <= qabs0) ? score[nt][0] : -CUDART_INF_F;
-                score[nt][1]   = (qrow0 < tokens && key1 <= qabs0) ? score[nt][1] : -CUDART_INF_F;
-                score[nt][2]   = (qrow1 < tokens && key0 <= qabs1) ? score[nt][2] : -CUDART_INF_F;
-                score[nt][3]   = (qrow1 < tokens && key1 <= qabs1) ? score[nt][3] : -CUDART_INF_F;
+                const bool key0_ok =
+                    key0 <= qabs0 && (!Carry || key0 < key_end);
+                const bool key1_ok =
+                    key1 <= qabs0 && (!Carry || key1 < key_end);
+                score[nt][0]   = (qrow0 < tokens && key0_ok) ? score[nt][0] : -CUDART_INF_F;
+                score[nt][1]   = (qrow0 < tokens && key1_ok) ? score[nt][1] : -CUDART_INF_F;
+                score[nt][2]   = (qrow1 < tokens && key0 <= qabs1 && (!Carry || key0 < key_end))
+                                     ? score[nt][2]
+                                     : -CUDART_INF_F;
+                score[nt][3]   = (qrow1 < tokens && key1 <= qabs1 && (!Carry || key1 < key_end))
+                                     ? score[nt][3]
+                                     : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }
@@ -437,7 +538,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             physical_page = next_physical_page;
             gqa_prefill_stage_kv<Geometry, Rotated>(k_s, cache_k, kv_head, (kb + 1) * Bc,
                                                     max_query_abs, physical_page, tid,
-                                                    scratch_span);
+                                                    scratch_span, Carry ? key_begin : 0,
+                                                    Carry ? key_end : 0x7fffffff);
             ninfer::ops::cp_commit();
         }
 
@@ -503,6 +605,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 // Row l lives on lanes [4i, 4i+4) of the C fragment; after the
                 // 4-lane butterfly reduction any of them holds the full sum.
                 const float lrow = __shfl_sync(FullMask, half == 0 ? l0 : l1, i << 2);
+                const float mrow = __shfl_sync(FullMask, half == 0 ? m0 : m1, i << 2);
                 const float inv_l = (lrow > 0.0f) ? __frcp_rn(lrow) : 0.0f;
                 float reg[8];
 #pragma unroll
@@ -510,10 +613,36 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 hq_ifwht256_sign(reg, signs, 0, lane);
                 const int qrow = q0 + warp_row0 + half * 8 + i;
                 if (qrow < tokens) {
+                    if constexpr (Carry) {
+                        if (store_carry != 0) {
+                            // Hand the unnormalized un-rotated accumulator and the running
+                            // softmax state to the next band; the row's lanes [4i,4i+4) agree
+                            // on m/l, so one of them writes.
 #pragma unroll
-                    for (int s = 0; s < 8; ++s) {
-                        out[gqa_prefill_q_index<Geometry>(q_head, s * 32 + lane, qrow)] =
-                            __float2bfloat16(reg[s] * inv_l);
+                            for (int s = 0; s < 8; ++s) {
+                                carry_acc[gqa_prefill_q_index<Geometry>(q_head, s * 32 + lane,
+                                                                        qrow)] =
+                                    __float2bfloat16(reg[s]);
+                            }
+                            if (lane == (i << 2)) {
+                                const std::int64_t stat =
+                                    static_cast<std::int64_t>(q_head) * width + qrow;
+                                carry_m[stat] = mrow;
+                                carry_l[stat] = lrow;
+                            }
+                        } else {
+#pragma unroll
+                            for (int s = 0; s < 8; ++s) {
+                                out[gqa_prefill_q_index<Geometry>(q_head, s * 32 + lane, qrow)] =
+                                    __float2bfloat16(reg[s] * inv_l);
+                            }
+                        }
+                    } else {
+#pragma unroll
+                        for (int s = 0; s < 8; ++s) {
+                            out[gqa_prefill_q_index<Geometry>(q_head, s * 32 + lane, qrow)] =
+                                __float2bfloat16(reg[s] * inv_l);
+                        }
                     }
                 }
             }

@@ -20,7 +20,9 @@ namespace ninfer::ops::detail {
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float scale,
                               const CacheView& cache, Metadata metadata, const Tensor& scratch_k,
-                              const Tensor& scratch_v, Tensor& out, cudaStream_t stream) {
+                              const Tensor& scratch_v, const Tensor& carry_acc,
+                              const Tensor& carry_m, const Tensor& carry_l,
+                              std::uint32_t visible_keys, Tensor& out, cudaStream_t stream) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     if (scratch_k.data == nullptr || scratch_v.data == nullptr ||
@@ -32,34 +34,66 @@ void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float sc
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(kGqaPrefillRotatedSmemBytes));
     CUDA_CHECK(attr_rot);
-    // Materialize the visible history once (rotated-frame bf16, eight lanes
-    // per row via the cooperative group decoder), then run the shared FA2
-    // prompt kernel over the scratch.
-    const auto tokens       = static_cast<std::int32_t>(q.ne[2]);
-    const auto span         = static_cast<std::int32_t>(scratch_k.ne[2]);
-    const auto units_bound  = static_cast<std::int64_t>(span) * Geometry::KVHeads * 2 * 8;
-    const int scratch_grid  = static_cast<int>(
-        div_up(units_bound, static_cast<std::int64_t>(kGqaHqScratchThreads)));
-    gqa_attention_prefill_hq_scratch_kernel<Geometry, Metadata>
-        <<<scratch_grid, kGqaHqScratchThreads, 0, stream>>>(
-            static_cast<const std::uint8_t*>(cache_k.data),
-            static_cast<const std::uint8_t*>(cache_v.data),
-            static_cast<const std::uint8_t*>(cache.k_scale_pages.data),
-            static_cast<const std::uint8_t*>(cache.v_scale_pages.data), metadata,
-            static_cast<const std::int32_t*>(positions.data), tokens, span,
-            static_cast<__nv_bfloat16*>(scratch_k.data),
-            static_cast<__nv_bfloat16*>(scratch_v.data));
-    CUDA_CHECK(cudaGetLastError());
+    static const cudaError_t attr_carry = cudaFuncSetAttribute(
+        gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true, true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(kGqaPrefillRotatedSmemBytes));
+    CUDA_CHECK(attr_carry);
+    // Materialize the visible history (rotated-frame bf16, eight lanes per row via the
+    // cooperative group decoder), then run the shared FA2 prompt kernel over the scratch.
+    // Scratch wider than `span` keys runs in sequential carry bands: each band decodes its
+    // keys into the band-local scratch rows and the FA2 kernel resumes/writes back the
+    // online-softmax state (m, l, unnormalized acc) between bands.
+    const auto tokens = static_cast<std::int32_t>(q.ne[2]);
+    const auto span   = static_cast<std::int32_t>(scratch_k.ne[2]);
+    const auto visible = static_cast<std::int32_t>(visible_keys);
     const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                               static_cast<unsigned>(Geometry::QHeads), 1u);
-    gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true>
-        <<<attention_grid, kGqaPrefillThreads, kGqaPrefillRotatedSmemBytes, stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data),
-            static_cast<const __nv_bfloat16*>(scratch_k.data),
-            static_cast<const __nv_bfloat16*>(scratch_v.data), metadata,
-            static_cast<const std::int32_t*>(positions.data), scale,
-            static_cast<__nv_bfloat16*>(out.data), tokens, span);
-    CUDA_CHECK(cudaGetLastError());
+    const int bands = static_cast<int>(div_up(visible, span));
+    if (bands > 1 && (span % kGqaPrefillBc) != 0) {
+        // Band bases index the FA2 key-tile grid; a mid-tile base would stage scratch
+        // rows below the band. The production band (262144) is tile-aligned.
+        throw std::invalid_argument("gqa_attention prompt: scratch band is not tile-aligned");
+    }
+    for (int band = 0; band < bands; ++band) {
+        const std::int32_t key_begin = band * span;
+        const std::int32_t band_rows = min(span, visible - key_begin);
+        const auto units_bound = static_cast<std::int64_t>(band_rows) * Geometry::KVHeads * 2 * 8;
+        const int scratch_grid = static_cast<int>(
+            div_up(units_bound, static_cast<std::int64_t>(kGqaHqScratchThreads)));
+        gqa_attention_prefill_hq_scratch_kernel<Geometry, Metadata>
+            <<<scratch_grid, kGqaHqScratchThreads, 0, stream>>>(
+                static_cast<const std::uint8_t*>(cache_k.data),
+                static_cast<const std::uint8_t*>(cache_v.data),
+                static_cast<const std::uint8_t*>(cache.k_scale_pages.data),
+                static_cast<const std::uint8_t*>(cache.v_scale_pages.data), metadata,
+                static_cast<const std::int32_t*>(positions.data), tokens, span,
+                static_cast<__nv_bfloat16*>(scratch_k.data),
+                static_cast<__nv_bfloat16*>(scratch_v.data), key_begin, band_rows);
+        CUDA_CHECK(cudaGetLastError());
+        if (bands == 1) {
+            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true>
+                <<<attention_grid, kGqaPrefillThreads, kGqaPrefillRotatedSmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(scratch_k.data),
+                    static_cast<const __nv_bfloat16*>(scratch_v.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens, span);
+        } else {
+            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true, true>
+                <<<attention_grid, kGqaPrefillThreads, kGqaPrefillRotatedSmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(scratch_k.data),
+                    static_cast<const __nv_bfloat16*>(scratch_v.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens, span, key_begin,
+                    key_begin + band_rows,
+                    static_cast<__nv_bfloat16*>(carry_acc.data),
+                    static_cast<float*>(carry_m.data), static_cast<float*>(carry_l.data),
+                    band + 1 == bands ? 0 : 1);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 
 template <typename Geometry, typename CacheView, typename Metadata>

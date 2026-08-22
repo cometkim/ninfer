@@ -307,6 +307,27 @@ struct SmallTWorkspace {
     Tensor l;
 };
 
+// U8 prompt scratch: banded when the envelope exceeds one band. Returns the scratch span and
+// fills the carry tensors (empty for the single-band and non-U8 cases).
+std::uint32_t allocate_hq_prompt_scratch(WorkspaceArena& workspace, std::int32_t kv_heads,
+                                         std::int32_t q_heads, std::int32_t width,
+                                         GqaExecutionEnvelope envelope, bool u8, Tensor& scratch_k,
+                                         Tensor& scratch_v, Tensor& carry_acc, Tensor& carry_m,
+                                         Tensor& carry_l) {
+    if (!u8) { return envelope.max_visible_keys; }
+    const std::uint32_t span =
+        std::min(envelope.max_visible_keys, kGqaHqPromptScratchBandKeys);
+    const auto rows = static_cast<std::int32_t>(span);
+    scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, rows, 1});
+    scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, rows, 1});
+    if (span < envelope.max_visible_keys) {
+        carry_acc = workspace.alloc(DType::BF16, {kHeadDim, q_heads, width, 1});
+        carry_m   = workspace.alloc(DType::FP32, {q_heads, width, 1, 1});
+        carry_l   = workspace.alloc(DType::FP32, {q_heads, width, 1, 1});
+    }
+    return span;
+}
+
 template <class Allocator>
 SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
                                            std::int32_t tokens, std::int32_t splits,
@@ -452,9 +473,16 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         }
         if (routes_prompt) {
             const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-            const std::size_t scratch   = 2 * static_cast<std::size_t>(envelope.max_visible_keys) *
-                                        static_cast<std::size_t>(kv_heads) * kHeadDim *
-                                        sizeof(std::uint16_t);
+            const std::size_t span      = std::min(envelope.max_visible_keys,
+                                                  kGqaHqPromptScratchBandKeys);
+            std::size_t scratch         = 2 * span * static_cast<std::size_t>(kv_heads) *
+                                  kHeadDim * sizeof(std::uint16_t);
+            if (span < envelope.max_visible_keys) {
+                // The banded carry state (acc [head_dim, q_heads, width] bf16 + m/l fp32) is
+                // live alongside the scratch inside one prompt call - size the sum.
+                scratch += (2ULL * kHeadDim + 8) * static_cast<std::size_t>(q_heads) *
+                           static_cast<std::size_t>(max_width);
+            }
             maximum = std::max(maximum, scratch);
         }
     }
@@ -499,13 +527,15 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     }
     Tensor scratch_k;
     Tensor scratch_v;
-    if (cache.dtype == DType::U8) {
-        const auto span = static_cast<std::int32_t>(envelope.max_visible_keys);
-        scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, span, 1});
-        scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, span, 1});
-    }
+    Tensor carry_acc;
+    Tensor carry_m;
+    Tensor carry_l;
+    (void)allocate_hq_prompt_scratch(workspace, kv_heads, q.ne[1], q.ne[2], envelope,
+                                     cache.dtype == DType::U8, scratch_k, scratch_v, carry_acc,
+                                     carry_m, carry_l);
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, scratch_k, scratch_v, out, stream);
+                                        cache, scratch_k, scratch_v, carry_acc, carry_m, carry_l,
+                                        envelope.max_visible_keys, out, stream);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -556,13 +586,15 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     }
     Tensor scratch_k;
     Tensor scratch_v;
-    if (cache.dtype == DType::U8) {
-        const auto span = static_cast<std::int32_t>(envelope.max_visible_keys);
-        scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, cache.num_kv_heads, span, 1});
-        scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, cache.num_kv_heads, span, 1});
-    }
+    Tensor carry_acc;
+    Tensor carry_m;
+    Tensor carry_l;
+    (void)allocate_hq_prompt_scratch(workspace, cache.num_kv_heads, q.ne[1], q.ne[2], envelope,
+                                     cache.dtype == DType::U8, scratch_k, scratch_v, carry_acc,
+                                     carry_m, carry_l);
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, scratch_k, scratch_v,
-                                                  out, stream);
+                                                  carry_acc, carry_m, carry_l,
+                                                  envelope.max_visible_keys, out, stream);
 }
 
 } // namespace ninfer::ops

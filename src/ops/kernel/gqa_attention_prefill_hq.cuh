@@ -129,21 +129,26 @@ __global__ void gqa_attention_prefill_hq_scratch_kernel(
     const std::uint8_t* codes_k, const std::uint8_t* codes_v,
     const std::uint8_t* meta_k, const std::uint8_t* meta_v, Metadata metadata,
     const std::int32_t* positions, std::int32_t width, std::int32_t span,
-    __nv_bfloat16* scratch_k, __nv_bfloat16* scratch_v) {
+    __nv_bfloat16* scratch_k, __nv_bfloat16* scratch_v, std::int32_t key_begin = 0,
+    std::int32_t band_rows = 0x7fffffff) {
     const std::int32_t tid = static_cast<std::int32_t>(blockIdx.x) * static_cast<std::int32_t>(blockDim.x) +
                              static_cast<std::int32_t>(threadIdx.x);
     const std::int32_t keys_total = positions[0] + metadata.valid_tokens(width);
-    const std::int32_t units      = keys_total * Geometry::KVHeads * 2;
+    // Banded decode: rows [0, count) of the scratch hold absolute keys
+    // [key_begin, key_begin + count); count clamps to the visible window.
+    const std::int32_t band_end   = min(min(keys_total, key_begin + band_rows), span + key_begin);
+    const std::int32_t count      = max(0, band_end - key_begin);
+    const std::int32_t units      = count * Geometry::KVHeads * 2;
     const std::int32_t unit = tid >> 3;
     if (unit >= units) { return; }
     const std::int32_t lane8 = tid & 7;
-    const std::int32_t pos  = unit / (Geometry::KVHeads * 2);
-    const std::int32_t rem  = unit - pos * (Geometry::KVHeads * 2);
+    const std::int32_t pos  = key_begin + unit / (Geometry::KVHeads * 2);
+    const std::int32_t rem  = unit - (unit / (Geometry::KVHeads * 2)) * (Geometry::KVHeads * 2);
     const std::int32_t head = rem >> 1;
     const bool role_v       = (rem & 1) != 0;
     const std::int32_t* table = metadata.block_table();
     __nv_bfloat16* dst = (role_v ? scratch_v : scratch_k) +
-                        (static_cast<std::int64_t>(head) * span + pos) * kHqHeadDim;
+                        (static_cast<std::int64_t>(head) * span + (pos - key_begin)) * kHqHeadDim;
     hq_decode_row_group(hq_row_codes<Geometry>(role_v ? codes_v : codes_k, table, head, pos),
                         hq_row_meta<Geometry>(role_v ? meta_v : meta_k, table, head, pos), dst,
                         lane8);

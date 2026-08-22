@@ -68,7 +68,9 @@ void gqa_prefill_attention_i8(const Tensor& q, const Tensor& positions, float sc
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float scale,
                               const CacheView& cache, Metadata metadata, const Tensor& scratch_k,
-                              const Tensor& scratch_v, Tensor& out, cudaStream_t stream);
+                              const Tensor& scratch_v, const Tensor& carry_acc,
+                              const Tensor& carry_m, const Tensor& carry_l,
+                              std::uint32_t visible_keys, Tensor& out, cudaStream_t stream);
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_append_bf16(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -107,7 +109,9 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& position
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 const Tensor& scratch_k, const Tensor& scratch_v, Tensor& out,
+                                 const Tensor& scratch_k, const Tensor& scratch_v,
+                                 const Tensor& carry_acc, const Tensor& carry_m,
+                                 const Tensor& carry_l, std::uint32_t visible_keys, Tensor& out,
                                  cudaStream_t stream);
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -115,10 +119,12 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
 
 // scratch_k/scratch_v are the hq-e8-2b one-shot decode planes (BF16
 // [head_dim, kv_heads, span]); they must be empty tensors for every other
-// cache dtype.
+// cache dtype. Envelopes wider than the scratch span band through the carry tensors.
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                            const PagedKVLayerView& cache, const Tensor& scratch_k,
-                                           const Tensor& scratch_v, Tensor& out,
+                                           const Tensor& scratch_v, const Tensor& carry_acc,
+                                           const Tensor& carry_m, const Tensor& carry_l,
+                                           std::uint32_t visible_keys, Tensor& out,
                                            cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

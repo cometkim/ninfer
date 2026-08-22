@@ -195,24 +195,54 @@ int run_scenario(int base, int width, int span, bool shuffle, unsigned seed) {
     launch_fill(d_k + static_cast<std::int64_t>(base) * Geo::KVHeads * kHqHeadDim,
                 d_v + static_cast<std::int64_t>(base) * Geo::KVHeads * kHqHeadDim, d_pos_b,
                 width);
-    // Scratch decode + rotated FA2 prompt attention.
-    const int scratch_grid = static_cast<int>(
-        (static_cast<std::int64_t>(span) * Geo::KVHeads * 2 * 4 + kGqaHqScratchThreads - 1) /
-        kGqaHqScratchThreads);
-    gqa_attention_prefill_hq_scratch_kernel<Geo, Metadata>
-        <<<scratch_grid, kGqaHqScratchThreads>>>(d_ck, d_cv, d_mk, d_mv, metadata, d_pos_b, width,
-                                                 span, d_sk, d_sv);
+    // Scratch decode + rotated FA2 prompt attention. When the span is smaller than the
+    // visible key count, run the banded carry path (the production envelope > band case):
+    // tile-aligned bands, FA2 resuming its online-softmax state between bands.
+    const int keys_total  = base + width;
+    const int bands       = (keys_total + span - 1) / span;
+    __nv_bfloat16* d_cacc = nullptr;
+    float *d_cm = nullptr, *d_cl = nullptr;
+    if (bands > 1) {
+        cudaMalloc(&d_cacc, static_cast<std::size_t>(width) * Geo::QHeads * kHqHeadDim * 2);
+        cudaMalloc(&d_cm, static_cast<std::size_t>(width) * Geo::QHeads * 4);
+        cudaMalloc(&d_cl, static_cast<std::size_t>(width) * Geo::QHeads * 4);
+    }
     cudaError_t attr = cudaFuncSetAttribute(
         gqa_attention_prefill_bf16_kernel<Geo, Metadata, true>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         static_cast<int>(kGqaPrefillRotatedSmemBytes));
     check(attr == cudaSuccess, "rotated FA2 smem opt-in rejected");
+    if (bands > 1) {
+        cudaError_t attr_carry = cudaFuncSetAttribute(
+            gqa_attention_prefill_bf16_kernel<Geo, Metadata, true, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(kGqaPrefillRotatedSmemBytes));
+        check(attr_carry == cudaSuccess, "carry FA2 smem opt-in rejected");
+    }
     const dim3 grid((width + kGqaPrefillBr - 1) / kGqaPrefillBr, Geo::QHeads, 1);
-    gqa_attention_prefill_bf16_kernel<Geo, Metadata, true>
-        <<<grid, kGqaPrefillThreads, kGqaPrefillRotatedSmemBytes>>>(
-            d_q, d_sk, d_sv, metadata, d_pos_b, kScale, d_out, width, span);
-    cudaError_t err = cudaGetLastError();
-    check(err == cudaSuccess, cudaGetErrorString(err));
+    for (int band = 0; band < bands; ++band) {
+        const std::int32_t key_begin = band * span;
+        const std::int32_t band_rows = std::min(span, keys_total - key_begin);
+        const int band_grid          = static_cast<int>(
+            (static_cast<std::int64_t>(band_rows) * Geo::KVHeads * 2 * 8 +
+             kGqaHqScratchThreads - 1) /
+            kGqaHqScratchThreads);
+        gqa_attention_prefill_hq_scratch_kernel<Geo, Metadata>
+            <<<band_grid, kGqaHqScratchThreads>>>(d_ck, d_cv, d_mk, d_mv, metadata, d_pos_b, width,
+                                                  span, d_sk, d_sv, key_begin, band_rows);
+        if (bands == 1) {
+            gqa_attention_prefill_bf16_kernel<Geo, Metadata, true>
+                <<<grid, kGqaPrefillThreads, kGqaPrefillRotatedSmemBytes>>>(
+                    d_q, d_sk, d_sv, metadata, d_pos_b, kScale, d_out, width, span);
+        } else {
+            gqa_attention_prefill_bf16_kernel<Geo, Metadata, true, true>
+                <<<grid, kGqaPrefillThreads, kGqaPrefillRotatedSmemBytes>>>(
+                    d_q, d_sk, d_sv, metadata, d_pos_b, kScale, d_out, width, span, key_begin,
+                    key_begin + band_rows, d_cacc, d_cm, d_cl, band + 1 == bands ? 0 : 1);
+        }
+        cudaError_t err = cudaGetLastError();
+        check(err == cudaSuccess, cudaGetErrorString(err));
+    }
     cudaDeviceSynchronize();
     std::printf("  kernels done (base=%d width=%d)\n", base, width);
     std::fflush(stdout);
@@ -336,6 +366,15 @@ int main() {
     int failed = 0;
     failed += run_scenario<GqaPrefillDirectMetadata>(100, 300, 1024, false, 20260821u);
     failed += run_scenario<GqaPrefillBatchMetadata<false>>(0, 67, 2048, true, 77u);
+    // Banded carry: span below the visible key count. Boundaries tile-aligned (span
+    // multiples of the 64-key FA2 tile) and the final band short (band_rows < span).
+    failed += run_scenario<GqaPrefillDirectMetadata>(100, 300, 128, false, 31u);
+    failed += run_scenario<GqaPrefillBatchMetadata<false>>(0, 300, 192, true, 32u);
+    failed += run_scenario<GqaPrefillDirectMetadata>(0, 130, 64, false, 33u);
+    // Engine-scale banded carry: the production band (262144) with a 390k-key window
+    // crossing the first band boundary at tile 4096. Narrow width keeps the CPU oracle
+    // affordable while exercising every large-index path.
+    failed += run_scenario<GqaPrefillDirectMetadata>(390000, 8, 262144, false, 34u);
     if (failed != 0) {
         std::fprintf(stderr, "test_hq_prefill: %d failures\n", failed);
         return EXIT_FAILURE;

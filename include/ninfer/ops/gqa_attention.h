@@ -17,6 +17,10 @@ inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 1048576;
 // BF16/I8 decode kernels stage at most 64 physical page ids per split in shared memory
 // (64-token pages; the 262144-key linear envelope spans at most 49 pages in one 27B split).
 inline constexpr std::uint32_t kGqaAttentionMaximumLinearVisibleKeys = 262144;
+// U8 prompt-route scratch band: the one-shot rotated planes are materialized in sequential
+// bands of at most this many keys (the FA2 kernel carries its online-softmax state between
+// bands), bounding the prompt scratch at 1 GiB regardless of the execution envelope.
+inline constexpr std::uint32_t kGqaHqPromptScratchBandKeys = 262144;
 
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
