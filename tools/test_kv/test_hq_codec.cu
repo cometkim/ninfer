@@ -472,10 +472,11 @@ int main() {
 
     // ---- 6. Synthetic Rice k > 0 rows: general-k fallback ------------------
     // The encoder never stores k > 0 (see [3b]), so these streams are written
-    // by a host mirror of HqBitWriter (u32 values accumulated MSB-first,
-    // stored little-endian) to exercise the group decoder's general-k branch
-    // (remainder extraction, cross-window symbols, the unary-guard tail)
-    // against the sequential reference.
+    // by a host reference writer (no device counterpart since the parallel
+    // packer replaced HqBitWriter; u32 values MSB-first, stored little-endian)
+    //) to exercise the group decoder's general-k branch (remainder
+    // extraction, cross-window symbols, the unary-guard tail) against
+    // the sequential reference.
     {
         struct HostBitWriter {
             std::uint32_t buf[kHqRowBudgetBytes / 4] = {0};

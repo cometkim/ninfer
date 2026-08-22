@@ -50,8 +50,8 @@
 // qualifies standalone.
 //
 // Stored-stream invariant (load-bearing for the group decoder): every code
-// byte at or past ceil(used/8) is ZERO (the bit writer zero-initializes its
-// buffer and the terminal fallback writes 64 zero-tail bytes), so decoders
+// byte at or past ceil(used/8) is ZERO (the packer zero-initializes the
+// staging row and the terminal fallback writes 64 zero-tail bytes), so decoders
 // may read all 16 words of a row and treat bits past `used` as unary-guard
 // padding without consulting `used` for word bounds.
 
@@ -626,7 +626,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
     const unsigned gmask = 0xFFu << gbase;
 
     // Stream layout: 16 u32 words; each word's VALUE carries its 32 stream
-    // bits MSB-first (HqBitWriter accumulates into u32 values stored
+    // bits MSB-first (the encoder's staging row holds u32 values stored
     // little-endian). Lane L's 64-bit window = stream bits [64L, 64L+64) =
     // words {2L, 2L+1} concatenated MSB-first.
     const std::uint32_t* w32 = reinterpret_cast<const std::uint32_t*>(codes);

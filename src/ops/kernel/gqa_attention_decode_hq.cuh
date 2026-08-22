@@ -38,9 +38,14 @@ __global__ void gqa_attention_decode_hq_kernel(
     constexpr int kKeys = kGqaHqDecodeKeys;
     extern __shared__ float smem[];
     __nv_bfloat16* q_rot = reinterpret_cast<__nv_bfloat16*>(smem);
+    // Pad each key row by one element so the score loop's cross-key reads
+    // (same d, different rows, formerly 512 B stride = one bank) land on
+    // distinct banks. Post-decoder the score/PV phases are ~50% of the
+    // kernel, so the 32-way conflict matters again.
+    constexpr int kKeyStride = kGqaHeadDim + 1;
     __nv_bfloat16* kv_smem =
         q_rot + kGqaHqDecodeMaxRows * kGqaHeadDim;
-    float* p_smem = reinterpret_cast<float*>(kv_smem + kKeys * kGqaHeadDim);
+    float* p_smem = reinterpret_cast<float*>(kv_smem + kKeys * kKeyStride);
     float* m_smem = p_smem + kGqaHqDecodeMaxRows * kKeys;
     float* l_smem = m_smem + kGqaHqDecodeMaxRows;
     float* corr_smem = l_smem + kGqaHqDecodeMaxRows;
@@ -198,7 +203,7 @@ __global__ void gqa_attention_decode_hq_kernel(
                 hq_decode_row_group(
                     hq_row_codes<Geometry>(codes_k, block_table, kv_head, k0 + drow),
                     hq_row_meta<Geometry>(meta_k, block_table, kv_head, k0 + drow),
-                    kv_smem + static_cast<std::size_t>(drow) * kGqaHeadDim, dseg);
+                    kv_smem + static_cast<std::size_t>(drow) * kKeyStride, dseg);
             }
         }
         __syncthreads();
@@ -209,7 +214,7 @@ __global__ void gqa_attention_decode_hq_kernel(
             float s = 0.0f;
             if (kk < chunk && k0 + kk <= pos[token]) {
                 const __nv_bfloat16* qr = q_rot + r * kGqaHeadDim;
-                const __nv_bfloat16* kr = kv_smem + kk * kGqaHeadDim;
+                const __nv_bfloat16* kr = kv_smem + kk * kKeyStride;
                 for (int d = 0; d < kGqaHeadDim; ++d) {
                     s += __bfloat162float(qr[d]) * __bfloat162float(kr[d]);
                 }
@@ -249,7 +254,7 @@ __global__ void gqa_attention_decode_hq_kernel(
                 hq_decode_row_group(
                     hq_row_codes<Geometry>(codes_v, block_table, kv_head, k0 + drow),
                     hq_row_meta<Geometry>(meta_v, block_table, kv_head, k0 + drow),
-                    kv_smem + static_cast<std::size_t>(drow) * kGqaHeadDim, dseg);
+                    kv_smem + static_cast<std::size_t>(drow) * kKeyStride, dseg);
             }
         }
         __syncthreads();
@@ -259,7 +264,7 @@ __global__ void gqa_attention_decode_hq_kernel(
             float a = acc[r * kGqaHeadDim + d];
             const float* pr = p_smem + r * kKeys;
             for (int kk = 0; kk < chunk; ++kk) {
-                a += pr[kk] * __bfloat162float(kv_smem[kk * kGqaHeadDim + d]);
+                a += pr[kk] * __bfloat162float(kv_smem[kk * kKeyStride + d]);
             }
             acc[r * kGqaHeadDim + d] = a;
         }
@@ -291,7 +296,10 @@ __global__ void gqa_attention_decode_hq_kernel(
 
 template <typename Geometry>
 inline constexpr std::size_t gqa_hq_decode_smem_bytes() {
-    return (kGqaHqDecodeMaxRows + kGqaHqDecodeKeys) * kGqaHeadDim * sizeof(__nv_bfloat16) +
+    // kKeyStride (= kGqaHeadDim + 1) per key row: one-element pad breaks the
+    // score loop's 32-way bank conflict on cross-key reads.
+    return kGqaHqDecodeMaxRows * kGqaHeadDim * sizeof(__nv_bfloat16) +
+           kGqaHqDecodeKeys * (kGqaHeadDim + 1) * sizeof(__nv_bfloat16) +
            kGqaHqDecodeMaxRows * kGqaHqDecodeKeys * sizeof(float) +
            3 * kGqaHqDecodeMaxRows * sizeof(float) +
            kGqaHqDecodeMaxRows * kGqaHeadDim * sizeof(float) + kHqHeadDim;
