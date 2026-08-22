@@ -234,6 +234,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
+    // plan.capacity is the PER-SEQUENCE context ceiling (options.max_context); the shared
+    // pool token count is plan.kv_capacity. The attention workspace envelope follows the
+    // per-sequence bound - one attention invocation never sees more than one sequence's
+    // window - so pool-sized reservations must not derive from it.
     const ops::GqaExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,

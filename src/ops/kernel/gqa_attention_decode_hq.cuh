@@ -155,6 +155,9 @@ __global__ void gqa_attention_decode_hq_kernel(
     // encode scratch lives in kv_smem, which is unused before the chunk loop
     // and is exactly 8 x (256 floats + 256 u32) = its full 16 KB.
     if constexpr (CacheInput::writes_cache) {
+        static_assert(8 * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow) * sizeof(float) <=
+                          kGqaHqDecodeKeys * kGqaHeadDim * sizeof(__nv_bfloat16),
+                      "per-warp append scratch must fit the decoded-K tile it aliases");
         float* append_scratch = reinterpret_cast<float*>(kv_smem);
         for (int unit = warp; unit < columns * 2;
              unit += kGqaHqDecodeThreads / 32) {
