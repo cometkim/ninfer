@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "product/speculative_options.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -41,7 +42,7 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
-    float rope_scaling_factor              = 0.0F;
+    product::RopeScalingSpec rope_scaling;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

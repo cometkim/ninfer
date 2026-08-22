@@ -162,7 +162,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             static const ops::RopeFrequencies frequencies =
                 ops::rope_linear_frequencies(Config::rope_theta, Config::head_dim);
             ops::rope(layer_positions.view({layer_columns}), Config::head_dim, frequencies, key,
-                      state.execution.device.stream);
+                      ops::RopeSide::Key, state.execution.device.stream);
             Tensor key_batch = key.view({Config::head_dim, Config::kv_heads, layer_width, batch});
             Tensor value_batch =
                 value.view({Config::head_dim, Config::kv_heads, layer_width, batch});

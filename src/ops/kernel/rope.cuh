@@ -45,8 +45,6 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
         const double turns = angle * kInvTwoPi;
         const float reduced = static_cast<float>(angle - nearbyint(turns) * kTwoPi);
         sincosf(reduced, sine, cosine);
-        *sine *= frequencies.attention_factor;
-        *cosine *= frequencies.attention_factor;
     } else if (frequencies.attention_factor == 1.0F) {
         // Legacy unscaled route: the FP32 product is bit-stable engine history.
         const float angle =
@@ -59,9 +57,13 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
         const double turns = angle * kInvTwoPi;
         const float reduced = static_cast<float>(angle - nearbyint(turns) * kTwoPi);
         sincosf(reduced, sine, cosine);
-        *sine *= frequencies.attention_factor;
-        *cosine *= frequencies.attention_factor;
     }
+}
+
+// The attention factor is a q-side temperature: the rotated dims of q scale by its square while
+// cached K stays factor-free ((f*q)*(f*k) == (f^2*q)*k). 1.0F makes the multiply a bit-exact no-op.
+__device__ __forceinline__ float rope_q_scale(const RopeFrequencies& frequencies) {
+    return frequencies.attention_factor * frequencies.attention_factor;
 }
 
 template <int HeadDim, int Half>
@@ -113,10 +115,12 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, RopeFrequencies
         s0             = sin_cache[pair];
         s1             = sin_cache[pair + 1];
     }
+    const float q_scale = rope_q_scale(frequencies);
     for (int combined_head = warp; combined_head < QHeads + KHeads; combined_head += block_warps) {
         if (combined_head < QHeads) {
-            apply_rope_head<kHeadDim, kHalf>(q, q_token_stride, combined_head, token, lane, c0, c1,
-                                             s0, s1);
+            apply_rope_head<kHeadDim, kHalf>(q, q_token_stride, combined_head, token, lane,
+                                             c0 * q_scale, c1 * q_scale, s0 * q_scale,
+                                             s1 * q_scale);
         } else {
             apply_rope_head<kHeadDim, kHalf>(k, k_token_stride, combined_head - QHeads, token, lane,
                                              c0, c1, s0, s1);
@@ -157,15 +161,18 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, RopeFrequ
     const float s0 = sin_cache[pair];
     const float s1 = sin_cache[pair + 1];
     if (combined_head < QHeads) {
-        apply_rope_head<kHeadDim, kHalf>(q, q_token_stride, combined_head, token, lane, c0, c1, s0,
-                                         s1);
+        const float q_scale = rope_q_scale(frequencies);
+        apply_rope_head<kHeadDim, kHalf>(q, q_token_stride, combined_head, token, lane,
+                                         c0 * q_scale, c1 * q_scale, s0 * q_scale, s1 * q_scale);
     } else {
         apply_rope_head<kHeadDim, kHalf>(k, k_token_stride, combined_head - QHeads, token, lane, c0,
                                          c1, s0, s1);
     }
 }
 
-__global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
+// inline: this non-template kernel lives in a header consumed by the launcher and bench TUs;
+// without it the host-side stubs collide at link time (ODR).
+inline __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
                                     RopeFrequencies frequencies, __nv_bfloat16* q,
                                     __nv_bfloat16* k, std::int32_t head_dim,
                                     std::int32_t rotary_dim, std::int32_t q_heads,
@@ -194,12 +201,11 @@ __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t 
             const double turns  = angle * kInvTwoPi;
             const float reduced = static_cast<float>(angle - nearbyint(turns) * kTwoPi);
             sincosf(reduced, &sin_cache[pair], &cos_cache[pair]);
-            sin_cache[pair] *= frequencies.attention_factor;
-            cos_cache[pair] *= frequencies.attention_factor;
         }
     }
     __syncthreads();
 
+    const float q_scale    = rope_q_scale(frequencies);
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     const int warp        = static_cast<int>(threadIdx.x) >> 5;
     const int block_warps = static_cast<int>(blockDim.x) >> 5;
@@ -211,11 +217,12 @@ __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t 
         const std::int64_t stride_t = is_q ? q_token_stride : k_token_stride;
         const std::int64_t base     = static_cast<std::int64_t>(token) * stride_t +
                                   static_cast<std::int64_t>(head) * head_dim;
+        const float head_scale      = is_q ? q_scale : 1.0F;
         for (int pair = lane; pair < half; pair += 32) {
             const float first        = __bfloat162float(data[base + pair]);
             const float second       = __bfloat162float(data[base + pair + half]);
-            const float c            = cos_cache[pair];
-            const float s            = sin_cache[pair];
+            const float c            = cos_cache[pair] * head_scale;
+            const float s            = sin_cache[pair] * head_scale;
             data[base + pair]        = __float2bfloat16_rn(first * c - second * s);
             data[base + pair + half] = __float2bfloat16_rn(second * c + first * s);
         }

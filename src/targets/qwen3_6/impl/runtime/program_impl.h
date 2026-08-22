@@ -182,6 +182,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       rope_frequencies(plan.text_rope), rope_scaling_factor(plan.rope_scaling_factor),
+      rope_scaling_temperature(plan.rope_scaling_temperature),
+      rope_scaling_beta_fast(plan.rope_scaling_beta_fast),
+      rope_scaling_beta_slow(plan.rope_scaling_beta_slow),
       max_concurrency(plan.max_concurrency),
       prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
@@ -2219,7 +2222,10 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         if (kv_dtype == DType::U8) { return KvCacheStorage::HqE8Rice2B; }
         return KvCacheStorage::Int8Group64;
     }();
-    out.rope_scaling_factor = rope_scaling_factor;
+    out.rope_scaling_factor      = rope_scaling_factor;
+    out.rope_scaling_temperature = rope_scaling_temperature;
+    out.rope_scaling_beta_fast   = rope_scaling_beta_fast;
+    out.rope_scaling_beta_slow   = rope_scaling_beta_slow;
     if (rope_scaling_factor > 1.0F) {
         if (capacity <= TextConfig::original_positions) {
             out.rope_note =

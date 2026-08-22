@@ -134,7 +134,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--rope-scaling") {
-            options.rope_scaling_factor = product::parse_rope_scaling(value(arg));
+            options.rope_scaling = product::parse_rope_scaling(value(arg));
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {

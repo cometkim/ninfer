@@ -587,9 +587,20 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         throw std::invalid_argument(
             "rope_scaling_factor must be 0/1 (linear) or a YaRN factor in (1, 64]");
     }
-    if (options.rope_scaling_factor > 1.0F &&
-        options.speculative.backend == SpeculativeBackend::DFlash) {
-        throw std::invalid_argument("DFlash does not support rope scaling");
+    if (options.rope_scaling_factor > 1.0F) {
+        if (options.speculative.backend == SpeculativeBackend::DFlash) {
+            throw std::invalid_argument("DFlash does not support rope scaling");
+        }
+        if (!(options.rope_scaling_temperature > 0.0F) ||
+            !std::isfinite(options.rope_scaling_temperature)) {
+            throw std::invalid_argument("rope_scaling_temperature must be positive and finite");
+        }
+        if (!(options.rope_scaling_beta_fast > options.rope_scaling_beta_slow &&
+              options.rope_scaling_beta_slow > 0.0F) ||
+            !std::isfinite(options.rope_scaling_beta_fast) ||
+            !std::isfinite(options.rope_scaling_beta_slow)) {
+            throw std::invalid_argument("YaRN ramp requires beta_fast > beta_slow > 0");
+        }
     }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
@@ -645,14 +656,20 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device              = inputs.device;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
-    impl->rope_scaling_factor = inputs.rope_scaling_factor;
-    impl->text_rope           = inputs.rope_scaling_factor > 1.0F
-                                   ? qwen3_6::rope_yarn_frequencies(TextConfig::rope_theta,
-                                                           TextConfig::rotary_dim,
-                                                           TextConfig::original_positions,
-                                                           inputs.rope_scaling_factor)
-                                   : ops::rope_linear_frequencies(TextConfig::rope_theta,
-                                                                  TextConfig::rotary_dim);
+    impl->rope_scaling_factor      = inputs.rope_scaling_factor;
+    impl->rope_scaling_temperature = inputs.rope_scaling_temperature;
+    impl->rope_scaling_beta_fast   = inputs.rope_scaling_beta_fast;
+    impl->rope_scaling_beta_slow   = inputs.rope_scaling_beta_slow;
+    impl->text_rope                = inputs.rope_scaling_factor > 1.0F
+                      ? qwen3_6::rope_yarn_frequencies(TextConfig::rope_theta,
+                                              TextConfig::rotary_dim,
+                                              TextConfig::original_positions,
+                                              inputs.rope_scaling_factor,
+                                              inputs.rope_scaling_temperature,
+                                              inputs.rope_scaling_beta_fast,
+                                              inputs.rope_scaling_beta_slow)
+                      : ops::rope_linear_frequencies(TextConfig::rope_theta,
+                                                     TextConfig::rotary_dim);
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
@@ -681,7 +698,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+                    // Measured instantiation per big-visible class: <=262144 keys fits the
+                    // historical 82 MiB; the split-grid step past it measured 427-437 MiB at
+                    // ~304k visible keys after WI-2 banding. The 1M-envelope tier is a
+                    // conservative extrapolation, not a measurement.
+                    const std::uint64_t tier = final_visible <= 4096        ? 12ULL
+                                               : final_visible <= 262144    ? 82ULL
+                                               : final_visible <= 524288    ? 512ULL
+                                                                             : 1024ULL;
+                    return tier * kMiB;
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
@@ -750,7 +775,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_dtype       = kv_storage_dtype(options.kv_cache),
         .kv_quant_group = kv_storage_group(options.kv_cache),
         .proposal_head  = options.speculative.proposal_head,
-        .rope_scaling_factor = options.rope_scaling_factor,
+        .rope_scaling_factor      = options.rope_scaling_factor,
+        .rope_scaling_temperature = options.rope_scaling_temperature,
+        .rope_scaling_beta_fast   = options.rope_scaling_beta_fast,
+        .rope_scaling_beta_slow   = options.rope_scaling_beta_slow,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,
         .device         = options.device,

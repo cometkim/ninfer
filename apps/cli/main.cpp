@@ -193,10 +193,20 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("gpu weights used", format_arena_used(memory.weights));
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
-    print_metric("rope scaling",
-                 memory.rope_scaling_factor > 1.0F
-                     ? "yarn:" + std::to_string(memory.rope_scaling_factor)
-                     : "none");
+    print_metric("rope scaling", [&] {
+        if (memory.rope_scaling_factor <= 1.0F) { return std::string("none"); }
+        std::string text = "yarn:" + std::to_string(memory.rope_scaling_factor);
+        if (memory.rope_scaling_temperature != 0.1F) {
+            text += ",t=" + std::to_string(memory.rope_scaling_temperature);
+        }
+        if (memory.rope_scaling_beta_fast != 32.0F) {
+            text += ",bf=" + std::to_string(memory.rope_scaling_beta_fast);
+        }
+        if (memory.rope_scaling_beta_slow != 1.0F) {
+            text += ",bs=" + std::to_string(memory.rope_scaling_beta_slow);
+        }
+        return text;
+    }());
     if (memory.rope_note != nullptr) { print_metric("rope note", memory.rope_note); }
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
@@ -273,7 +283,10 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache            = cli.kv_cache;
-        engine_options.rope_scaling_factor = cli.rope_scaling_factor;
+        engine_options.rope_scaling_factor      = cli.rope_scaling.factor;
+        engine_options.rope_scaling_temperature = cli.rope_scaling.temperature;
+        engine_options.rope_scaling_beta_fast   = cli.rope_scaling.beta_fast;
+        engine_options.rope_scaling_beta_slow   = cli.rope_scaling.beta_slow;
         engine_options.speculative         = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;

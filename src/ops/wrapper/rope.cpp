@@ -161,7 +161,7 @@ void rope(const Tensor& positions, int rotary_dim, const RopeFrequencies& freque
 }
 
 void rope(const Tensor& positions, int rotary_dim, const RopeFrequencies& frequencies, Tensor& x,
-          cudaStream_t stream) {
+          RopeSide side, cudaStream_t stream) {
     require_common(positions, rotary_dim, frequencies);
     if (x.dtype != DType::BF16) { throw std::invalid_argument("rope: tensor must be BF16"); }
     (void)numel_allow_zero(positions, "positions");
@@ -175,7 +175,7 @@ void rope(const Tensor& positions, int rotary_dim, const RopeFrequencies& freque
     if (x_numel == 0) { return; }
     require_positions_storage(positions);
     if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
-    detail::rope_single_launch(positions, rotary_dim, frequencies, x, stream);
+    detail::rope_single_launch(positions, rotary_dim, frequencies, x, side, stream);
 }
 
 } // namespace ninfer::ops

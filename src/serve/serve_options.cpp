@@ -219,7 +219,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--rope-scaling") {
-            options.rope_scaling_factor =
+            options.rope_scaling =
                 ninfer::product::parse_rope_scaling(require_value("--rope-scaling"));
         } else if (arg == "--spec") {
             options.speculative.backend =

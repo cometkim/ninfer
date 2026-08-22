@@ -246,6 +246,9 @@ public:
     const std::uint32_t kv_capacity;
     const ops::RopeFrequencies rope_frequencies;
     const float rope_scaling_factor;
+    const float rope_scaling_temperature;
+    const float rope_scaling_beta_fast;
+    const float rope_scaling_beta_slow;
     const std::uint32_t max_concurrency;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;

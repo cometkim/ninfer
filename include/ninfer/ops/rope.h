@@ -11,11 +11,12 @@ inline constexpr int kRopeMaxPairs = 128;
 
 /**
  * Pair-frequency table driving every rope mode. `inv_frequency[i]` is the cycle frequency of
- * rotary pair i; only [0, rotary_dim/2) entries are read. `attention_factor` multiplies both
- * cos and sin, i.e. scales the rotated subspace of every q and k row (scores of the rotated
- * dimensions scale by its square); 1.0F leaves the rotation untouched. Unrotated dimensions are
- * never affected. The two host builders cover the linear checkpoint tables; YaRN-shaped tables
- * are constructed by the owning target.
+ * rotary pair i; only [0, rotary_dim/2) entries are read. `attention_factor` is a q-side
+ * temperature: the rotated dimensions of every q row scale by its square while k rows rotate
+ * unscaled, so cached K is factor-free and the scores of the rotated dimensions scale by
+ * attention_factor^2; 1.0F leaves the rotation untouched. Unrotated dimensions are never
+ * affected. The two host builders cover the linear checkpoint tables; YaRN-shaped tables are
+ * constructed by the owning target.
  */
 struct RopeFrequencies {
     double inv_frequency[kRopeMaxPairs] = {};
@@ -35,8 +36,9 @@ RopeFrequencies rope_vision_frequencies(float theta);
  *   ideal[i]              = x[i] * cos(phi) - x[i+R/2] * sin(phi)
  *   ideal[i+rotary_dim/2] = x[i+R/2] * cos(phi) + x[i] * sin(phi).
  *
- * cos and sin carry `frequencies.attention_factor`. Dimensions [rotary_dim,head_dim) are
- * unchanged. Supported modes are:
+ * cos and sin carry `frequencies.attention_factor` squared on the q path and unmodified on the
+ * k path (the factor-free-K contract above). Dimensions [rotary_dim,head_dim) are unchanged.
+ * Supported modes are:
  *
  * - Text 1-D: positions I32 [T], either head_dim=256 with even 0<rotary_dim<=256, or the
  *   DFlash full-head domain head_dim=rotary_dim=128; phi=positions[t]*frequencies.inv_frequency[i].
@@ -65,9 +67,18 @@ RopeFrequencies rope_vision_frequencies(float theta);
 void rope(const Tensor& positions, int rotary_dim, const RopeFrequencies& frequencies, Tensor& q,
           Tensor& k, cudaStream_t stream);
 
-// Single-tensor form with the same formula and storage contract. The head count comes directly
-// from x; Q versus K role does not change the transformation.
+/** Operand side of the single-tensor rope form; selects whether the factor scale applies. */
+enum class RopeSide : std::uint8_t {
+    /** Rotated dims scale by attention_factor squared (queries). */
+    Query,
+    /** Rotation stays unscaled — the factor-free cached-K contract (keys). */
+    Key,
+};
+
+// Single-tensor form with the same formula and storage contract; `side` selects q semantics
+// (attention_factor squared on the rotated dims) or k semantics (unscaled, cacheable keys).
+// The head count comes directly from x.
 void rope(const Tensor& positions, int rotary_dim, const RopeFrequencies& frequencies, Tensor& x,
-          cudaStream_t stream);
+          RopeSide side, cudaStream_t stream);
 
 } // namespace ninfer::ops

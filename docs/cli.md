@@ -141,7 +141,7 @@ measured recommendation rather than a semantic limit.
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|hq-e8-2b` | KV-cache storage | `bf16` |
-| `--rope-scaling none\|yarn:F` | text RoPE position scaling; `yarn:2`/`yarn:4` select YaRN with that factor (HF/vLLM semantics) | `none` |
+| `--rope-scaling none\|yarn:F[,t=c][,bf=n][,bs=n]` | text RoPE position scaling; `yarn:2`/`yarn:4` select YaRN with that factor (HF/vLLM semantics). Optional fields: `t` the attention temperature coefficient (attention factor = `t·ln F + 1`, default 0.1), `bf`/`bs` the ramp bounds beta_fast/beta_slow (defaults 32/1) | `none` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -185,7 +185,9 @@ The engine context envelope is 1,048,576 tokens with `--kv-dtype hq-e8-2b` and 2
 with `bf16` or `int8` (the BF16/I8 decode kernels stage a fixed number of page ids per split).
 The checkpoint's trained position capacity is 262,144 tokens: contexts past it require
 `--rope-scaling yarn:F` (use factor 2 for a 524k deployment, factor 4 for 1M; Qwen notes YaRN
-degrades short prompts, so leave it off at or below the native range). On the 35B-A3B target
+degrades short prompts, so leave it off at or below the native range). The YaRN attention
+factor is a q-side temperature — the KV cache stays factor-free — and the `t=`/`bf=`/`bs=`
+fields tune it without touching the frequency ramp's defaults. On the 35B-A3B target
 the text route honors the scaling but DFlash rejects it. A context above the native range
 without scaling, or scaling active below it, is reported as a note in the CLI summary and
 the server request log. The practical

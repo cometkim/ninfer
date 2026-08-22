@@ -122,53 +122,59 @@ bool launch_fixed_pair(const RopeFrequencies& frequencies, const Tensor& positio
     return false;
 }
 
-template <RopeKernelMode Mode, int Heads>
+template <RopeKernelMode Mode, int Heads, RopeSide Side>
 void launch_fixed_single(const RopeFrequencies& frequencies, const Tensor& positions, Tensor& x,
                          cudaStream_t stream) {
-    launch_fixed<Mode, Heads, 0>(frequencies, positions, &x, nullptr, stream);
+    if constexpr (Side == RopeSide::Query) {
+        launch_fixed<Mode, Heads, 0>(frequencies, positions, &x, nullptr, stream);
+    } else {
+        launch_fixed<Mode, 0, Heads>(frequencies, positions, nullptr, &x, stream);
+    }
 }
 
-template <int Heads>
+template <int Heads, RopeSide Side>
 bool launch_text_single(const RopeFrequencies& frequencies, const Tensor& positions, int axes,
                         Tensor& x, cudaStream_t stream) {
     if (x.ne[1] != Heads) { return false; }
     if (axes == 1) {
-        launch_fixed_single<RopeKernelMode::Text1D, Heads>(frequencies, positions, x, stream);
+        launch_fixed_single<RopeKernelMode::Text1D, Heads, Side>(frequencies, positions, x, stream);
         return true;
     }
     if (axes == 3) {
-        launch_fixed_single<RopeKernelMode::TextMrope, Heads>(frequencies, positions, x, stream);
+        launch_fixed_single<RopeKernelMode::TextMrope, Heads, Side>(frequencies, positions, x,
+                                                                    stream);
         return true;
     }
     return false;
 }
 
+template <RopeSide Side>
 bool launch_fixed_single_dispatch(const RopeFrequencies& frequencies, const Tensor& positions,
                                   int rotary_dim, Tensor& x, cudaStream_t stream) {
     if (!bf16x2_aligned(x)) { return false; }
     const int axes = positions.ne[1];
     if (axes == 1 && x.ne[0] == 128 && rotary_dim == 128) {
         if (x.ne[1] == 32) {
-            launch_fixed_single<RopeKernelMode::DflashText1D, 32>(frequencies, positions, x,
-                                                                  stream);
+            launch_fixed_single<RopeKernelMode::DflashText1D, 32, Side>(frequencies, positions, x,
+                                                                        stream);
             return true;
         }
         if (x.ne[1] == 8) {
-            launch_fixed_single<RopeKernelMode::DflashText1D, 8>(frequencies, positions, x,
-                                                                 stream);
+            launch_fixed_single<RopeKernelMode::DflashText1D, 8, Side>(frequencies, positions, x,
+                                                                       stream);
             return true;
         }
     }
     if (rotary_dim == 64) {
-        if (launch_text_single<24>(frequencies, positions, axes, x, stream) ||
-            launch_text_single<4>(frequencies, positions, axes, x, stream) ||
-            launch_text_single<16>(frequencies, positions, axes, x, stream) ||
-            launch_text_single<2>(frequencies, positions, axes, x, stream)) {
+        if (launch_text_single<24, Side>(frequencies, positions, axes, x, stream) ||
+            launch_text_single<4, Side>(frequencies, positions, axes, x, stream) ||
+            launch_text_single<16, Side>(frequencies, positions, axes, x, stream) ||
+            launch_text_single<2, Side>(frequencies, positions, axes, x, stream)) {
             return true;
         }
     }
     if (axes == 2 && rotary_dim == 72 && x.ne[1] == 16) {
-        launch_fixed_single<RopeKernelMode::Vision2D, 16>(frequencies, positions, x, stream);
+        launch_fixed_single<RopeKernelMode::Vision2D, 16, Side>(frequencies, positions, x, stream);
         return true;
     }
     return false;
@@ -198,9 +204,19 @@ void rope_launch(const Tensor& positions, int rotary_dim, const RopeFrequencies&
 }
 
 void rope_single_launch(const Tensor& positions, int rotary_dim,
-                        const RopeFrequencies& frequencies, Tensor& x, cudaStream_t stream) {
-    if (!launch_fixed_single_dispatch(frequencies, positions, rotary_dim, x, stream)) {
-        launch_generic(frequencies, positions, rotary_dim, &x, nullptr, stream);
+                        const RopeFrequencies& frequencies, Tensor& x, RopeSide side,
+                        cudaStream_t stream) {
+    const bool fixed = side == RopeSide::Query
+                           ? launch_fixed_single_dispatch<RopeSide::Query>(frequencies, positions,
+                                                                          rotary_dim, x, stream)
+                           : launch_fixed_single_dispatch<RopeSide::Key>(frequencies, positions,
+                                                                        rotary_dim, x, stream);
+    if (!fixed) {
+        if (side == RopeSide::Query) {
+            launch_generic(frequencies, positions, rotary_dim, &x, nullptr, stream);
+        } else {
+            launch_generic(frequencies, positions, rotary_dim, nullptr, &x, stream);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

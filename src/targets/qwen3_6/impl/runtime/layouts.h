@@ -71,8 +71,12 @@ struct SequencePlanningInputs {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     // 0 (or 1): linear rope at the checkpoint's native positions. Any value > 1 selects YaRN
-    // with that factor; the sequence plan resolves it into `text_rope`.
+    // with that factor; the sequence plan resolves it into `text_rope`. The temperature
+    // coefficient and ramp bounds parameterize the YaRN table (HF defaults).
     float rope_scaling_factor              = 0.0F;
+    float rope_scaling_temperature         = 0.1F;
+    float rope_scaling_beta_fast           = 32.0F;
+    float rope_scaling_beta_slow           = 1.0F;
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;
@@ -96,6 +100,9 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     float rope_scaling_factor              = 0.0F;
+    float rope_scaling_temperature         = 0.1F;
+    float rope_scaling_beta_fast           = 32.0F;
+    float rope_scaling_beta_slow           = 1.0F;
     ops::RopeFrequencies text_rope;
     StartupFeatures features;
     bool use_cuda_graph = true;

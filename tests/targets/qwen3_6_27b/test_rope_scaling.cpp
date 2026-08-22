@@ -1,7 +1,8 @@
 // Host-only check of the Qwen3.6 family YaRN table builder against reference tables computed
 // independently with the documented HF `_compute_yarn_parameters` formula (beta_fast 32,
 // beta_slow 1, dim 64, base 1e7, original positions 262144). References carry full
-// round-trip precision, so the comparison is bit-exact.
+// round-trip precision, so the comparison is bit-exact. Also covers the temperature and ramp
+// parameterization and its rejection cases.
 #include "targets/qwen3_6/impl/runtime/rope_scaling.h"
 
 namespace rope_scaling_ns = ninfer::targets::qwen3_6;
@@ -174,6 +175,87 @@ int check_vision_table() {
     return failures;
 }
 
+// The temperature knob rewrites only the attention factor: t=0.25 at factor 2 gives
+// 0.25*ln(2)+1 with the default table untouched.
+int check_temperature() {
+    const ops::RopeFrequencies table =
+        rope_scaling_ns::rope_yarn_frequencies(1.0e7F, 64, 262144, 2.0F, 0.25F);
+    const double expected = 0.25 * std::log(2.0) + 1.0;
+    int failures          = 0;
+    if (std::abs(static_cast<double>(table.attention_factor) - expected) > 1e-7 * expected) {
+        std::cerr << "temperature: attention factor " << table.attention_factor << " != "
+                  << expected << '\n';
+        ++failures;
+    }
+    const ops::RopeFrequencies reference = rope_scaling_ns::rope_yarn_frequencies(1.0e7F, 64,
+                                                                                  262144, 2.0F);
+    for (int i = 0; i < 32; ++i) {
+        if (table.inv_frequency[i] != reference.inv_frequency[i]) {
+            std::cerr << "temperature: pair " << i << " changed the frequency table\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+// Ramp parameterization: beta_fast 32 -> 16 raises `low` from 14 to 15 (one fewer blending
+// pair); beta_slow 1 -> 2 lowers `high` from 22 to 20 (two more interpolating pairs). Both
+// move the ramp without disturbing the extrapolated prefix.
+int check_ramp_direction() {
+    int failures = 0;
+    const ops::RopeFrequencies base =
+        rope_scaling_ns::rope_yarn_frequencies(1.0e7F, 64, 262144, 4.0F);
+    const ops::RopeFrequencies fast =
+        rope_scaling_ns::rope_yarn_frequencies(1.0e7F, 64, 262144, 4.0F, 0.1F, 16.0F, 1.0F);
+    const ops::RopeFrequencies slow =
+        rope_scaling_ns::rope_yarn_frequencies(1.0e7F, 64, 262144, 4.0F, 0.1F, 32.0F, 2.0F);
+    // Base ramp: low=14, high=22. correction(16) ~ 15.62 -> floor 15; correction(2) ~ 19.74 ->
+    // ceil 20. The boundary pair itself is continuous (blend at e=0 equals extrapolation), so
+    // pair 15 is the discriminator: it blends at e=1/8 under the base table but extrapolates
+    // under bf=16.
+    if (fast.inv_frequency[15] == base.inv_frequency[15]) {
+        std::cerr << "ramp: bf=16 left the ramp unchanged\n";
+        ++failures;
+    }
+    if (fast.inv_frequency[13] != base.inv_frequency[13]) {
+        std::cerr << "ramp: bf=16 disturbed the extrapolated prefix\n";
+        ++failures;
+    }
+    if (slow.inv_frequency[21] == base.inv_frequency[21]) {
+        std::cerr << "ramp: bs=2 left the ramp unchanged\n";
+        ++failures;
+    }
+    if (slow.inv_frequency[14] != base.inv_frequency[14]) {
+        std::cerr << "ramp: bs=2 disturbed the extrapolated prefix\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int check_rejections() {
+    int failures = 0;
+    const auto expect_throw = [&](const char* label, auto build) {
+        try {
+            build();
+            std::cerr << label << ": accepted\n";
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    };
+    expect_throw("yarn factor 1", [] {
+        (void)rope_scaling_ns::rope_yarn_frequencies(1.0e7F, 64, 262144, 1.0F);
+    });
+    expect_throw("yarn temperature 0", [] {
+        (void)rope_scaling_ns::rope_yarn_frequencies(1.0e7F, 64, 262144, 2.0F, 0.0F);
+    });
+    expect_throw("yarn beta_fast <= beta_slow", [] {
+        (void)rope_scaling_ns::rope_yarn_frequencies(1.0e7F, 64, 262144, 2.0F, 0.1F, 1.0F, 1.0F);
+    });
+    expect_throw("yarn beta_slow 0", [] {
+        (void)rope_scaling_ns::rope_yarn_frequencies(1.0e7F, 64, 262144, 2.0F, 0.1F, 32.0F, 0.0F);
+    });
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -182,14 +264,12 @@ int main() {
     failures += check_table("yarn2", kYarn2, 2.0F);
     failures += check_attention_factor("yarn4 attention", 4.0F, 1.13862943611198908);
     failures += check_attention_factor("yarn2 attention", 2.0F, 1.06931471805599454);
+    failures += check_temperature();
+    failures += check_ramp_direction();
     failures += check_linear_table();
     failures += check_dflash_table();
     failures += check_vision_table();
-    try {
-        (void)rope_scaling_ns::rope_yarn_frequencies(1.0e7F, 64, 262144, 1.0F);
-        std::cerr << "yarn: factor 1 accepted\n";
-        ++failures;
-    } catch (const std::invalid_argument&) {}
+    failures += check_rejections();
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " rope scaling tables\n";
     return failures == 0 ? 0 : 1;
 }

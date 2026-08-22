@@ -14,6 +14,6 @@ void rope_launch(const Tensor& positions, int rotary_dim, const RopeFrequencies&
                  Tensor& q, Tensor& k, cudaStream_t stream);
 
 void rope_single_launch(const Tensor& positions, int rotary_dim, const RopeFrequencies& frequencies,
-                        Tensor& x, cudaStream_t stream);
+                        Tensor& x, RopeSide side, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

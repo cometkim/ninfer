@@ -840,7 +840,7 @@ int test_props_stub() {
     options.max_context                = 16384;
     options.default_max_tokens         = 4096;
     options.enable_vision              = true;
-    options.speculative.backend        = SpeculativeBackend::Mtp;
+    options.speculative.backend        = ninfer::SpeculativeBackend::Mtp;
     options.sampling_overrides.temperature = 1.0F;
     options.sampling_overrides.top_k       = 20;
 
