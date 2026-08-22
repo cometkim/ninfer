@@ -1,4 +1,5 @@
 #pragma once
+#include "ninfer/ops/rope.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
@@ -39,6 +40,7 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    const ops::RopeFrequencies* rope_frequencies;
 };
 
 struct PrefillContext {

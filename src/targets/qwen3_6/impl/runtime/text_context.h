@@ -9,6 +9,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/gqa_attention.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
@@ -50,7 +51,6 @@ struct ModelConfig {
     static constexpr int mtp_attn_in         = TextConfig::mtp_attention_input_rows;
     static constexpr int mtp_mlp_gateup_rows = TextConfig::mtp_mlp_gate_up_rows;
     static constexpr float rms_eps           = TextConfig::rms_epsilon;
-    static constexpr float rope_theta        = TextConfig::rope_theta;
     static constexpr int mtp_layers          = TextConfig::mtp_layers;
 
     [[nodiscard]] static constexpr bool is_full(int layer) {
@@ -154,7 +154,7 @@ public:
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
                 qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
                 qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
-                std::uint32_t text_kv_base,
+                std::uint32_t text_kv_base, const ops::RopeFrequencies& rope_frequencies,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
@@ -294,6 +294,7 @@ private:
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
     std::uint32_t text_kv_base_;
+    const ops::RopeFrequencies& rope_frequencies_;
     const Tensor* active_cache_positions_                 = nullptr;
     const Tensor* active_rope_positions_                  = nullptr;
     const Tensor* active_kv_table_rows_                   = nullptr;

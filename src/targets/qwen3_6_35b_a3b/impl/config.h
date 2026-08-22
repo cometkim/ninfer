@@ -31,6 +31,8 @@ struct TextConfig {
 
     static constexpr float rms_epsilon = 1.0e-6F;
     static constexpr float rope_theta  = 1.0e7F;
+    // The checkpoint's trained position capacity; YaRN scaling extends past it.
+    static constexpr std::uint32_t original_positions = 262144;
 
     static constexpr int key_dim               = gdn_key_heads * gdn_key_head_dim;
     static constexpr int value_dim             = gdn_value_heads * gdn_value_head_dim;

@@ -114,6 +114,9 @@ ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
+ninfer_add_test(ninfer_qwen3_6_27b_rope_scaling_test
+  SOURCES targets/qwen3_6_27b/test_rope_scaling.cpp
+  LIBRARIES ninfer_ops)
 target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)

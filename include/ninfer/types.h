@@ -83,6 +83,9 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // 0 (default): linear rope at the checkpoint's native positions. Any value > 1 selects
+    // YaRN position scaling with that factor (HF/vLLM `yarn` semantics).
+    float rope_scaling_factor          = 0.0F;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

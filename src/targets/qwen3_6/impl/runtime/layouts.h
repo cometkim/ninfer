@@ -7,6 +7,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "ninfer/ops/rope.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
@@ -69,6 +70,9 @@ struct SequencePlanningInputs {
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
+    // 0 (or 1): linear rope at the checkpoint's native positions. Any value > 1 selects YaRN
+    // with that factor; the sequence plan resolves it into `text_rope`.
+    float rope_scaling_factor              = 0.0F;
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;
@@ -91,6 +95,8 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
+    float rope_scaling_factor              = 0.0F;
+    ops::RopeFrequencies text_rope;
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;

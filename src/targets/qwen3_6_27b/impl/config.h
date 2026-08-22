@@ -33,6 +33,8 @@ struct TextConfig {
     static constexpr int full_attention_interval = qwen3_6::kHybridAttentionInterval;
     static constexpr float rms_epsilon           = 1.0e-6F;
     static constexpr float rope_theta            = 1.0e7F;
+    // The checkpoint's trained position capacity; YaRN scaling extends past it.
+    static constexpr std::uint32_t original_positions = 262144;
 
     static constexpr int key_dim               = gdn_key_heads * gdn_key_head_dim;
     static constexpr int value_dim             = gdn_value_heads * gdn_value_head_dim;
@@ -88,6 +90,9 @@ inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
-inline constexpr std::uint32_t kNativeContext            = 262144;
+// Engine envelope ceiling. The checkpoint's trained position capacity stays 262144; contexts
+// past it require YaRN rope scaling, and only the U8 (hq-e8-2b) KV cache can hold a window
+// this large on one device - the GQA op bounds BF16/I8 envelopes separately.
+inline constexpr std::uint32_t kNativeContext            = 1048576;
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

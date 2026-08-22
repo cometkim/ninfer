@@ -1,4 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include "targets/qwen3_6/impl/runtime/rope_scaling.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -573,6 +574,16 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     default:
         throw std::invalid_argument("unknown kv_capacity policy");
     }
+    if (options.rope_scaling_factor < 0.0F || options.rope_scaling_factor > 64.0F ||
+        (options.rope_scaling_factor > 0.0F && options.rope_scaling_factor < 1.0F) ||
+        !std::isfinite(options.rope_scaling_factor)) {
+        throw std::invalid_argument(
+            "rope_scaling_factor must be 0/1 (linear) or a YaRN factor in (1, 64]");
+    }
+    if (options.rope_scaling_factor > 1.0F &&
+        options.speculative.backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument("DFlash does not support rope scaling");
+    }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
@@ -627,6 +638,14 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device              = inputs.device;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
+    impl->rope_scaling_factor = inputs.rope_scaling_factor;
+    impl->text_rope           = inputs.rope_scaling_factor > 1.0F
+                                   ? qwen3_6::rope_yarn_frequencies(TextConfig::rope_theta,
+                                                           TextConfig::rotary_dim,
+                                                           TextConfig::original_positions,
+                                                           inputs.rope_scaling_factor)
+                                   : ops::rope_linear_frequencies(TextConfig::rope_theta,
+                                                                  TextConfig::rotary_dim);
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
@@ -724,6 +743,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_dtype       = kv_storage_dtype(options.kv_cache),
         .kv_quant_group = kv_storage_group(options.kv_cache),
         .proposal_head  = options.speculative.proposal_head,
+        .rope_scaling_factor = options.rope_scaling_factor,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,
         .device         = options.device,

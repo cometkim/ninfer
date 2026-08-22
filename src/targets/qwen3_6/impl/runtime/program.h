@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -243,6 +244,7 @@ public:
     DeviceContext& device;
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
+    const ops::RopeFrequencies rope_frequencies;
     const std::uint32_t max_concurrency;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;

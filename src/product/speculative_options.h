@@ -48,4 +48,26 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     throw std::invalid_argument("invalid speculative backend");
 }
 
+
+[[nodiscard]] inline float parse_rope_scaling(std::string_view value) {
+    if (value == "none") { return 0.0F; }
+    constexpr std::string_view prefix = "yarn:";
+    if (value.substr(0, prefix.size()) == prefix) {
+        const std::string factor_text(value.substr(prefix.size()));
+        std::size_t consumed = 0;
+        float factor = 0.0F;
+        try {
+            factor = std::stof(factor_text, &consumed);
+        } catch (const std::exception&) {
+            throw std::invalid_argument("invalid rope-scaling factor: " + factor_text);
+        }
+        if (consumed != factor_text.size()) {
+            throw std::invalid_argument("invalid rope-scaling factor: " + factor_text);
+        }
+        return factor;
+    }
+    throw std::invalid_argument("invalid rope-scaling (expected none or yarn:F): " +
+                                std::string(value));
+}
+
 } // namespace ninfer::product

@@ -24,6 +24,7 @@ struct Options {
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    float rope_scaling_factor = 0.0F;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
