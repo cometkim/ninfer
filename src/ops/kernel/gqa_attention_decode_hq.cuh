@@ -35,7 +35,6 @@ __global__ void gqa_attention_decode_hq_kernel(
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
     std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
-    (void)full_width;
     (void)logical_capacity;
     constexpr int kKeys = kGqaHqDecodeKeys;
     extern __shared__ float smem[];
@@ -57,17 +56,34 @@ __global__ void gqa_attention_decode_hq_kernel(
     const int batch   = static_cast<int>(blockIdx.z);
     const int rows    = tokens * Geometry::GroupSize;
 
+    // Batch/column addressing mirrors the bf16 small-T kernel: q, pos, and the
+    // fused-append sources live in the invocation's full-width frame, and the
+    // partial tensors are batch-major.
+    const std::int64_t column_base =
+        column_begin + static_cast<std::int64_t>(batch) * full_width;
+    q += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::QHeads * column_base;
+    pos += column_base;
+    if constexpr (CacheInput::writes_cache) {
+        input.k += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
+        input.v += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
+    }
+    const int split_count = static_cast<int>(gridDim.y);
+    partial_acc +=
+        static_cast<std::int64_t>(batch) * kGqaHeadDim * Geometry::QHeads * tokens * split_count;
+    partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+    partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+
     const std::int32_t row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(row) * table_stride;
 
-    const std::int32_t first_pos = pos[column_begin];
-    const std::int32_t last_pos  = pos[column_begin + tokens - 1];
+    const std::int32_t first_pos = pos[0];
+    const std::int32_t last_pos  = pos[tokens - 1];
     const std::int32_t window    = last_pos + 1;
     std::int32_t columns = tokens;
     if (valid_columns != nullptr) {
-        const std::int32_t valid = valid_columns[batch];
-        columns                  = valid <= 0 ? 0 : (valid < tokens ? valid : tokens);
+        const std::int32_t remaining = valid_columns[batch] - column_begin;
+        columns = remaining <= 0 ? 0 : (remaining < tokens ? remaining : tokens);
     }
     const int active_splits =
         gqa_small_t_active_splits<Geometry, false>(window, gridDim.y, tokens);
@@ -96,7 +112,10 @@ __global__ void gqa_attention_decode_hq_kernel(
     hq_engine_signs_fill(signs);
     for (int i = tid; i < rows * kGqaHeadDim; i += kGqaHqDecodeThreads) { acc[i] = 0.0f; }
     for (int r = 0; r < rows; ++r) {
-        if (tid == 0) { m_smem[r] = -INFINITY; }
+        if (tid == 0) {
+            m_smem[r] = -INFINITY;
+            l_smem[r] = 0.0f;
+        }
     }
     __syncthreads();
 
@@ -118,50 +137,46 @@ __global__ void gqa_attention_decode_hq_kernel(
     }
     __syncthreads();
 
-    // Fused append: the split owning the LAST key quantizes this round's K/V
-    // rows before any block reads them (each key row belongs to exactly one
-    // split, so the writer block is also the only reader of those rows).
+    // Key range owned by this split (absolute cache positions over the whole
+    // visible window, like the bf16 small-T kernel). The launch grid is sized
+    // for the captured envelope upper bound; only the active splits own keys.
+    const std::int32_t kps    = div_up(window, active_splits);
+    const std::int32_t key_lo = split * kps;
+    const std::int32_t key_hi = min(key_lo + kps, window);
+
+    // Fused append: every split quantizes the new K/V rows whose positions
+    // fall in its own key range before any block reads them (each key row
+    // belongs to exactly one split, so the writer block is also the only
+    // reader of those rows).
     if constexpr (CacheInput::writes_cache) {
-        const std::int32_t span = window - column_begin;
-        const std::int32_t kps  = div_up(span, active_splits);
-        const std::int32_t owner_lo = column_begin + split * kps;
-        if (last_pos >= owner_lo && last_pos < min(owner_lo + kps, window)) {
-            __shared__ float append_smem[2 * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow)];
-            const std::int64_t base =
-                static_cast<std::int64_t>(tokens - 1) * Geometry::KVHeads * kGqaHeadDim;
+        __shared__ float append_smem[2 * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow)];
+        for (int t = 0; t < columns; ++t) {
+            const std::int32_t p = pos[t];
+            if (p < key_lo || p >= key_hi) { continue; }
             for (int pass = 0; pass < 2; ++pass) {
                 float* u = append_smem + warp * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow);
                 std::uint32_t* syms =
                     reinterpret_cast<std::uint32_t*>(u + kHqSmemFloatsPerRow);
                 if (warp < 2) {
+                    const std::int64_t base =
+                        static_cast<std::int64_t>(t) * Geometry::KVHeads * kGqaHeadDim;
                     const __nv_bfloat16* src = (pass == 0 ? input.k : input.v) + base +
                                                gqa_kv_new_index<Geometry>(kv_head, 0, 0);
                     hq_encode_row_warp(src, signs, 0, u, syms,
                                        hq_row_codes_mut<Geometry>(
                                            pass == 0 ? codes_k : codes_v, block_table, kv_head,
-                                           last_pos),
+                                           p),
                                        hq_row_meta_mut<Geometry>(
                                            pass == 0 ? meta_k : meta_v, block_table, kv_head,
-                                           last_pos));
+                                           p));
                 }
             }
+            __syncthreads();
         }
-        __syncthreads();
     }
-
-    // Key range owned by this split (absolute cache positions). Partition by
-    // the DEVICE-side active split count: the launch grid is sized for the
-    // captured envelope upper bound, and only the active splits own keys.
-    const std::int32_t span = window - column_begin;
-    const std::int32_t kps  = div_up(span, active_splits);
-    const std::int32_t key_lo = column_begin + split * kps;
-    const std::int32_t key_hi = min(key_lo + kps, window);
 
     for (std::int32_t k0 = key_lo; k0 < key_hi; k0 += kKeys) {
         const int chunk = min(kKeys, key_hi - k0);
-        // Four threads per K row (one 64-symbol segment each): the serial
-        // Rice chain per thread shrinks 4x and four warps run the phase
-        // instead of one.
         {
             const int drow = tid >> 2;
             const int dseg = tid & 3;
@@ -178,7 +193,7 @@ __global__ void gqa_attention_decode_hq_kernel(
             const int kk = i - r * kKeys;
             const int token = r / Geometry::GroupSize;
             float s = 0.0f;
-            if (kk < chunk && k0 + kk <= pos[column_begin + token]) {
+            if (kk < chunk && k0 + kk <= pos[token]) {
                 const __nv_bfloat16* qr = q_rot + r * kGqaHeadDim;
                 const __nv_bfloat16* kr = kv_smem + kk * kGqaHeadDim;
                 for (int d = 0; d < kGqaHeadDim; ++d) {

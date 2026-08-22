@@ -25,4 +25,5 @@ add_executable(test_hq_codec test_hq_codec.cu)
 add_executable(verify_hq_retrieval verify_hq_retrieval.cu)
 add_executable(bench_hq_kernel bench_hq_kernel.cu)
 add_executable(test_hq_prefill test_hq_prefill.cu)
+add_executable(test_hq_decode test_hq_decode.cu)
 
