@@ -206,11 +206,18 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     return static_cast<std::uint32_t>(capacity);
 }
 
+// U8 (hq-e8-2b) reaches the absolute envelope ceiling; the paged BF16/I8 decode kernels
+// stage a fixed number of page ids per split, so their linear envelopes stay capped.
+std::uint32_t maximum_visible_keys_for(DType cache_dtype) {
+    return cache_dtype == DType::U8 ? kGqaAttentionMaximumVisibleKeys
+                                    : kGqaAttentionMaximumLinearVisibleKeys;
+}
+
 void validate_envelope(GqaExecutionEnvelope envelope, const PagedKVLayerView& cache,
                        std::int32_t tokens, const char* op) {
     const std::uint32_t capacity = validate_cache(cache, cache.num_kv_heads, op);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > maximum_visible_keys_for(cache.dtype) ||
         envelope.max_visible_keys > capacity) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope");
     }
@@ -287,7 +294,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
     if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > maximum_visible_keys_for(cache.dtype) ||
         envelope.max_visible_keys > capacity ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(width)) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope or table");
@@ -401,7 +408,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > maximum_visible_keys_for(cache_dtype) ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(max_width)) {
         throw std::invalid_argument("gqa_attention workspace: invalid profile or interval");
     }

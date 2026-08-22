@@ -1334,14 +1334,41 @@ int verify_workspace_capacity_contract() {
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
+            16, DType::BF16, {1, ops::kGqaAttentionMaximumLinearVisibleKeys}, 1, 1, 1);
     } catch (const std::invalid_argument&) {
-        std::cerr << "gqa_attention rejected its maximum visible-key envelope\n";
+        std::cerr << "gqa_attention rejected the maximum linear visible-key envelope\n";
         ++failures;
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
+            16, DType::BF16, {1, ops::kGqaAttentionMaximumLinearVisibleKeys + 1}, 1, 1, 1);
+        std::cerr << "gqa_attention accepted a linear envelope outside the launcher domain\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    try {
+        (void)ops::gqa_attention_workspace_capacity_bytes(
+            16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
+        std::cerr << "gqa_attention accepted the U8-only absolute envelope with a BF16 cache\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    try {
+        // max_width 17 routes the U8 prompt scratch: 16 q heads resolve to 2 KV heads (35B
+        // geometry), so at the absolute ceiling the one-shot rotated planes are exactly 2 GiB
+        // (2 roles x 2 KV heads x 256 x 1048576 x 2 B).
+        const std::size_t scratch = ops::gqa_attention_workspace_capacity_bytes(
+            16, DType::U8, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 17);
+        constexpr std::size_t expected = 2ULL * 2 * 256 * ops::kGqaAttentionMaximumVisibleKeys * 2;
+        if (scratch < expected) {
+            std::cerr << "gqa_attention U8 prompt scratch at the 1M envelope is undersized\n";
+            ++failures;
+        }
+    } catch (const std::invalid_argument&) {
+        std::cerr << "gqa_attention rejected its maximum visible-key envelope for U8\n";
+        ++failures;
+    }
+    try {
+        (void)ops::gqa_attention_workspace_capacity_bytes(
+            16, DType::U8, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
         std::cerr << "gqa_attention accepted an envelope outside the launcher domain\n";
         ++failures;
     } catch (const std::invalid_argument&) {}

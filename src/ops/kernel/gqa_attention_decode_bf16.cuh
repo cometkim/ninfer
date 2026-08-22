@@ -50,7 +50,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     constexpr int QKKs    = D / 16;
     constexpr int PVNt    = D / 8;
     constexpr int PVKs    = Bc / 16;
-    // The GQA Op's 262144-key maximum envelope spans at most 49 pages in one 27B split.
+    // The BF16/I8 linear envelope ceiling (262144 keys) spans at most 49 pages in one 27B
+    // split; the absolute U8-only envelope never stages pages here.
     constexpr int PageIds       = 64;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;

@@ -182,6 +182,10 @@ int main() {
         // logical_capacity below the last position: every split must write
         // neutral partials instead of indexing the block table out of range.
         {"I oob guard",         1, 1,  1, 0, 200,  -1, false, false, 199},
+        // Beyond the former 262144-key envelope (4,098 pages > 4,096; 16,388
+        // keys per split at the test's 16 splits): pins the U8-only absolute
+        // ceiling and page-table indices past the old linear boundary.
+        {"J window=262208",     1, 1,  1, 0, 262208, -1, false, false, -1},
     };
 
     for (const auto& sc : scenarios) {
