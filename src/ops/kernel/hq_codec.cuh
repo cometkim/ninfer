@@ -21,11 +21,13 @@
 //      one Rice parameter per row chosen exactly from 8 accumulators
 //
 // Budget guarantee: a row whose symbols do not fit is re-encoded at
-// alpha*2 (then alpha*4); a row of all-zero lattice codes always fits (256
-// one-bit codes = 32 bytes <= budget), so encoding terminates in bounded
-// deterministic time with no host involvement (graph-safe). Escalation is
-// recorded in the metadata flags and is astronomically rare for
-// post-rotation rows (Gaussian tail ~1e-5 at the shipped alpha).
+// alpha/2 (then alpha/4), which strictly shrinks the symbols; a row of
+// all-zero lattice codes always fits (256 one-bit codes = 32 bytes <=
+// budget), so encoding terminates in bounded deterministic time with no
+// host involvement (graph-safe). Escalation is recorded in the metadata
+// flags; at the shipped alpha a small fraction of Gaussian rows (measured
+// ~0.4% on the unit-variance corpus, more on heavy-tailed rows) needs the
+// first halving.
 //
 // Storage planes per pool (one page id shared across all planes):
 //   codes: U8 [kHqCodePlaneExtent=64, 64, Hkv, Nphysical]  (page-major)
@@ -427,10 +429,14 @@ __device__ __forceinline__ void hq_encode_row_warp(const __nv_bfloat16* row,
 #pragma unroll 1
     for (int attempt = 0; attempt < 3; ++attempt) {
         if (attempt > 0) {
-            // Each retry doubles the effective alpha (cumulative 2x, 4x);
-            // the decode side applies 1<<escalation to match.
+            // Each retry HALVES the effective alpha (cumulative 1/2x, 1/4x):
+            // shrinking the staged coordinates shrinks the lattice symbols, so
+            // a retry strictly reduces the bit count and an overflowing row is
+            // rescued. (Doubling would make things strictly worse — a row fits
+            // iff sum(z) <= 256, and doubling gives sum ~2x.) The decode side
+            // multiplies by 1<<escalation to match.
 #pragma unroll
-            for (int i = lane * 8; i < lane * 8 + 8; ++i) { u_scaled[i] *= 2.0f; }
+            for (int i = lane * 8; i < lane * 8 + 8; ++i) { u_scaled[i] *= 0.5f; }
             __syncwarp();
         }
         // lane w owns word w: quantize + strip into syms.
@@ -572,8 +578,8 @@ __device__ __forceinline__ void hq_decode_row_thread(const std::uint8_t* codes,
     const std::uint32_t k = meta[2] & 0x0Fu;
     const std::uint32_t escalation = (meta[2] >> 4) & 0x3u;
     const float inv_scale =
-        1.0f / (kHqAlpha * static_cast<float>(1u << escalation) *
-                sqrtf(static_cast<float>(kHqHeadDim)));
+        static_cast<float>(1u << escalation) /
+        (kHqAlpha * sqrtf(static_cast<float>(kHqHeadDim)));
 
     const unsigned used_bits =
         static_cast<unsigned>(meta[3]) | (static_cast<unsigned>(meta[4] & 0x3) << 8);
@@ -851,8 +857,8 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
     *reinterpret_cast<std::uint16_t*>(&h) = static_cast<std::uint16_t>(mw0 & 0xFFFFu);
     const float norm = __half2float(h);
     const float inv_scale =
-        1.0f / (kHqAlpha * static_cast<float>(1u << escalation) *
-                sqrtf(static_cast<float>(kHqHeadDim)));
+        static_cast<float>(1u << escalation) /
+        (kHqAlpha * sqrtf(static_cast<float>(kHqHeadDim)));
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int word = lane + 8 * i;

@@ -70,7 +70,8 @@ void host_decode_row(const std::uint8_t* codes, const std::uint8_t* meta,
     const double norm   = static_cast<double>(__half2float(h));
     const unsigned k   = meta[2] & 0x0Fu;
     const unsigned esc = (meta[2] >> 4) & 0x3u;
-    const double inv_scale = 1.0 / (static_cast<double>(kHqAlpha) * (1u << esc) * 16.0);
+    const double inv_scale =
+        static_cast<double>(1u << esc) / (static_cast<double>(kHqAlpha) * 16.0);
     const unsigned used =
         static_cast<unsigned>(meta[3]) | (static_cast<unsigned>(meta[4] & 0x3) << 8);
     if (used == 0) {

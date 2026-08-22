@@ -274,6 +274,35 @@ int main() {
         check(nondet == 0, "decode is not deterministic");
         check(grp_bad == 0, "8-lane group decode differs from sequential decode");
 
+        // Escalation and terminal-fallback census. Escalated rows are those
+        // whose first packing attempt overflowed the 512-bit budget; the
+        // terminal fallback (32 bytes of 0xFF) decodes to an all-zero row, so
+        // any fallback row outside a crafted corpus is silently dropped K/V.
+        {
+            std::vector<std::uint8_t> hcodes(static_cast<std::size_t>(kRows) * kHqRowBudgetBytes);
+            cudaMemcpy(hcodes.data(), d_codes, hcodes.size(), cudaMemcpyDeviceToHost);
+            int esc_normal = 0, esc_heavy = 0, fb_normal = 0, fb_heavy = 0;
+            for (int r = 0; r < kRows; ++r) {
+                const bool heavy = r >= kNormal;
+                const int esc = (hmeta[r * 8 + 2] >> 4) & 3;
+                bool fallback = true;
+                for (int b = 0; b < 32; ++b) {
+                    if (hcodes[static_cast<std::size_t>(r) * kHqRowBudgetBytes + b] != 0xFF) {
+                        fallback = false;
+                        break;
+                    }
+                }
+                if (esc != 0) { heavy ? ++esc_heavy : ++esc_normal; }
+                if (fallback) { heavy ? ++fb_heavy : ++fb_normal; }
+            }
+            std::printf("[3c] escalated rows: %d normal / %d heavy; terminal-fallback "
+                        "(zeroed) rows: %d normal / %d heavy\n",
+                        esc_normal, esc_heavy, fb_normal, fb_heavy);
+            check(fb_normal == 0 && fb_heavy == 0,
+                  "rows hit the terminal fallback (silently zeroed K/V) instead of the "
+                  "alpha-halving rescue");
+        }
+
         // Stored-format invariant: a row that fits the 512-bit budget at all
         // fits at k=0 with fewer-or-equal bits, and the encoder visits k=0
         // first with strict <, so every stored row must carry Rice k = 0.
@@ -308,10 +337,10 @@ int main() {
                          static_cast<double>(hsigns[d]);
             }
             host_fwht(rot.data(), kHqHeadDim);
-            // host_fwht is UNNORMALIZED: u_scaled = fwht(x.s)*alpha/norm, and
-            // the decoded rotated value = y*norm/(alpha*2^esc*sqrt(256)).
-            const double scale = kHqAlpha * (1 << esc) / norm;
-            const double inv = norm / (kHqAlpha * (1 << esc) * 16.0);
+            // host_fwht is UNNORMALIZED: u_scaled = fwht(x.s)*alpha/(2^esc*norm),
+            // and the decoded rotated value = y*norm*(2^esc)/(alpha*sqrt(256)).
+            const double scale = kHqAlpha / (static_cast<double>(1 << esc) * norm);
+            const double inv = norm * static_cast<double>(1 << esc) / (kHqAlpha * 16.0);
             // One E8int lattice step in decoded-value space. The device
             // quantizes the FP32-staged row while this oracle quantizes FP64,
             // so rare boundary ties legitimately flip the nearest point (a
@@ -356,10 +385,52 @@ int main() {
         }
         const double snr = 10.0 * std::log10(sig / noise);
         const double cos = cos_xy / (std::sqrt(cos_xx) * std::sqrt(cos_yy) + 1e-300);
+        // Heavy-tailed rows are the escalation corpus: they overflow the
+        // budget at alpha and must be rescued (halved alpha) with fidelity,
+        // not zeroed by the terminal fallback. Oracle-check a sample with the
+        // same per-row escalation the device recorded.
+        int heavy_oracle_bad = 0, heavy_escalated = 0;
+        for (int r = kNormal; r < kNormal + kOracleSample && r < kRows; ++r) {
+            const unsigned esc = (hmeta[r * 8 + 2] >> 4) & 3u;
+            if (esc != 0) { ++heavy_escalated; }
+            std::vector<double> rot(kHqHeadDim);
+            double norm = 0.0;
+            for (int d = 0; d < kHqHeadDim; ++d) {
+                const double x = __bfloat162float(hrows_bf[r * kHqHeadDim + d]);
+                norm += x * x;
+            }
+            norm = std::sqrt(norm);
+            for (int d = 0; d < kHqHeadDim; ++d) {
+                rot[d] = __bfloat162float(hrows_bf[r * kHqHeadDim + d]) *
+                         static_cast<double>(hsigns[d]);
+            }
+            host_fwht(rot.data(), kHqHeadDim);
+            const double scale = kHqAlpha / (static_cast<double>(1 << esc) * norm);
+            const double inv = norm * static_cast<double>(1 << esc) / (kHqAlpha * 16.0);
+            const double lattice_step = 2.0 * norm * inv;
+            for (int w = 0; w < kHqWordsPerRow; ++w) {
+                double x8[8];
+                for (int j = 0; j < 8; ++j) { x8[j] = rot[w * 8 + j] * scale; }
+                int y[8];
+                e8_bf_nearest(x8, y);
+                for (int j = 0; j < 8; ++j) {
+                    const double expected = y[j] * inv;
+                    const double got = bf16_bits_to_float(hout[r * kHqHeadDim + w * 8 + j]);
+                    if (std::fabs(got - expected) >
+                        0.02 * std::fabs(expected) + 0.01 + 2.5 * lattice_step) {
+                        ++heavy_oracle_bad;
+                    }
+                }
+            }
+        }
         std::printf("[2] oracle mismatches (rel>2%%): %d, max rel %.4f\n", oracle_bad, max_rel);
         std::printf("[5] rotated-frame SNR %.2f dB, original-frame cosine %.6f\n", snr, cos);
+        std::printf("[2b] heavy-row sample: %d escalated, %d oracle mismatches\n",
+                    heavy_escalated, heavy_oracle_bad);
         check(oracle_bad == 0, "decoded rows deviate from the FP64 oracle beyond bf16 rounding");
         check(snr > 15.0 && cos > 0.90, "2 bits/dim reconstruction quality collapsed");
+        check(heavy_escalated > 0, "heavy-row corpus no longer exercises escalation");
+        check(heavy_oracle_bad == 0, "escalated rows deviate from the FP64 oracle");
 
         cudaFree(d_rows);
         cudaFree(d_signs);

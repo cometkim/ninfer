@@ -374,115 +374,115 @@ int main() {
                         sc.name, nonneutral);
             check(nonneutral == 0, "out-of-range positions did not produce neutral partials");
         } else {
-        // ---- FP64 oracle over the device-decoded cache ---------------------
-        const std::int64_t dec_n =
-            static_cast<std::int64_t>(sc.batch) * sc.window * kKVHeads * 2 * kDim;
-        __nv_bfloat16* d_dec;
-        cudaMalloc(&d_dec, dec_n * 2);
-        decode_cache_rows<<<static_cast<int>((dec_n / kDim + 255) / 256), 256>>>(
-            d_ck, d_cv, d_mk, d_mv, d_table, d_trows, sc.window + 1, sc.window, sc.batch, d_dec);
-        cudaDeviceSynchronize();
-        std::vector<std::uint16_t> hdec(dec_n);
-        cudaMemcpy(hdec.data(), d_dec, dec_n * 2, cudaMemcpyDeviceToHost);
+            // ---- FP64 oracle over the device-decoded cache ---------------------
+            const std::int64_t dec_n =
+                static_cast<std::int64_t>(sc.batch) * sc.window * kKVHeads * 2 * kDim;
+            __nv_bfloat16* d_dec;
+            cudaMalloc(&d_dec, dec_n * 2);
+            decode_cache_rows<<<static_cast<int>((dec_n / kDim + 255) / 256), 256>>>(
+                d_ck, d_cv, d_mk, d_mv, d_table, d_trows, sc.window + 1, sc.window, sc.batch, d_dec);
+            cudaDeviceSynchronize();
+            std::vector<std::uint16_t> hdec(dec_n);
+            cudaMemcpy(hdec.data(), d_dec, dec_n * 2, cudaMemcpyDeviceToHost);
 
-        double min_cos = 1.0, max_rel = 0.0;
-        int rows_checked = 0;
-        for (int b = 0; b < sc.batch; ++b) {
-            const int valid_width =
-                sc.valid_columns >= 0 ? (sc.valid_columns - sc.column_begin) : sc.width;
-            for (int t = 0; t < valid_width; ++t) {
-                const int pos_t = sc.window - sc.width + t;
-                for (int h = 0; h < kQHeads; ++h) {
-                    // Oracle (rotated-frame profile, like the kernel): scores
-                    // of the rotated q row against the decoded (rotated) K
-                    // rows; FP64 softmax; one un-rotation of the output.
-                    const std::uint16_t* qrow =
-                        &hq[((static_cast<std::size_t>(b) * sc.full_width + sc.column_begin + t) *
-                                 kQHeads + h) * kDim];
-                    std::vector<double> qrot(kDim);
-                    for (int d = 0; d < kDim; ++d) {
-                        qrot[d] = bf16_bits_to_double(qrow[d]);
-                    }
-                    host_rotate(qrot.data());
-                    const int kvh = h / kGroup;
-                    std::vector<double> s(pos_t + 1);
-                    double m = -1e300;
-                    for (int p = 0; p <= pos_t; ++p) {
-                        const std::uint16_t* krow =
-                            &hdec[((static_cast<std::size_t>(b) * sc.window + p) * kKVHeads * 2 +
-                                   static_cast<std::size_t>(kvh) * 2) * kDim];
-                        double dot = 0;
+            double min_cos = 1.0, max_rel = 0.0;
+            int rows_checked = 0;
+            for (int b = 0; b < sc.batch; ++b) {
+                const int valid_width =
+                    sc.valid_columns >= 0 ? (sc.valid_columns - sc.column_begin) : sc.width;
+                for (int t = 0; t < valid_width; ++t) {
+                    const int pos_t = sc.window - sc.width + t;
+                    for (int h = 0; h < kQHeads; ++h) {
+                        // Oracle (rotated-frame profile, like the kernel): scores
+                        // of the rotated q row against the decoded (rotated) K
+                        // rows; FP64 softmax; one un-rotation of the output.
+                        const std::uint16_t* qrow =
+                            &hq[((static_cast<std::size_t>(b) * sc.full_width + sc.column_begin + t) *
+                                     kQHeads + h) * kDim];
+                        std::vector<double> qrot(kDim);
                         for (int d = 0; d < kDim; ++d) {
-                            dot += qrot[d] * bf16_bits_to_double(krow[d]);
+                            qrot[d] = bf16_bits_to_double(qrow[d]);
                         }
-                        s[p] = dot * kScale;
-                        m = m > s[p] ? m : s[p];
-                    }
-                    double l = 0;
-                    for (int p = 0; p <= pos_t; ++p) { l += std::exp(s[p] - m); }
-                    std::vector<double> o(kDim, 0.0);
-                    for (int p = 0; p <= pos_t; ++p) {
-                        const double w = std::exp(s[p] - m) / l;
-                        const std::uint16_t* vrow =
-                            &hdec[((static_cast<std::size_t>(b) * sc.window + p) * kKVHeads * 2 +
-                                   static_cast<std::size_t>(kvh) * 2 + 1) * kDim];
-                        for (int d = 0; d < kDim; ++d) { o[d] += w * bf16_bits_to_double(vrow[d]); }
-                    }
-                    host_unrotate(o.data());
-                    // Combine this row's partials (m/l/acc, batch-major).
-                    // Layout: head + QHeads*(token + tokens*split) per batch.
-                    const std::int64_t stat_base =
-                        static_cast<std::int64_t>(b) * kQHeads * sc.width * kSplits +
-                        h + kQHeads * t + kQHeads * sc.width * 0;
-                    const std::int64_t acc_base =
-                        static_cast<std::int64_t>(b) * kQHeads * kDim * sc.width * kSplits +
-                        (h + kQHeads * t) * kDim;
-                    double gm = -1e300;
-                    for (int sp = 0; sp < kSplits; ++sp) {
-                        const std::int64_t si = stat_base +
-                                                static_cast<std::int64_t>(kQHeads) * sc.width * sp;
-                        gm = gm > hpm[si] ? gm : hpm[si];
-                    }
-                    double gl = 0;
-                    std::vector<double> g(kDim, 0.0);
-                    for (int sp = 0; sp < kSplits; ++sp) {
-                        const std::int64_t si = stat_base +
-                                                static_cast<std::int64_t>(kQHeads) * sc.width * sp;
-                        if (hpm[si] == -INFINITY) { continue; }
-                        const double w = std::exp(hpm[si] - gm);
-                        gl += hpl[si] * w;
-                        const std::int64_t ai = acc_base +
-                                                static_cast<std::int64_t>(kQHeads) * sc.width *
-                                                    kDim * sp;
+                        host_rotate(qrot.data());
+                        const int kvh = h / kGroup;
+                        std::vector<double> s(pos_t + 1);
+                        double m = -1e300;
+                        for (int p = 0; p <= pos_t; ++p) {
+                            const std::uint16_t* krow =
+                                &hdec[((static_cast<std::size_t>(b) * sc.window + p) * kKVHeads * 2 +
+                                       static_cast<std::size_t>(kvh) * 2) * kDim];
+                            double dot = 0;
+                            for (int d = 0; d < kDim; ++d) {
+                                dot += qrot[d] * bf16_bits_to_double(krow[d]);
+                            }
+                            s[p] = dot * kScale;
+                            m = m > s[p] ? m : s[p];
+                        }
+                        double l = 0;
+                        for (int p = 0; p <= pos_t; ++p) { l += std::exp(s[p] - m); }
+                        std::vector<double> o(kDim, 0.0);
+                        for (int p = 0; p <= pos_t; ++p) {
+                            const double w = std::exp(s[p] - m) / l;
+                            const std::uint16_t* vrow =
+                                &hdec[((static_cast<std::size_t>(b) * sc.window + p) * kKVHeads * 2 +
+                                       static_cast<std::size_t>(kvh) * 2 + 1) * kDim];
+                            for (int d = 0; d < kDim; ++d) { o[d] += w * bf16_bits_to_double(vrow[d]); }
+                        }
+                        host_unrotate(o.data());
+                        // Combine this row's partials (m/l/acc, batch-major).
+                        // Layout: head + QHeads*(token + tokens*split) per batch.
+                        const std::int64_t stat_base =
+                            static_cast<std::int64_t>(b) * kQHeads * sc.width * kSplits +
+                            h + kQHeads * t + kQHeads * sc.width * 0;
+                        const std::int64_t acc_base =
+                            static_cast<std::int64_t>(b) * kQHeads * kDim * sc.width * kSplits +
+                            (h + kQHeads * t) * kDim;
+                        double gm = -1e300;
+                        for (int sp = 0; sp < kSplits; ++sp) {
+                            const std::int64_t si = stat_base +
+                                                    static_cast<std::int64_t>(kQHeads) * sc.width * sp;
+                            gm = gm > hpm[si] ? gm : hpm[si];
+                        }
+                        double gl = 0;
+                        std::vector<double> g(kDim, 0.0);
+                        for (int sp = 0; sp < kSplits; ++sp) {
+                            const std::int64_t si = stat_base +
+                                                    static_cast<std::int64_t>(kQHeads) * sc.width * sp;
+                            if (hpm[si] == -INFINITY) { continue; }
+                            const double w = std::exp(hpm[si] - gm);
+                            gl += hpl[si] * w;
+                            const std::int64_t ai = acc_base +
+                                                    static_cast<std::int64_t>(kQHeads) * sc.width *
+                                                        kDim * sp;
+                            for (int d = 0; d < kDim; ++d) {
+                                g[d] += bf16_bits_to_double(hpacc[ai + d]) * w;
+                            }
+                        }
+                        for (int d = 0; d < kDim; ++d) { g[d] /= gl; }
+                        double xy = 0, xx = 0, yy = 0, rel = 0, on = 0;
                         for (int d = 0; d < kDim; ++d) {
-                            g[d] += bf16_bits_to_double(hpacc[ai + d]) * w;
+                            xy += o[d] * g[d];
+                            xx += o[d] * o[d];
+                            yy += g[d] * g[d];
+                            rel += (g[d] - o[d]) * (g[d] - o[d]);
+                            on += o[d] * o[d];
                         }
+                        const double cos = xy / (std::sqrt(xx * yy) + 1e-300);
+                        min_cos = min_cos < cos ? min_cos : cos;
+                        max_rel = max_rel > std::sqrt(rel / (on + 1e-300))
+                                      ? max_rel
+                                      : std::sqrt(rel / (on + 1e-300));
+                        ++rows_checked;
                     }
-                    for (int d = 0; d < kDim; ++d) { g[d] /= gl; }
-                    double xy = 0, xx = 0, yy = 0, rel = 0, on = 0;
-                    for (int d = 0; d < kDim; ++d) {
-                        xy += o[d] * g[d];
-                        xx += o[d] * o[d];
-                        yy += g[d] * g[d];
-                        rel += (g[d] - o[d]) * (g[d] - o[d]);
-                        on += o[d] * o[d];
-                    }
-                    const double cos = xy / (std::sqrt(xx * yy) + 1e-300);
-                    min_cos = min_cos < cos ? min_cos : cos;
-                    max_rel = max_rel > std::sqrt(rel / (on + 1e-300))
-                                  ? max_rel
-                                  : std::sqrt(rel / (on + 1e-300));
-                    ++rows_checked;
                 }
             }
-        }
-        std::printf("[%s] rows %d, min cos %.6f, max row rel %.4f%%\n", sc.name, rows_checked,
-                    min_cos, max_rel * 100.0);
-        check(rows_checked > 0, "no rows checked");
-        check(min_cos > 0.9999, "combined partials diverge from the FP64 oracle");
-        check(max_rel < 0.03, "combined partial row error exceeds 3%");
+            std::printf("[%s] rows %d, min cos %.6f, max row rel %.4f%%\n", sc.name, rows_checked,
+                        min_cos, max_rel * 100.0);
+            check(rows_checked > 0, "no rows checked");
+            check(min_cos > 0.9999, "combined partials diverge from the FP64 oracle");
+            check(max_rel < 0.03, "combined partial row error exceeds 3%");
 
-        cudaFree(d_dec);
+            cudaFree(d_dec);
         }
         cudaFree(d_pacc);
         cudaFree(d_pm);

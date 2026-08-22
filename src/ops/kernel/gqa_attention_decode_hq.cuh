@@ -150,32 +150,37 @@ __global__ void gqa_attention_decode_hq_kernel(
     // Fused append: every split quantizes the new K/V rows whose positions
     // fall in its own key range before any block reads them (each key row
     // belongs to exactly one split, so the writer block is also the only
-    // reader of those rows).
+    // reader of those rows). (token, role) units are flattened across all
+    // eight warps — one encode per unit, no duplicate work — and the per-warp
+    // encode scratch lives in kv_smem, which is unused before the chunk loop
+    // and is exactly 8 x (256 floats + 256 u32) = its full 16 KB.
     if constexpr (CacheInput::writes_cache) {
-        __shared__ float append_smem[2 * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow)];
-        for (int t = 0; t < columns; ++t) {
+        float* append_scratch = reinterpret_cast<float*>(kv_smem);
+        for (int unit = warp; unit < columns * 2;
+             unit += kGqaHqDecodeThreads / 32) {
+            const int t = unit >> 1;
+            const bool role_v = (unit & 1) != 0;
             const std::int32_t p = pos[t];
             if (p < key_lo || p >= key_hi) { continue; }
-            for (int pass = 0; pass < 2; ++pass) {
-                float* u = append_smem + warp * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow);
-                std::uint32_t* syms =
-                    reinterpret_cast<std::uint32_t*>(u + kHqSmemFloatsPerRow);
-                if (warp < 2) {
-                    const std::int64_t base =
-                        static_cast<std::int64_t>(t) * Geometry::KVHeads * kGqaHeadDim;
-                    const __nv_bfloat16* src = (pass == 0 ? input.k : input.v) + base +
-                                               gqa_kv_new_index<Geometry>(kv_head, 0, 0);
-                    hq_encode_row_warp(src, signs, 0, u, syms,
-                                       hq_row_codes_mut<Geometry>(
-                                           pass == 0 ? codes_k : codes_v, block_table, kv_head,
-                                           p),
-                                       hq_row_meta_mut<Geometry>(
-                                           pass == 0 ? meta_k : meta_v, block_table, kv_head,
-                                           p));
-                }
-            }
-            __syncthreads();
+            float* u =
+                append_scratch + warp * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow);
+            std::uint32_t* syms =
+                reinterpret_cast<std::uint32_t*>(u + kHqSmemFloatsPerRow);
+            const std::int64_t base =
+                static_cast<std::int64_t>(t) * Geometry::KVHeads * kGqaHeadDim;
+            const __nv_bfloat16* src = (role_v ? input.v : input.k) + base +
+                                       gqa_kv_new_index<Geometry>(kv_head, 0, 0);
+            hq_encode_row_warp(src, signs, 0, u, syms,
+                               hq_row_codes_mut<Geometry>(role_v ? codes_v : codes_k,
+                                                          block_table, kv_head, p),
+                               hq_row_meta_mut<Geometry>(role_v ? meta_v : meta_k,
+                                                         block_table, kv_head, p));
         }
+        // One barrier orders every owned encode's cache writes (and the
+        // scratch region's reuse as the decoded-key tile) before the chunk
+        // loop reads them; the branch is block-uniform because columns,
+        // key_lo, and key_hi are.
+        __syncthreads();
     }
 
     for (std::int32_t k0 = key_lo; k0 < key_hi; k0 += kKeys) {
