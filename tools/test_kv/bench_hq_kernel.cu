@@ -269,6 +269,56 @@ int main() {
                     kRows, kRows / (ms / 3) / 1e3);
     }
 
+    // Append-variant timing (GqaAppendInput, the engine decode round's
+    // shape): the owner split encodes this round's K/V rows inside the
+    // kernel, which the sweeps above never measure.
+    {
+        cudaFuncSetAttribute(gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(gqa_hq_decode_smem_bytes<Gqa27Geometry>()));
+        __nv_bfloat16 *d_q1, *d_knew, *d_vnew;
+        std::int32_t* d_posa;
+        cudaMalloc(&d_q1, 24 * kHqHeadDim * 2);
+        cudaMalloc(&d_knew, 4 * kHqHeadDim * 2);
+        cudaMalloc(&d_vnew, 4 * kHqHeadDim * 2);
+        cudaMalloc(&d_posa, 4);
+        cudaMemset(d_q1, 0x3C, 24 * kHqHeadDim * 2);
+        cudaMemset(d_knew, 0x3C, 4 * kHqHeadDim * 2);
+        cudaMemset(d_vnew, 0x3C, 4 * kHqHeadDim * 2);
+        for (int window : {54, 2048}) {
+            const std::int32_t last = window - 1;
+            cudaMemcpy(d_posa, &last, 4, cudaMemcpyHostToDevice);
+            GqaAppendInput input{d_knew, d_vnew};
+            gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>
+                <<<dim3(4, 32, 1), 256, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
+                    d_q1, input, d_posa, 1, d_codes, d_codes, d_meta, d_meta, d_table, nullptr,
+                    nullptr, kRows / 64, 1, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
+            cudaDeviceSynchronize();
+            cudaEvent_t a4, b4;
+            cudaEventCreate(&a4);
+            cudaEventCreate(&b4);
+            cudaEventRecord(a4);
+            for (int rep = 0; rep < 8; ++rep) {
+                gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>
+                    <<<dim3(4, 32, 1), 256, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
+                        d_q1, input, d_posa, 1, d_codes, d_codes, d_meta, d_meta, d_table,
+                        nullptr, nullptr, kRows / 64, 1, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
+            }
+            cudaEventRecord(b4);
+            cudaEventSynchronize(b4);
+            float ms4 = 0;
+            cudaEventElapsedTime(&ms4, a4, b4);
+            std::printf("decode-kernel(append) grid.y=32 window=%d: %.3f ms/call\n", window,
+                        ms4 / 8);
+            cudaEventDestroy(a4);
+            cudaEventDestroy(b4);
+        }
+        cudaFree(d_q1);
+        cudaFree(d_knew);
+        cudaFree(d_vnew);
+        cudaFree(d_posa);
+    }
+
     // Full decode-kernel invocation shaped like the engine decode round,
     // swept over launch split counts and window sizes.
     for (int gridsplit : {4, 32, 85}) {
