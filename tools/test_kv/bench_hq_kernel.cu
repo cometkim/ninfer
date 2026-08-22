@@ -271,29 +271,52 @@ int main() {
 
     // Append-variant timing (GqaAppendInput, the engine decode round's
     // shape): the owner split encodes this round's K/V rows inside the
-    // kernel, which the sweeps above never measure.
+    // kernel, which the sweeps above never measure. K and V encode into
+    // dedicated planes (never the corpus, never each other's bytes), and the
+    // appended row's meta is read back so an escalating row (three packing
+    // attempts) cannot silently inflate the timing.
     {
         cudaFuncSetAttribute(gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(gqa_hq_decode_smem_bytes<Gqa27Geometry>()));
         __nv_bfloat16 *d_q1, *d_knew, *d_vnew;
         std::int32_t* d_posa;
+        std::uint8_t *d_cka, *d_cva, *d_mka, *d_mva;
+        const size_t aplane_codes = static_cast<size_t>(32) * 64 * 4 * 64;
+        const size_t aplane_meta  = static_cast<size_t>(32) * 64 * 4 * 8;
         cudaMalloc(&d_q1, 24 * kHqHeadDim * 2);
         cudaMalloc(&d_knew, 4 * kHqHeadDim * 2);
         cudaMalloc(&d_vnew, 4 * kHqHeadDim * 2);
         cudaMalloc(&d_posa, 4);
+        cudaMalloc(&d_cka, aplane_codes);
+        cudaMalloc(&d_cva, aplane_codes);
+        cudaMalloc(&d_mka, aplane_meta);
+        cudaMalloc(&d_mva, aplane_meta);
         cudaMemset(d_q1, 0x3C, 24 * kHqHeadDim * 2);
         cudaMemset(d_knew, 0x3C, 4 * kHqHeadDim * 2);
         cudaMemset(d_vnew, 0x3C, 4 * kHqHeadDim * 2);
+        cudaMemset(d_cka, 0, aplane_codes);
+        cudaMemset(d_cva, 0, aplane_codes);
+        cudaMemset(d_mka, 0, aplane_meta);
+        cudaMemset(d_mva, 0, aplane_meta);
         for (int window : {54, 2048}) {
             const std::int32_t last = window - 1;
             cudaMemcpy(d_posa, &last, 4, cudaMemcpyHostToDevice);
             GqaAppendInput input{d_knew, d_vnew};
             gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>
                 <<<dim3(4, 32, 1), 256, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
-                    d_q1, input, d_posa, 1, d_codes, d_codes, d_meta, d_meta, d_table, nullptr,
-                    nullptr, kRows / 64, 1, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
+                    d_q1, input, d_posa, 1, d_cka, d_cva, d_mka, d_mva, d_table, nullptr,
+                    nullptr, 32, 1, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
             cudaDeviceSynchronize();
+            {
+                const int page = last >> 6, off = last & 63;
+                std::uint8_t hm[8];
+                cudaMemcpy(hm, d_mka + static_cast<size_t>(off) * 8 +
+                                   static_cast<size_t>(page) * 64 * 4 * 8,
+                           8, cudaMemcpyDeviceToHost);
+                std::printf("append row meta (k=%d esc=%d used=%u)\n", hm[2] & 15,
+                            (hm[2] >> 4) & 3, hm[3] | ((hm[4] & 3) << 8));
+            }
             cudaEvent_t a4, b4;
             cudaEventCreate(&a4);
             cudaEventCreate(&b4);
@@ -301,8 +324,8 @@ int main() {
             for (int rep = 0; rep < 8; ++rep) {
                 gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>
                     <<<dim3(4, 32, 1), 256, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
-                        d_q1, input, d_posa, 1, d_codes, d_codes, d_meta, d_meta, d_table,
-                        nullptr, nullptr, kRows / 64, 1, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
+                        d_q1, input, d_posa, 1, d_cka, d_cva, d_mka, d_mva, d_table,
+                        nullptr, nullptr, 32, 1, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
             }
             cudaEventRecord(b4);
             cudaEventSynchronize(b4);
@@ -317,6 +340,10 @@ int main() {
         cudaFree(d_knew);
         cudaFree(d_vnew);
         cudaFree(d_posa);
+        cudaFree(d_cka);
+        cudaFree(d_cva);
+        cudaFree(d_mka);
+        cudaFree(d_mva);
     }
 
     // Full decode-kernel invocation shaped like the engine decode round,
