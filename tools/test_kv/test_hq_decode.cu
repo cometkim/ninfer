@@ -109,7 +109,8 @@ __global__ void to_bf16(const float* in, __nv_bfloat16* out, int n) {
 // the sequential row decoder: out[batch][pos][head][role][dim].
 __global__ void decode_cache_rows(const std::uint8_t* codes_k, const std::uint8_t* codes_v,
                                   const std::uint8_t* meta_k, const std::uint8_t* meta_v,
-                                  const std::int32_t* block_tables, std::int32_t table_stride,
+                                  const std::int32_t* block_tables,
+                                  const std::int32_t* table_rows, std::int32_t table_stride,
                                   std::int32_t window, std::int32_t batch_count,
                                   __nv_bfloat16* out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -121,7 +122,9 @@ __global__ void decode_cache_rows(const std::uint8_t* codes_k, const std::uint8_
     const int r2  = rem - pos * kKVHeads * 2;
     const int head = r2 >> 1;
     const bool role_v = (r2 & 1) != 0;
-    const std::int32_t* table = block_tables + static_cast<std::int64_t>(b) * table_stride;
+    const int trow = table_rows == nullptr ? 0 : table_rows[b];
+    const std::int32_t* table =
+        block_tables + static_cast<std::int64_t>(trow) * table_stride;
     __nv_bfloat16* dst =
         out + (static_cast<std::int64_t>(b) * window * kKVHeads * 2 + rem) * kDim;
     hq_decode_row_thread(
@@ -149,6 +152,9 @@ struct Scenario {
     int valid_columns; // -1: none; else absolute valid count
     bool append;       // last `width` positions supplied through GqaAppendInput
     bool trash;        // run twice with an smem trasher in between
+    int capacity;      // -1: window; else the logical capacity passed to the
+                       // kernel (smaller than window exercises the
+                       // out-of-range neutral guard)
 };
 
 }  // namespace
@@ -159,24 +165,37 @@ int main() {
     std::printf("device: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
 
     const std::vector<Scenario> scenarios = {
-        {"A tokens=1 b=1",      1, 1,  1, 0, 200, -1, false, false},
-        {"B tokens=3 b=1",      1, 3,  3, 0, 200, -1, false, false},
-        {"C tokens=1 b=2",      2, 1,  1, 0, 150, -1, false, false},
-        {"D chunk col_begin=6", 1, 12, 6, 6, 120, -1, false, false},
-        {"E partial valid",     1, 3,  3, 0, 100, 2,  false, false},
-        {"F smem trash",        1, 1,  1, 0, 200, -1, false, true},
-        {"G append width=3",    1, 3,  3, 0, 100, -1, true,  false},
+        {"A tokens=1 b=1",      1, 1,  1, 0, 200,  -1, false, false, -1},
+        {"B tokens=3 b=1",      1, 3,  3, 0, 200,  -1, false, false, -1},
+        {"C tokens=1 b=2",      2, 1,  1, 0, 150,  -1, false, false, -1},
+        {"D chunk col_begin=6", 1, 12, 6, 6, 120,  -1, false, false, -1},
+        {"E partial valid",     1, 3,  3, 0, 100,  2,  false, false, -1},
+        {"F smem trash",        1, 1,  1, 0, 200,  -1, false, true,  -1},
+        {"G append width=3",    1, 3,  3, 0, 100,  -1, true,  false, -1},
+        // A window large enough that every split runs many chunks, exercising
+        // the online-softmax rescale chain across chunk boundaries.
+        {"H window=2560",       1, 1,  1, 0, 2560, -1, false, false, -1},
+        // logical_capacity below the last position: every split must write
+        // neutral partials instead of indexing the block table out of range.
+        {"I oob guard",         1, 1,  1, 0, 200,  -1, false, false, 199},
     };
 
     for (const auto& sc : scenarios) {
         // Disjoint injective page maps per batch: batch b maps position p to
-        // b*half + (p % half), half >= window.
+        // b*half + (p % half), half >= window. With batch 2 the engine table
+        // rows are swapped (table_rows = {1, 0}) so the kernel's
+        // table_rows[batch] lookup selects the other row's memory.
         const int half = ((sc.window + kPagePos - 1) / kPagePos) * kPagePos;
         const int pages = half * sc.batch;
+        std::vector<std::int32_t> table_rows(sc.batch);
+        for (int b = 0; b < sc.batch; ++b) {
+            table_rows[b] = (sc.batch == 2) ? (1 - b) : 0;
+        }
         std::vector<std::int32_t> tables(static_cast<std::size_t>(sc.batch) * (sc.window + 1));
         for (int b = 0; b < sc.batch; ++b) {
             for (int p = 0; p < sc.window; ++p) {
-                tables[static_cast<std::size_t>(b) * (sc.window + 1) + p] = b * half + (p % half);
+                tables[static_cast<std::size_t>(table_rows[b]) * (sc.window + 1) + p] =
+                    b * half + (p % half);
             }
         }
 
@@ -206,7 +225,7 @@ int main() {
         cudaMalloc(&d_q, q_n * 2);
         cudaMalloc(&d_knew, kv_n * 2);
         cudaMalloc(&d_vnew, kv_n * 2);
-        cudaMalloc(&d_cache, cache_n * 2);
+        cudaMalloc(&d_cache, cache_n * 2 * sc.batch);
         cudaMalloc(&d_table, tables.size() * 4);
         cudaMalloc(&d_pos0, 4);
         cudaMalloc(&d_pos, static_cast<std::size_t>(sc.batch) * sc.full_width * 4);
@@ -228,10 +247,13 @@ int main() {
                                                        static_cast<int>(kv_n));
         to_bf16<<<static_cast<int>((kv_n + 255) / 256), 256>>>(d_tmp, d_vnew,
                                                       static_cast<int>(kv_n));
-        gen_gauss<<<static_cast<int>((cache_n + 255) / 256), 256>>>(d_tmp, 99ull + sc.window,
-                                                       static_cast<int>(cache_n));
-        to_bf16<<<static_cast<int>((cache_n + 255) / 256), 256>>>(d_tmp, d_cache,
-                                                         static_cast<int>(cache_n));
+        for (int b = 0; b < sc.batch; ++b) {
+            gen_gauss<<<static_cast<int>((cache_n + 255) / 256), 256>>>(
+                d_tmp, 99ull + sc.window + 7ull * b, static_cast<int>(cache_n));
+            to_bf16<<<static_cast<int>((cache_n + 255) / 256), 256>>>(
+                d_tmp, d_cache + static_cast<std::int64_t>(b) * cache_n,
+                static_cast<int>(cache_n));
+        }
         cudaDeviceSynchronize();
         {
             cudaError_t e = cudaGetLastError();
@@ -262,14 +284,20 @@ int main() {
 
         // Fill the cache for every position; append scenarios leave the last
         // `width` positions to the decode kernel's fused append (the fill's
-        // tokens bound covers only the prefix).
+        // tokens bound covers only the prefix). Each batch fills through the
+        // engine table row the kernel will select for it and from its own
+        // cache content, so a wrong table lookup cannot pass by coincidence.
+        std::int32_t* d_trows;
+        cudaMalloc(&d_trows, table_rows.size() * 4);
+        cudaMemcpy(d_trows, table_rows.data(), table_rows.size() * 4, cudaMemcpyHostToDevice);
         for (int b = 0; b < sc.batch; ++b) {
-            GqaPrefillDirectMetadata meta{d_table +
-                                          static_cast<std::size_t>(b) * (sc.window + 1)};
+            GqaPrefillDirectMetadata meta{
+                d_table + static_cast<std::size_t>(table_rows[b]) * (sc.window + 1)};
             const int fill_tokens = sc.append ? (sc.window - sc.width) : sc.window;
+            __nv_bfloat16* src = d_cache + static_cast<std::int64_t>(b) * cache_n;
             gqa_attention_prefill_fill_hq_kernel<Gqa27Geometry, GqaPrefillDirectMetadata>
                 <<<div_up(fill_tokens * kKVHeads * 2, kGqaHqFillWarps), kGqaHqFillWarps * 32,
-                   kGqaHqFillSmemBytes>>>(d_cache, d_cache, d_pos0, meta, d_ck, d_cv, d_mk, d_mv,
+                   kGqaHqFillSmemBytes>>>(src, src, d_pos0, meta, d_ck, d_cv, d_mk, d_mv,
                                           fill_tokens);
         }
         cudaDeviceSynchronize();
@@ -298,15 +326,15 @@ int main() {
                 gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaAppendInput>
                     <<<grid, kGqaHqDecodeThreads, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
                         d_q, input, d_pos, sc.width, d_ck, d_cv, d_mk, d_mv, d_table, d_vc,
-                        nullptr, sc.window + 1, sc.full_width, sc.column_begin, sc.window, kScale,
-                        d_pacc, d_pm, d_pl);
+                        d_trows, sc.window + 1, sc.full_width, sc.column_begin,
+                        sc.capacity >= 0 ? sc.capacity : sc.window, kScale, d_pacc, d_pm, d_pl);
             } else {
                 GqaCachedInput no_append{};
                 gqa_attention_decode_hq_kernel<Gqa27Geometry, GqaCachedInput>
                     <<<grid, kGqaHqDecodeThreads, gqa_hq_decode_smem_bytes<Gqa27Geometry>()>>>(
                         d_q, no_append, d_pos, sc.width, d_ck, d_cv, d_mk, d_mv, d_table, d_vc,
-                        nullptr, sc.window + 1, sc.full_width, sc.column_begin, sc.window, kScale,
-                        d_pacc, d_pm, d_pl);
+                        d_trows, sc.window + 1, sc.full_width, sc.column_begin,
+                        sc.capacity >= 0 ? sc.capacity : sc.window, kScale, d_pacc, d_pm, d_pl);
             }
             cudaDeviceSynchronize();
         };
@@ -335,13 +363,24 @@ int main() {
         cudaMemcpy(hpm.data(), d_pm, pstat_n * 4, cudaMemcpyDeviceToHost);
         cudaMemcpy(hpl.data(), d_pl, pstat_n * 4, cudaMemcpyDeviceToHost);
 
+        if (sc.capacity >= 0 && sc.capacity < sc.window) {
+            // Out-of-range guard: every (head, token, split) partial must be
+            // neutral, not a block-table read at an out-of-range position.
+            int nonneutral = 0;
+            for (std::int64_t i = 0; i < pstat_n; ++i) {
+                if (hpm[i] != -INFINITY || hpl[i] != 0.0f) { ++nonneutral; }
+            }
+            std::printf("[%s] non-neutral partials under out-of-range positions: %d\n",
+                        sc.name, nonneutral);
+            check(nonneutral == 0, "out-of-range positions did not produce neutral partials");
+        } else {
         // ---- FP64 oracle over the device-decoded cache ---------------------
         const std::int64_t dec_n =
             static_cast<std::int64_t>(sc.batch) * sc.window * kKVHeads * 2 * kDim;
         __nv_bfloat16* d_dec;
         cudaMalloc(&d_dec, dec_n * 2);
         decode_cache_rows<<<static_cast<int>((dec_n / kDim + 255) / 256), 256>>>(
-            d_ck, d_cv, d_mk, d_mv, d_table, sc.window + 1, sc.window, sc.batch, d_dec);
+            d_ck, d_cv, d_mk, d_mv, d_table, d_trows, sc.window + 1, sc.window, sc.batch, d_dec);
         cudaDeviceSynchronize();
         std::vector<std::uint16_t> hdec(dec_n);
         cudaMemcpy(hdec.data(), d_dec, dec_n * 2, cudaMemcpyDeviceToHost);
@@ -444,6 +483,7 @@ int main() {
         check(max_rel < 0.03, "combined partial row error exceeds 3%");
 
         cudaFree(d_dec);
+        }
         cudaFree(d_pacc);
         cudaFree(d_pm);
         cudaFree(d_pl);
@@ -456,6 +496,7 @@ int main() {
         cudaFree(d_vnew);
         cudaFree(d_cache);
         cudaFree(d_table);
+        cudaFree(d_trows);
         cudaFree(d_pos0);
         cudaFree(d_pos);
         if (d_vc) { cudaFree(d_vc); }

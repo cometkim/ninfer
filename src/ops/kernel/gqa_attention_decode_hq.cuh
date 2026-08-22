@@ -35,7 +35,6 @@ __global__ void gqa_attention_decode_hq_kernel(
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
     std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
-    (void)logical_capacity;
     constexpr int kKeys = kGqaHqDecodeKeys;
     extern __shared__ float smem[];
     __nv_bfloat16* q_rot = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -79,6 +78,10 @@ __global__ void gqa_attention_decode_hq_kernel(
 
     const std::int32_t first_pos = pos[0];
     const std::int32_t last_pos  = pos[tokens - 1];
+    // Out-of-range positions would index the block table out of bounds;
+    // write neutral partials for every split, like the bf16 small-T kernel.
+    const bool positions_out_of_range =
+        first_pos < 0 || last_pos < 0 || last_pos >= logical_capacity;
     const std::int32_t window    = last_pos + 1;
     std::int32_t columns = tokens;
     if (valid_columns != nullptr) {
@@ -89,7 +92,7 @@ __global__ void gqa_attention_decode_hq_kernel(
         gqa_small_t_active_splits<Geometry, false>(window, gridDim.y, tokens);
 
     // Neutral partials for inactive splits (and empty batches).
-    if (split >= active_splits || columns <= 0) {
+    if (positions_out_of_range || split >= active_splits || columns <= 0) {
         for (int t = 0; t < tokens; ++t) {
             for (int g = 0; g < Geometry::GroupSize; ++g) {
                 const int q_head = kv_head * Geometry::GroupSize + g;
