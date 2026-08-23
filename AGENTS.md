@@ -297,10 +297,55 @@ The following are typical choices, not a cumulative checklist:
 Do not replace weak verification with low-value tests. State clearly when a relevant check could not
 run and why.
 
+## Fork and branch management
+
+This checkout is the personal workspace of a three-remote fork; the full strategy is
+documented in README.md ("About this fork"). The rules that bind agent work:
+
+- Remotes: `upstream` = Neroued/ninfer (reference implementation), `natpate` =
+  natpate/ninfer-windows (Windows port lineage), `origin` = cometkim/ninfer (this fork).
+  Never push to `upstream` or `natpate`.
+- Branches: `master` follows `upstream/master`; `feat/*` are curated upstream-PR-able
+  feature branches (no machine-specific files: no absolute toolchain paths, local bench
+  prompts, or agent workspaces) stacked on `master` or on `feat/windows-port`;
+  `cometkim/dev` is the experimentation sandbox AND integration branch.
+- Experimentation cycle: (1) commit anything on `cometkim/dev`; (2) extract or
+  cherry-pick the meaningful pieces into `feat/*`; (3) squash verified feat branches
+  back into dev — reset dev to its fork-base commit, then one `git merge --squash` per
+  feat branch in stack order. This integrates the verified state AND dedups the
+  experimental commits.
+- Squashed feature snapshots on dev carry the subject prefix `squash(feat/<branch>):`;
+  they are re-applied snapshots, not primary history, and are the only commits a
+  rebuild may drop or reorder (`git log --grep '^squash(feat/'`).
+- A feat branch merged by upstream is never squashed: sync `master`, rebase the
+  remaining stack, drop its squash from the rebuild.
+- After every dev rebuild, verify content parity: `git diff feat/<tip> cometkim/dev
+  --name-only` must list only the fork-base files (README, .gitignore,
+  Directory.Build.props, build-live.ps1, HANDOFF.md, tests/fixtures/longcontext). A non-empty
+  extra diff means the re-apply lost or hybridized content — stop and fix before
+  continuing.
+- Pushing rewritten branches to origin always uses `--force-with-lease`.
+- `HANDOFF.md` (fork-base file) is the cross-session work-state document: read it at the
+  start of a session before planning work, and update it before ending a session that
+  changed anything material — current state, verified measurements, remaining work in
+  priority order, and cautions/do-not-reintroduce notes. It is the first source to consult
+  alongside this file; keep it current rather than letting it lag the branches.
+
 ## Local environment
 
 Use unrestricted build-tool parallelism for repository compilation. Invoke CMake builds as
 `cmake --build <build-dir> -j`; do not supply a numeric job limit such as `-j2` or `-j32`.
+
+On this Windows checkout the fast path is the Ninja wrapper scripts (plain PowerShell, no
+developer prompt needed — they import the MSVC/vcvars environment themselves and resolve
+ninja/cmake from PATH with VS-bundled and winget fallbacks): run
+`powershell -ExecutionPolicy Bypass -File configure-ninja.ps1` once per build dir
+(`build-ninja`, benchmarks ON), then `powershell -ExecutionPolicy Bypass -File
+build-ninja.ps1 [-Target <name>]` for every build. The Visual Studio generator flow via
+`build-live.ps1` remains supported. Never pipe a build through `head`/`tail`; check `$?`
+or use a log file. The GQA launcher TUs are deliberately split per dtype (and per geometry
+for the hq codec kernels) so heavy kernels compile in parallel — keep new launcher
+template instantiations in their per-dtype route TUs, not in the dispatchers.
 
 These are conventional project resources, not a checklist of resources every task must use:
 

@@ -1,0 +1,231 @@
+schema_version: 1
+
+# Long-context quality gates for qwen3.8-27b (ROADMAP-1m-context.md WI-5). Each suite runs
+# against its own ninfer-serve launch; the required server flags are noted per suite.
+#
+# Two benchmark families:
+# - needle_haystack: synthetic retrieval grid (depth x length), rule-scored. Needs the
+#   ModelScope NIaH corpus and the exact HF tokenizer as local prerequisites under
+#   eval/data/ (repository-relative; run from the repository root):
+#   eval/data/needle-haystack-corpus from the ModelScope cache, and
+#   eval/data/Qwen3.8-27B-tokenizer via tools/artifact/extract_frontend_fixtures.py.
+# - longbench_v2: 503 real-document multiple-choice questions (single/multi-doc QA, long
+#   in-context learning, structured data, code-repo understanding), rule-scored on the final
+#   "ANSWER: [LETTER]" line - no judge model. Auto-downloads from ZhipuAI/LongBench-v2.
+#   Subsets by prompt length: short (mean ~31k tokens, max ~210k), medium (mean ~125k, max
+#   ~560k), long (mean ~715k, max ~4M). Samples beyond the launch envelope + framing fail;
+#   that is a real subset of `medium` on 524k and of `long` on 1M - read those cells as
+#   lower bounds or trim with --limit.
+#
+# Measured context (2026-08-23 greedy single-needle probes, HANDOFF section 5g): retrieval is
+# clean through ~200k true tokens at yarn:2 and becomes fragile by ~1.5x native (390k: 2 of 3
+# depths retrieved, one immediate im_end; yarn:4 also failed that probe; unscaled OOD partially
+# retrieved). This suite quantifies that boundary.
+
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 1
+    request:
+      timeout_seconds: 86400
+      retries: 1
+      retry_interval_seconds: 10
+
+suites:
+  # Server: --kv-dtype int8 --max-context 262144 (no --rope-scaling). Native-range baseline.
+  native_int8:
+    jobs:
+      - id: needle_native_int8
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: &retrieval
+          temperature: 0
+          max_tokens: 512
+          seed: 42
+          extra_body:
+            enable_thinking: false
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: eval/data/needle-haystack-corpus
+            extra_params:
+              context_lengths_min: 8192
+              context_lengths_max: 131072
+              context_lengths_num_intervals: 5
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 5
+              tokenizer_path: eval/data/Qwen3.8-27B-tokenizer
+              show_score: true
+
+  # Server: --kv-dtype hq-e8-2b --max-context 262144 (no --rope-scaling). Codec effect at
+  # native range; compare against native_int8.
+  native_hq:
+    jobs:
+      - id: needle_native_hq
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: eval/data/needle-haystack-corpus
+            extra_params:
+              context_lengths_min: 8192
+              context_lengths_max: 131072
+              context_lengths_num_intervals: 5
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 5
+              tokenizer_path: eval/data/Qwen3.8-27B-tokenizer
+              show_score: true
+
+  # Server: --kv-dtype hq-e8-2b --max-context 524288 --rope-scaling yarn:2. The M1 profile.
+  # Five samples at ~6-7 min prefill each.
+  scaled_524k:
+    jobs:
+      - id: needle_524k_yarn2
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: eval/data/needle-haystack-corpus
+            extra_params:
+              context_lengths_min: 524288
+              context_lengths_max: 524288
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 5
+              tokenizer_path: eval/data/Qwen3.8-27B-tokenizer
+              show_score: true
+
+  # Server: --kv-dtype hq-e8-2b --max-context 1048576 --kv-capacity 1048576
+  # --rope-scaling yarn:4. The M2 profile; three samples at ~25 min prefill each.
+  scaled_1m:
+    jobs:
+      - id: needle_1m_yarn4
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: eval/data/needle-haystack-corpus
+            extra_params:
+              context_lengths_min: 1000000
+              context_lengths_max: 1000000
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 25
+              document_depth_percent_max: 75
+              document_depth_percent_intervals: 3
+              tokenizer_path: eval/data/Qwen3.8-27B-tokenizer
+              show_score: true
+
+  # Server: --kv-dtype hq-e8-2b --max-context 65536 --rope-scaling yarn:4. Static-YaRN
+  # short-prompt regression: compare against native_hq's 8k/32k cells.
+  yarn_short_regression:
+    jobs:
+      - id: needle_short_yarn4
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *retrieval
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: eval/data/needle-haystack-corpus
+            extra_params:
+              context_lengths_min: 8192
+              context_lengths_max: 32768
+              context_lengths_num_intervals: 2
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 5
+              tokenizer_path: eval/data/Qwen3.8-27B-tokenizer
+              show_score: true
+
+  # ---- LongBench v2: real-document understanding, rule-scored accuracy ----------------
+  # The prompt asks for step-by-step reasoning ending in "ANSWER: [LETTER]"; thinking stays
+  # off so the observable answer is the marker line, and 1024 tokens leave room to reason.
+
+  # Server: --kv-dtype hq-e8-2b --max-context 262144 (no --rope-scaling). Real-document
+  # baseline inside the trained range; compare against native_int8/native_hq needle cells.
+  lbv2_short_native:
+    jobs:
+      - id: lbv2_short
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        generation: &mcq
+          temperature: 0
+          max_tokens: 1024
+          seed: 42
+          extra_body:
+            enable_thinking: false
+        backend_args:
+          subset_list: [short]
+          judge_strategy: rule
+
+  # Server: --kv-dtype hq-e8-2b --max-context 262144 (no --rope-scaling). YaRN ablation cell:
+  # the same first-15 medium samples as lbv2_medium_524k at unscaled positions. One sample
+  # (index 9, ~426k tokens) exceeds this envelope and fails by construction - pair the runs
+  # on the 14 shared samples.
+  lbv2_medium_native:
+    jobs:
+      - id: lbv2_medium_native
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        limit: 15
+        generation: *mcq
+        backend_args:
+          subset_list: [medium]
+          judge_strategy: rule
+
+  # Server: --kv-dtype hq-e8-2b --max-context 524288 --rope-scaling yarn:2. The M1 profile.
+  lbv2_medium_524k:
+    jobs:
+      - id: lbv2_medium
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *mcq
+        backend_args:
+          subset_list: [medium]
+          judge_strategy: rule
+
+  # Server: --kv-dtype hq-e8-2b --max-context 1048576 --kv-capacity 1048576
+  # --rope-scaling yarn:4. The M2 profile; samples past the envelope fail by construction.
+  lbv2_long_1m:
+    jobs:
+      - id: lbv2_long
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *mcq
+        backend_args:
+          subset_list: [long]
+          judge_strategy: rule

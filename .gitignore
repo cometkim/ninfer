@@ -39,6 +39,9 @@ vcpkg_installed/
 tools/freq_corpus/fixtures/*
 !tools/freq_corpus/fixtures/ranking/
 
+# Local eval prerequisites (ModelScope needle corpus, extracted tokenizer trio)
+/eval/data/
+
 # Editor / OS
 .vscode/
 .idea/
@@ -54,3 +57,6 @@ dist/*
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Local agent workspace
+.zcode/

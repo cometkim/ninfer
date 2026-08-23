@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <!--
+    CUDA 13.3 was installed without its registry entries, so NVIDIA's
+    CUDA 13.3.targets cannot resolve CudaToolkitDir and every CUDA project
+    fails with "The CUDA Toolkit directory '' does not exist". MSBuild
+    auto-imports this file for all projects under the repo and pins the
+    toolkit location explicitly.
+  -->
+  <PropertyGroup>
+    <CudaToolkitDir>C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\</CudaToolkitDir>
+  </PropertyGroup>
+</Project>

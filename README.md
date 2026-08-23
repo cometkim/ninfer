@@ -1,12 +1,100 @@
-# NInfer-windows
+# NInfer — cometkim fork
+
+## About this fork
+
+This repository (`cometkim/ninfer`, branch `cometkim/dev`) is a personal integration workspace.
+Work happens on stacked feature branches and is re-applied here; nothing from this branch is
+pushed upstream directly.
+
+| Remote | Repository | Role |
+|---|---|---|
+| `upstream` | `Neroued/ninfer` | the original engine; feat/* branches must stay PR-able against it |
+| `natpate` | `natpate/ninfer-windows` | the Windows port this workspace started from (environment base) |
+| `origin` | `cometkim/ninfer` | personal fork; all branches below are pushed here |
+
+Branch layout:
+
+- `master` tracks `origin/master` and follows `upstream/master` (rebase; force-push own fork only).
+- `cometkim/dev` is the primary experimentation workspace AND the integration branch: the
+  fork-base commit (Windows toolchain pins, local build wrapper, bench prompts, handoff
+  notes) plus **one squashed commit per verified feature branch**, applied in stack order.
+  Anything may be committed here at any time — no discipline required.
+- `feat/*` are the curated feature branches containing **no machine-specific files** (no
+  absolute toolchain paths, local prompts, or agent workspaces) so any of them can become an
+  upstream PR at any time. They are rewritten freely
+  (`git push --force-with-lease origin feat/...`). Feature branches stack on `master`
+  directly or on `feat/windows-port` — the Windows port layer (from
+  `natpate/ninfer-windows`), which is engine work, not environment: local builds and local
+  verification require it. It is itself PR-able; when upstream takes it, the branches above
+  rebase onto `master` and the layer disappears.
+
+The experimentation cycle:
+
+1. **Commit anything on `cometkim/dev`** — it is the sandbox.
+2. **Extract / cherry-pick the meaningful pieces into `feat/*`**, keeping those branches
+   upstream-PR-able.
+3. **Squash verified feat branches back into `cometkim/dev` and dedup**: reset dev to the
+   fork base, re-apply each feat branch as one squashed commit in stack order — this both
+   integrates the verified state and drops the superseded experimental commits.
+   Squashed feature commits carry the prefix `squash(feat/<branch>):` — they are re-applied
+   snapshots, not primary history, and are the only commits on this branch that a future
+   rebuild may drop or reorder freely (`git log --grep '^squash(feat/'`).
+   Exception: a feat branch that upstream has **merged** is never squashed into dev — sync
+   `master` to upstream, rebase the remaining stack onto it, and the merged branch's content
+   arrives through the lineage; drop its squash from the rebuild.
+
+Ongoing feature experimentation:
+
+| feat branch | stacked on | status | squashed on dev as |
+|---|---|---|---|
+| `feat/windows-port` | `natpate/master` | webui + `meta.n_ctx` (already absorbed by natpate's dev; not PR-active) | — (dev's lineage base, never squashed) |
+| `feat/build-speed` | `natpate/master` | per-dtype GQA launcher TU split — head of **natpate PR #2** (one commit) | `squash(feat/build-speed)` |
+| `feat/qwen3.8-nvfp4full` | `upstream/master` | verified; upstream-PR candidate (0 behind upstream) | `squash(feat/qwen3.8-nvfp4full)` |
+| `feat/hyperquant` | `feat/build-speed` | verified (TC tile-source decode, oracle-gated); natpate-lineage PR candidate | `squash(feat/hyperquant)` |
+| `feat/1m-context` | `feat/hyperquant` | active — 1M envelope + YaRN + scratch banding + WI-8 residual window/dither (hq needle-retrieval clean through 592k true tokens); upstream-PR candidate | `squash(feat/1m-context)` |
+
+When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
+its row into the upstream lineage note.
+
+Fork-local on `cometkim/dev` only (never in a feat branch): the `/utf-8` source/execution
+charset flags — a CP949-locale build workaround owned by this environment, not engine work.
+
+```
+git switch cometkim/dev
+git reset --hard <base-commit>          # the chore(dev) fork base, before any squash
+git merge --squash feat/build-speed     && git commit   # re-apply in stack order
+git merge --squash feat/qwen3.8-nvfp4full && git commit
+git merge --squash feat/hyperquant     && git commit
+git merge --squash feat/1m-context     && git commit
+```
+
+After every re-apply, verify content parity — the integration tree must differ from the feature
+tip only by fork-only files (environment and session docs) and content owned by sibling feature
+branches or upstream commits the feature lineage predates:
+
+```
+git diff feat/1m-context cometkim/dev --name-only    # expect fork files (.gitignore,
+                                                    # Directory.Build.props, HANDOFF.md,
+                                                    # ROADMAP-1m-context.md, build scripts,
+                                                    # longprompt_*.json, README) plus
+                                                    # sibling-branch files — never a
+                                                    # feature-owned file
+```
+
+Machine-specific files live only in the environment commit (`Directory.Build.props` pins the
+CUDA 13.3 toolkit path for MSBuild; `configure-ninja.ps1`/`build-ninja.ps1` are the Ninja
+fast-path build wrappers and `build-live.ps1` the live-progress Visual Studio wrapper, with
+machine-local fallbacks for `VCPKG_ROOT` and `CUDA_PATH`; `longprompt_*.json` are fixed-context
+bench inputs; `HANDOFF.md` and `ROADMAP-1m-context.md` track active work).
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
-NInfer-windows is a Windows 11 port of [Neroued/ninfer](https://github.com/Neroued/ninfer), a from-scratch C++/CUDA inference 
-engine for explicitly registered Qwen checkpoints on a single NVIDIA GeForce RTX 5090.
-It runs text, image, and video prompts through a local CLI, OpenAI-/Anthropic-compatible HTTP APIs, 
-or the included llama.cpp webui. It builds and runs natively on Windows 11 x64. Fork changes should 
-also build/run on 64-bit Linux but nothing has been tested there.
+This fork carries [Neroued/ninfer](https://github.com/Neroued/ninfer), a from-scratch C++/CUDA
+inference engine for explicitly registered Qwen checkpoints on a single NVIDIA GeForce RTX 5090,
+and runs text, image, and video prompts through a local CLI, OpenAI-/Anthropic-compatible HTTP
+APIs, or the included llama.cpp webui. Development and measurement happen on Windows 11 x64
+today (native builds via the port lineage); the Linux build path is unchanged from upstream and
+is the intended next home for this environment.
 
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
@@ -18,6 +106,7 @@ runtime:
 | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `groupwise-int` | `qwen3_8_27b.ninfer` | 18,210,531,328 bytes (16.96 GiB) | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
 | [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | 21,492,695,040 bytes (20.02 GiB) | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
+| [Qwen3.8-27B fuller NVFP4](https://huggingface.co/cometkim/Qwen3.8-27B-nvfp4full-NInfer) | `nvfp4full` | `qwen3_8_27b_nvfp4full.ninfer` | 18,324,059,648 bytes (17.07 GiB) | `2f59cc27d67cb7acba0ba8a0e0881ac89c1db2b267a60119a696fefa12faf4e7` |
 
 Qwen3.6-27B and Qwen3.8-27B each expose two registered weight profiles. The version-2 artifact
 identity selects the profile without a separate runtime flag; Qwen3.8 uses target key
@@ -28,22 +117,24 @@ embedding, attention input/output projections, GDN Q/K/V/Z and output projection
 remaining MLP weights. All four 27B artifacts retain the same Text, Vision, MTP, prefix-reuse, CLI,
 and serving routes.
 
-## Upstream
+## Upstream lineage
 
 NInfer is [Neroued](https://github.com/Neroued)'s project
-([Neroued/ninfer](https://github.com/Neroued/ninfer)). This repository is a fork of that
-project that adds native Windows support. The engine, model artifacts, API surface, and
-published benchmarks are all upstream's work, and the upstream repository remains the
-reference implementation (this fork tracks upstream `master` with the additions below).
+([Neroued/ninfer](https://github.com/Neroued/ninfer)); that repository remains the reference
+implementation, and `master` here follows `upstream/master` directly. This workspace builds on
+[natpate/ninfer-windows](https://github.com/natpate/ninfer-windows), the native Windows port of
+that engine — the port core below is inherited from it (the compatibility layer itself ported
+from [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090), without its RTX 3090
+retargeting). The WebUI and context-reporting items live on this fork's `feat/windows-port`
+lineage — natpate's dev branch has already absorbed them, and [PR #2](https://github.com/natpate/ninfer-windows/pull/2)
+delivers them to its master.
 
-What this fork adds on top of upstream:
+Windows-port lineage:
 
 - **Native Windows 11 x64 build and run** — CMake with Visual Studio 2022 (MSVC), with
   [vcpkg](https://github.com/microsoft/vcpkg) resolving FFmpeg, libcurl, and zlib via the
   `vcpkg.json` manifest; the CUDA runtime is statically linked, so the CUDA Toolkit is only
-  needed at build time. The Windows compatibility layer is ported from
-  [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090), without its RTX 3090
-  (`sm_86`) retargeting, kernel reschedules, or release packaging.
+  needed at build time.
 - **Windows porting of the runtime** — memory-mapped artifact reading with unbuffered
   overlapped I/O (the Windows counterpart of POSIX `O_DIRECT`/`pread`, with the same 4096-byte
   alignment contract), portable console logging and load progress, and portable media
@@ -52,16 +143,39 @@ What this fork adds on top of upstream:
   under MSVC: device-pointer NVFP4 TMA descriptors, the pair-row SwiGLU TMA epilogue, and
   MSVC move-construction details in the target runtime.
 - **Stock llama.cpp WebUI** — the HTTP server additionally accepts the stock llama.cpp WebUI's
-  API dialect (compatible with the upstream `tools/ui` client), and `ninfer-serve` can serve
-  the unmodified WebUI in-process: `--webui` downloads the latest build from the
+  API dialect, and `ninfer-serve` can serve the unmodified WebUI in-process: `--webui`
+  downloads the latest build from the
   [ggml-org/llama-ui](https://huggingface.co/ggml-org/llama-ui) bucket on first start, or
   `--webui-dir DIR` serves an existing local copy.
 - **Context window reporting** — `ninfer-serve` advertises the served context ceiling in the
   OpenAI dialect: the objects returned by `/v1/models` and `/v1/models/{id}` carry
-  `meta.n_ctx` = the `--max-context` value in force, so clients that auto-detect the context
-  window (the stock WebUI, OpenAI-compatible frontends) need no manual configuration.
+  `meta.n_ctx` = the `--max-context` value in force.
 - **Portable Windows release** — a self-contained zip containing the executables and all
   runtime DLLs; see [Prebuilt Windows release](#prebuilt-windows-release).
+
+What this fork adds on top (one squashed commit per feature branch, per
+[About this fork](#about-this-fork)):
+
+- **`feat/qwen3.8-nvfp4full`** — the Qwen3.8-27B NVFP4 full-precision-requant artifact:
+  unified activation scale space, conversion tooling, model card, and the published gpqa
+  comparison.
+- **`feat/hyperquant`** — the `hq-e8-2b` KV cache: E8-lattice + Rice entropy coding at
+  2.25 bits/scalar (3.7× smaller payload than INT8 at 262k context), prompt attention over
+  one-shot decoded rotated bf16 scratch, an 8-lane cooperative k=0 Rice decoder with a
+  parallel unary packer, and a tensor-core tile-source decode kernel (the hq route is a
+  KV-source policy of the bf16 TC kernel). After the residual-window + dither work below,
+  hq decode matches or beats same-session INT8 at the measured cells (tg128 80.6 vs 71.7,
+  pp32k+tg64 62.2 vs 58.1 tok/s).
+- **`feat/1m-context`** — the 1M-context track: engine envelope raised to 1,048,576 keys on
+  the U8 cache (banded rotated scratch, 1M + `--kv-capacity auto` resolves the full pool with
+  ~3.3 GiB free), YaRN rope scaling (`--rope-scaling yarn:F[,t=][,bf=][,bs=]`, q-side
+  temperature, FP64 angle reduction), the bf16/int8 linear envelope raised to 524,288 keys,
+  and the WI-8 quality fix — a BF16 sink+recent residual window (S=32/W=512 exact side rows
+  with per-slot ring validity) plus half-cell subtractive dither, which fixed the >262k hq
+  garble: greedy needle retrieval is exact at 32k/304k/390k/592k true tokens (592k runs
+  yarn:4 at 916–922 prefill / 15.2 decode tok/s; MTP3 at 390k commits 62.9 tok/s). Beyond
+  ~592k the 1M cell still garbles (depth-independent; dense-YaRN-at-1M is the leading
+  suspect — see HANDOFF).
 
 Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
 requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from upstream.
@@ -140,15 +254,18 @@ and per-fixture results.
 Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
 enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
 
-| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond |
-|---|---:|---:|---:|
-| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% |
-| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
-| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | — | — | 88.38% |
+| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond | ERQA | RealWorldQA |
+|---|---:|---:|---:|---:|---:|
+| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
+| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
+| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
+| [Qwen3.8-27B groupwise-int](model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
+| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
 
-The Qwen3.8-27B groupwise-int profile has not yet been added to this published evaluation campaign;
-the Qwen3.8-27B NVFP4 profile currently reports GPQA-Diamond only.
+The Qwen3.6 rows used temperature 0.6 and presence penalty 1.0; the Qwen3.8-27B rows used
+temperature 1.0 and presence penalty 0.0. The multimodal columns (ERQA and RealWorldQA) ran with
+`--vision` at a 81,920-token context limit; the text columns used a 262,144-token limit except
+Qwen3.8-27B NVFP4, which needs 252,928 to fit the RTX 5090 after weights.
 
 These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
 cards and [full performance document](docs/performance.md) for correct/total counts and evaluation
@@ -205,8 +322,8 @@ unchanged: Windows 11 x64, RTX 5090, and an NVIDIA driver supporting CUDA 13.1.
 ### Linux
 
 ```bash
-git clone https://github.com/natpate/ninfer-windows.git
-cd ninfer-windows
+git clone https://github.com/cometkim/ninfer.git
+cd ninfer
 
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
@@ -223,25 +340,52 @@ Tests, benchmarks, and maintainer tools are excluded from the default build.
 
 ### Windows
 
-Use Visual Studio 2022 (with MSVC) and vcpkg; the manifest in the repository root pins
-`curl`, `ffmpeg`, and `pkgconf`:
+The fork's build entry point is a pair of plain-PowerShell Ninja wrappers — no developer
+prompt needed. `configure-ninja.ps1` (run once per build directory) imports the MSVC
+(vcvars64) environment itself, resolves `cmake`/`ninja` from PATH with VS-bundled and
+winget fallbacks, points the vcpkg toolchain at `VCPKG_ROOT` (falling back to this
+machine's local checkout) and `nvcc` at `CUDA_PATH`, and enables tests and benchmarks by
+default (`-NoTests` / `-NoBenchmarks` exclude them). `build-ninja.ps1` builds everything
+or one target:
 
 ```powershell
-git clone https://github.com/natpate/ninfer-windows.git
-cd ninfer-windows
+git clone https://github.com/cometkim/ninfer.git
+cd ninfer
 
+powershell -ExecutionPolicy Bypass -File configure-ninja.ps1
+powershell -ExecutionPolicy Bypass -File build-ninja.ps1
+powershell -ExecutionPolicy Bypass -File build-ninja.ps1 -Target ninfer_bench
+```
+
+The default configuration builds:
+
+```text
+build-ninja/apps/ninfer.exe
+build-ninja/apps/ninfer-serve.exe
+```
+
+with tests under `build-ninja/tests/` and benchmarks under `build-ninja/bench/`. The GQA
+launcher TUs are split per dtype (and per geometry for the hq codec kernels), so a cold
+build takes ~15 minutes on the RTX 5090 box versus ~50 minutes through the Visual Studio
+generator, and touching a launcher dispatcher rebuilds in ~90 seconds. MSVC compiles with
+`/utf-8` for source and execution charset, matching the Linux toolchain default.
+
+The same configuration works through the Visual Studio generator without the wrappers —
+Visual Studio 2022 (MSVC) and vcpkg; the manifest in the repository root pins `curl`,
+`ffmpeg`, and `pkgconf`:
+
+```powershell
 cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 `
   -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake `
   -DVCPKG_TARGET_TRIPLET=x64-windows
 cmake --build build-windows --config Release --parallel
 ```
 
-The default configuration builds:
-
-```text
-build-windows/apps/Release/ninfer.exe
-build-windows/apps/Release/ninfer-serve.exe
-```
+building `build-windows/apps/Release/ninfer.exe` and
+`build-windows/apps/Release/ninfer-serve.exe` (tests and benchmarks require
+`-DBUILD_TESTING=ON` / `-DNINFER_BUILD_BENCHMARKS=ON`; the Ninja wrapper turns both on by
+default). `build-live.ps1` wraps the Visual Studio flow with live progress output and
+remains supported.
 
 See [the Windows guide](docs/windows.md) for complete setup instructions, vcpkg installation, and
 notes on the resulting DLL layout.
@@ -419,7 +563,9 @@ from one to fifteen.
 - NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
   multi-GPU execution, CPU/GPU offload, or distributed serving.
 - `--max-context` is the logical ceiling of each sequence and is configurable up to the registered
-  models' native 262,144-token limit. `--kv-capacity N` explicitly sizes the shared Main Text KV
+  models' per-dtype context envelope: 524,288 tokens with `bf16`/`int8` KV and 1,048,576
+with `hq-e8-2b` (YaRN `--rope-scaling yarn:F` past the checkpoint's trained 262,144
+positions). `--kv-capacity N` explicitly sizes the shared Main Text KV
   pool for all active and retained sequences, while `--kv-capacity auto` selects the largest usable
   capacity from the memory remaining after weights are loaded while preserving 1 GiB of sizing
   headroom. Omission defaults to one `--max-context` worth of pages. The resolved pool is fixed at
