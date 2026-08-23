@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -89,12 +90,19 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
 }
 
 const fi::Tokenizer& official_tokenizer() {
+    // The upstream maintainer's checkpoint holds the tokenizer trio; NINFER_TEST_FIXTURES
+    // redirects to any directory carrying the same three files (e.g. extracted from a .ninfer
+    // artifact on machines without the checkpoint).
+    static const std::string fixture_root = [] {
+        if (const char* root = std::getenv("NINFER_TEST_FIXTURES")) { return std::string(root); }
+        return std::string("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16");
+    }();
     static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_file((fixture_root + "/tokenizer.json").c_str());
     static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_file((fixture_root + "/tokenizer_config.json").c_str());
     static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_file((fixture_root + "/generation_config.json").c_str());
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -131,7 +139,7 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     result.tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"},
-          {"vocab", {{std::string("\xff", 1), 13}, {"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
+          {"vocab", {{"ÿ", 13}, {"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
           {"merges", nlohmann::json::array()}}},
         {"added_tokens",
          tokens}}.dump();
@@ -281,7 +289,8 @@ bool throws_processor_budget(Callable&& callable) {
 
 int test_utf8_replacement_bytes(const Frontend& frontend) {
     // An invalid UTF-8 lead byte in the generated stream publishes exactly one U+FFFD
-    // (EF BF BD) and generation continues. Token 13 decodes to the byte 0xFF.
+    // (EF BF BD) and generation continues. Token 13 is the byte-level-alphabet character for
+    // 0xFF, so the tokenizer publishes the raw invalid lead byte.
     auto prompt    = frontend.prepare_tokens({0});
     auto session   = frontend.make_output_session(prompt, {});
     int failures   = 0;
@@ -1328,7 +1337,7 @@ int test_media_preparation_cancellation() {
 
 } // namespace
 
-int main() {
+int run_all_tests() {
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
@@ -1358,5 +1367,14 @@ int main() {
     failures += test_many_images_prepare_in_one_parallel_batch();
     failures += test_media_preparation_cancellation();
     failures += test_disabled_vision();
-    return failures == 0 ? 0 : 1;
+    return failures;
+}
+
+int main() {
+    try {
+        return run_all_tests() == 0 ? 0 : 1;
+    } catch (const std::exception& error) {
+        std::cerr << "fatal: " << error.what() << std::endl;
+        return 2;
+    }
 }

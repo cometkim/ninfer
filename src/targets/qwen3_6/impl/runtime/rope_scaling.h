@@ -17,7 +17,10 @@ namespace ninfer::targets::qwen3_6 {
  * e = 1 - (i - low)/(high - low), and pairs above `high` interpolate at inv/factor. The ramp
  * bounds are floor/ceil of the correction dimension
  * rotary_dim * ln(original_positions / (beta * 2pi)) / (2 ln theta), clamped to leave a
- * non-empty extrapolation and interpolation segment. `temperature` scales the attention factor
+ * non-empty extrapolation and interpolation segment (HF clamps `high` to rotary_dim - 1
+ * rather than rotary_dim/2 - 1, so extreme beta_slow values leave HF blending the top pairs
+ * while this builder fully interpolates them; irrelevant at the checkpoint defaults).
+ * `temperature` scales the attention factor
  * (temperature * ln(factor) + 1, HF default 0.1), which travels in RopeFrequencies as the
  * q-side temperature squared on q and leaves cached K factor-free.
  */
