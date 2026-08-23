@@ -737,10 +737,7 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
-// `meta` mirrors the llama.cpp server model-object dialect: clients (llama-ui,
-// hermes) read meta.n_ctx to auto-report the served context ceiling.
-std::string make_models_list(const std::string& model_id, std::uint32_t max_context,
-                             std::int64_t created) {
+std::string make_models_list(const std::string& model_id, std::int64_t created) {
     // `status` is a llama.cpp webui extension: the client reads status.value to
     // decide whether a model is loaded. A single loaded artifact is always loaded.
     const Json payload = {{"object", "list"},
@@ -749,19 +746,16 @@ std::string make_models_list(const std::string& model_id, std::uint32_t max_cont
                                              {"object", "model"},
                                              {"created", created},
                                              {"owned_by", "ninfer"},
-                                             {"status", Json{{"value", "loaded"}}},
-                                             {"meta", Json{{"n_ctx", max_context}}}}})}};
+                                             {"status", Json{{"value", "loaded"}}}}})}};
     return payload.dump();
 }
 
-std::string make_model_object(const std::string& model_id, std::uint32_t max_context,
-                              std::int64_t created) {
+std::string make_model_object(const std::string& model_id, std::int64_t created) {
     const Json payload = {{"id", model_id},
                           {"object", "model"},
                           {"created", created},
                           {"owned_by", "ninfer"},
-                          {"status", Json{{"value", "loaded"}}},
-                          {"meta", Json{{"n_ctx", max_context}}}};
+                          {"status", Json{{"value", "loaded"}}}};
     return payload.dump();
 }
 
