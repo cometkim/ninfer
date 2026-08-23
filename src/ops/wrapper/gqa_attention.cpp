@@ -476,7 +476,18 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::GqaAttentionRoute route =
             detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope);
-        if (route == detail::GqaAttentionRoute::Prompt) { return std::size_t{0}; }
+        if (route == detail::GqaAttentionRoute::Prompt) {
+            // The INT8 prompt route key-splits into partials (ROADMAP WI-K1a); every other
+            // prompt dtype — and widths the split policy keeps at S=1 — needs no workspace.
+            if (cache_dtype != DType::I8) { return std::size_t{0}; }
+            const std::int32_t splits = detail::gqa_prefill_split_count(width, q_heads);
+            if (splits == 1) { return std::size_t{0}; }
+            WorkspaceLayoutBuilder layout;
+            (void)layout.alloc(DType::FP32, {kHeadDim, q_heads, width, splits});
+            (void)layout.alloc(DType::FP32, {q_heads, width, splits});
+            (void)layout.alloc(DType::FP32, {q_heads, width, splits});
+            return layout.peak_bytes(1);
+        }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
         for (std::int32_t begin = 0; begin < width; begin += kSmallTChunkTokens) {
@@ -517,6 +528,16 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
             }
             maximum = std::max(maximum, scratch);
         }
+    }
+    // The INT8 prompt route key-splits into per-(head, token, split) partials (ROADMAP
+    // WI-K1a); the buffers scale with width and S(width), which only changes at 64-token
+    // q-block boundaries.
+    if (cache_dtype == DType::I8 && batch_size == 1 && max_width > kMaximumVerifyTokens) {
+        const std::int32_t first = std::max(min_width, kMaximumVerifyTokens + 1);
+        for (std::int32_t width = first; width <= max_width; width += 64) {
+            maximum = std::max(maximum, exact_capacity(width));
+        }
+        maximum = std::max(maximum, exact_capacity(max_width));
     }
     return maximum;
 }
@@ -565,9 +586,22 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     (void)allocate_hq_prompt_scratch(workspace, kv_heads, q.ne[1], q.ne[2], envelope,
                                      cache.dtype == DType::U8, scratch_k, scratch_v, carry_acc,
                                      carry_m, carry_l);
+    Tensor split_acc;
+    Tensor split_m;
+    Tensor split_l;
+    std::int32_t split_count = 1;
+    if (cache.dtype == DType::I8) {
+        split_count = detail::gqa_prefill_split_count(width, q.ne[1]);
+        if (split_count > 1) {
+            split_acc = workspace.alloc(DType::FP32, {kHeadDim, q.ne[1], width, split_count});
+            split_m   = workspace.alloc(DType::FP32, {q.ne[1], width, split_count});
+            split_l   = workspace.alloc(DType::FP32, {q.ne[1], width, split_count});
+        }
+    }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                         cache, scratch_k, scratch_v, carry_acc, carry_m, carry_l,
-                                        envelope.max_visible_keys, out, stream);
+                                        envelope.max_visible_keys, split_acc, split_m, split_l,
+                                        split_count, out, stream);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -624,9 +658,22 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     (void)allocate_hq_prompt_scratch(workspace, cache.num_kv_heads, q.ne[1], q.ne[2], envelope,
                                      cache.dtype == DType::U8, scratch_k, scratch_v, carry_acc,
                                      carry_m, carry_l);
+    Tensor split_acc;
+    Tensor split_m;
+    Tensor split_l;
+    std::int32_t split_count = 1;
+    if (cache.dtype == DType::I8) {
+        split_count = detail::gqa_prefill_split_count(q.ne[2], q.ne[1]);
+        if (split_count > 1) {
+            split_acc = workspace.alloc(DType::FP32, {kHeadDim, q.ne[1], q.ne[2], split_count});
+            split_m   = workspace.alloc(DType::FP32, {q.ne[1], q.ne[2], split_count});
+            split_l   = workspace.alloc(DType::FP32, {q.ne[1], q.ne[2], split_count});
+        }
+    }
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, scratch_k, scratch_v,
                                                   carry_acc, carry_m, carry_l,
-                                                  envelope.max_visible_keys, out, stream);
+                                                  envelope.max_visible_keys, split_acc, split_m,
+                                                  split_l, split_count, out, stream);
 }
 
 } // namespace ninfer::ops

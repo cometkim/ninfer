@@ -1362,6 +1362,11 @@ int run_geometry(const Geometry& geometry) {
         }
 
         if (dtype == DType::I8) {
+            // Key-split coverage (ROADMAP WI-K1a): T=130 selects S=2 (and splits the repeated
+            // block across segments in large_v_peaked); T=1024/base 0 selects S=3 — the
+            // production chunk shape.
+            failures += run_a1_case(geometry, dtype, {1024, 0, 1100, 507u},
+                                    MappingPattern::Identity);
             // K1 range cases for the f16-accumulated PV partial. base 128 + block 0 puts the 64
             // repeated keys on one aligned key tile; with same-sign |V| ~ 2000 the unguarded
             // partial is ~128k > 65504 (measured non-finite before the 2^-6 guard), the guarded

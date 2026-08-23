@@ -224,7 +224,8 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_i8_kernel(
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width) {
+    std::int32_t width, float* __restrict__ partial_acc, float* __restrict__ partial_m,
+    float* __restrict__ partial_l, std::int32_t split_count) {
     constexpr int D             = kGqaPrefillHeadDim;
     constexpr int Br            = kGqaPrefillI8Br;
     constexpr int Bc            = kGqaPrefillI8Bc;
@@ -270,8 +271,18 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_i8_kernel(
     const int tokens  = metadata.valid_tokens(width);
     if (q_head >= Geometry::QHeads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                               kGqaPrefillI8Threads);
+        if (split_count > 1) {
+            // Dead rows carry neutral merge state (m = -inf) so the reducer emits zeros.
+            for (int row = q0 + tid; row < min(q0 + Br, width); row += kGqaPrefillI8Threads) {
+                partial_m[gqa_prefill_partial_stat_index<Geometry>(q_head, row, blockIdx.z, width)] =
+                    -CUDART_INF_F;
+                partial_l[gqa_prefill_partial_stat_index<Geometry>(q_head, row, blockIdx.z, width)] =
+                    0.0f;
+            }
+        } else {
+            gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
+                                                   kGqaPrefillI8Threads);
+        }
         return;
     }
     const int base_pos              = positions[0];
@@ -280,6 +291,14 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_i8_kernel(
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
     const int key_blocks    = max_query_abs / Bc + 1;
+
+    // Key-range split (ROADMAP WI-K1a): grid.z partitions the tile range into contiguous
+    // segments; each segment runs the full online-softmax pipeline over its keys and stores
+    // unnormalized (acc, m, l) partials for gqa_attention_prefill_reduce_kernel.
+    const int split        = static_cast<int>(blockIdx.z);
+    const int tiles_per    = (key_blocks + split_count - 1) / split_count;
+    const int kb_begin     = split * tiles_per;
+    const int kb_end       = min(kb_begin + tiles_per, key_blocks);
 
     // Quantize Q cooperatively. One warp owns one (row, 64-d group) at a time.
     for (int unit = warp; unit < Br * Groups; unit += kGqaPrefillI8Warps) {
@@ -340,7 +359,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_i8_kernel(
         ninfer::ops::cp_commit();
     };
 
-    issue_kv_tile(0);
+    if (kb_begin < kb_end) { issue_kv_tile(kb_begin * Bc); }
     ninfer::ops::cp_wait<0>();
     __syncthreads();
 
@@ -383,7 +402,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_i8_kernel(
     float running_l0     = 0.0f;
     float running_l1     = 0.0f;
     const float scale_l2 = scale * Log2E;
-    for (int kb = 0; kb < key_blocks; ++kb) {
+    for (int kb = kb_begin; kb < kb_end; ++kb) {
         const int k0 = kb * Bc;
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
@@ -540,7 +559,7 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_i8_kernel(
         }
         __syncthreads();
 
-        const bool has_next = kb + 1 < key_blocks;
+        const bool has_next = kb + 1 < kb_end;
         if (has_next) { issue_kv_tile((kb + 1) * Bc); }
 
         const int row_tile = warp % kGqaPrefillI8RowTiles;
@@ -608,6 +627,65 @@ __global__ __maxnreg__(128) void gqa_attention_prefill_i8_kernel(
         final_l_s[row1] = running_l1;
     }
     __syncthreads();
+
+    if (split_count > 1) {
+        // Split mode: producer warps own each row's (m, l). Rows past tile_rows are dead for
+        // this block and MUST still write their own slot (rows in [tokens, width) would
+        // otherwise leave garbage for the reducer) — but never rows past width: an unclamped
+        // row aliases a different (token, split) slot and races its real writer. Dead rows and
+        // causally-empty segments carry m = -inf / l = 0, which the reducer maps to zero rows.
+        if (warp < ProducerWarps && lid == 0) {
+            const int row0       = warp * 16 + gid;
+            const int row1       = row0 + 8;
+            const bool row0_live = row0 < tile_rows;
+            const bool row1_live = row1 < tile_rows;
+            // A dead row still owns a merge slot while q0 + row < width (the reducer must see
+            // m = -inf there); rows past width have no slot at all and must never be written.
+            if (q0 + row0 < width) {
+                partial_m[gqa_prefill_partial_stat_index<Geometry>(q_head, q0 + row0, split,
+                                                                   width)] =
+                    row0_live ? running_m0 : -CUDART_INF_F;
+                partial_l[gqa_prefill_partial_stat_index<Geometry>(q_head, q0 + row0, split,
+                                                                   width)] =
+                    row0_live ? running_l0 : 0.0f;
+            }
+            if (q0 + row1 < width) {
+                partial_m[gqa_prefill_partial_stat_index<Geometry>(q_head, q0 + row1, split,
+                                                                   width)] =
+                    row1_live ? running_m1 : -CUDART_INF_F;
+                partial_l[gqa_prefill_partial_stat_index<Geometry>(q_head, q0 + row1, split,
+                                                                   width)] =
+                    row1_live ? running_l1 : 0.0f;
+            }
+        }
+        const int row_tile = warp % kGqaPrefillI8RowTiles;
+        const int d_slice  = warp / kGqaPrefillI8RowTiles;
+        const int row_base = row_tile * 16;
+        const int row0     = row_base + gid;
+        const int row1     = row0 + 8;
+        // Store the partial ALREADY normalized by its own l (0 when l == 0): bf16 rounding then
+        // lands on O(1) values exactly like the single-pass output path, and the reducer
+        // re-weights by l*exp2((m - m*)*scale*log2e), which is algebraically the plain merge.
+        const float inv_l0 = final_l_s[row0] > 0.0f ? __frcp_rn(final_l_s[row0]) : 0.0f;
+        const float inv_l1 = final_l_s[row1] > 0.0f ? __frcp_rn(final_l_s[row1]) : 0.0f;
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const int d0 = (d_slice * PVNtPerWarp + n) * 8 + 2 * lid;
+            if (row0 < tile_rows) {
+                float2* slot = reinterpret_cast<float2*>(
+                    &partial_acc[gqa_prefill_partial_acc_index<Geometry>(q_head, d0, q0 + row0,
+                                                                         split, width)]);
+                *slot        = make_float2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+            }
+            if (row1 < tile_rows) {
+                float2* slot = reinterpret_cast<float2*>(
+                    &partial_acc[gqa_prefill_partial_acc_index<Geometry>(q_head, d0, q0 + row1,
+                                                                         split, width)]);
+                *slot        = make_float2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+            }
+        }
+        return;
+    }
 
     const int row_tile = warp % kGqaPrefillI8RowTiles;
     const int d_slice  = warp / kGqaPrefillI8RowTiles;
