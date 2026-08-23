@@ -60,6 +60,23 @@ struct AttentionCase {
     std::uint32_t seed;
 };
 
+// Value profile for the INT8 f16-accumulated PV range cases. The default magnitudes (Q/K +-0.25,
+// V +-1) produce a nearly flat softmax; these profiles reach the regimes the per-tile f16
+// partial must survive. `repeat_key_block` copies one key row across the 64 appended tokens
+// starting there, and `match_query_to_repeated` makes every query that row too, so the repeated
+// tile is the row's maximum with p = 1 on all 64 keys.
+struct AttentionProfile {
+    const char* name;
+    float q_lo;
+    float q_hi;
+    float k_lo;
+    float k_hi;
+    float v_lo;
+    float v_hi;
+    std::int32_t repeat_key_block;
+    bool match_query_to_repeated;
+};
+
 enum class MappingPattern { Identity, Offset, Fragmented };
 
 const char* mapping_name(MappingPattern pattern) {
@@ -920,7 +937,8 @@ int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mappin
 }
 
 int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test_case,
-                MappingPattern mapping) {
+                MappingPattern mapping, const AttentionProfile* profile = nullptr,
+                const ReductionCriterion* criterion = nullptr) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -930,9 +948,37 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) *
                                     static_cast<std::size_t>(geometry.kv_heads) *
                                     static_cast<std::size_t>(test_case.tokens);
-    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
-    std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
-    std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
+    const float q_lo = profile != nullptr ? profile->q_lo : -0.25f;
+    const float q_hi = profile != nullptr ? profile->q_hi : 0.25f;
+    const float k_lo = profile != nullptr ? profile->k_lo : -0.25f;
+    const float k_hi = profile != nullptr ? profile->k_hi : 0.25f;
+    const float v_lo = profile != nullptr ? profile->v_lo : -1.0f;
+    const float v_hi = profile != nullptr ? profile->v_hi : 1.0f;
+    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, q_lo, q_hi);
+    std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, k_lo, k_hi);
+    std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, v_lo, v_hi);
+    if (profile != nullptr && profile->repeat_key_block >= 0) {
+        const std::int32_t block = profile->repeat_key_block;
+        for (std::int32_t t = block + 1; t < block + 64 && t < test_case.tokens; ++t) {
+            for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    k[kv_input_index(geometry, head, d, t)] =
+                        k[kv_input_index(geometry, head, d, block)];
+                }
+            }
+        }
+        if (profile->match_query_to_repeated) {
+            for (std::int32_t t = 0; t < test_case.tokens; ++t) {
+                for (std::int32_t head = 0; head < geometry.q_heads; ++head) {
+                    const std::int32_t kv_head = head / geometry.query_group();
+                    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                        q[q_index(geometry, head, d, t)] =
+                            k[kv_input_index(geometry, kv_head, d, block)];
+                    }
+                }
+            }
+        }
+    }
     inject_codec_edges(geometry, test_case.tokens, k, v);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
@@ -980,11 +1026,13 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
                        envelope, workspace, tout, nullptr);
     cuda_synchronize();
 
-    const std::string label = case_label("gqa_attention", geometry, dtype, test_case, mapping);
+    std::string label = case_label("gqa_attention", geometry, dtype, test_case, mapping);
+    if (profile != nullptr) { label += std::string(" profile=") + profile->name; }
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
-    int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(dtype));
+    int failures =
+        verify_attention(label, bf16_bits_to_double(output_bits), reference,
+                         criterion != nullptr ? *criterion : attention_criterion(dtype));
     failures += verify_cache(label, cache.snapshot(), expected);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_input(label + " k unchanged", dk, k_bits);
@@ -1311,6 +1359,40 @@ int run_geometry(const Geometry& geometry) {
                 run_a3_case(geometry, dtype, {16, 17, 1024, 403u}, MappingPattern::Identity);
             failures +=
                 run_a3_case(geometry, dtype, {16, 17, 1025, 404u}, MappingPattern::Identity);
+        }
+
+        if (dtype == DType::I8) {
+            // K1 range cases for the f16-accumulated PV partial. base 128 + block 0 puts the 64
+            // repeated keys on one aligned key tile; with same-sign |V| ~ 2000 the unguarded
+            // partial is ~128k > 65504 (measured non-finite before the 2^-6 guard), the guarded
+            // one is bounded by max|v|. The second case drives post-q/k-norm Q/K magnitudes
+            // (RMS ~1) so the softmax is concentrated rather than the default flat profile.
+            // Both carry profile-specific criteria: at these profiles the INT8 quantization
+            // itself exceeds the registered flat-profile criterion (measured rel_l2 3.43e-3 /
+            // gross ratio 1.45 on the PRE-f16-PV kernel, 3.45e-3 / 1.48 with it — the f16 tile
+            // partial adds <=0.5% of the error), so these bounds pin the range guard and the
+            // realistic-profile margin (measured rel_l2 1.21e-3 and 3.45e-3) rather than the
+            // flat-profile contract.
+            const AttentionProfile large_v_peaked{
+                "large_v_peaked", -1.0f, 1.0f, -1.0f, 1.0f, 1800.0f, 2200.0f, 0, true};
+            const AttentionProfile realistic_qk{
+                "realistic_qk", -1.7f, 1.7f, -1.7f, 1.7f, -1.0f, 1.0f, -1, false};
+            const ReductionCriterion large_v_peaked_criterion{
+                /*relative_l2*/ 4.0e-3,
+                /*gross_absolute*/ 10.0e-3,
+                /*gross_relative_to_max_reference*/ 6.0e-3,
+            };
+            const ReductionCriterion realistic_qk_criterion{
+                /*relative_l2*/ 5.0e-3,
+                /*gross_absolute*/ 2.5e-3,
+                /*gross_relative_to_max_reference*/ 4.0e-3,
+            };
+            failures += run_a1_case(geometry, dtype, {130, 128, 260, 505u},
+                                    MappingPattern::Identity, &large_v_peaked,
+                                    &large_v_peaked_criterion);
+            failures += run_a1_case(geometry, dtype, {130, 128, 260, 506u},
+                                    MappingPattern::Identity, &realistic_qk,
+                                    &realistic_qk_criterion);
         }
     }
     return failures;

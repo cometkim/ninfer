@@ -2,8 +2,10 @@
 
 // INT8-native GQA prompt kernel for the registered Qwen3.6 head geometries. QK stays INT8 through
 // m16n8k32.s8 Tensor Cores; V alone is dequantized with packed FP16 arithmetic while
-// producer warps execute QK. Sixteen warps split each 16-row FP16 PV output across
-// four 64-dimension slices.
+// producer warps execute QK. PV is f16-accumulated per 64-key tile (2x the f32-accumulate issue
+// rate) and promoted to the f32 running sum once per tile, with a 2^-6 range guard on the staged
+// V so a tile partial can never leave the fp16 range. Sixteen warps split each 16-row FP16 PV
+// output across four 64-dimension slices.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -60,17 +62,22 @@ __device__ __forceinline__ int gqa_prefill_i8_p_swz(int row, int col) {
     return gqa_prefill_swz(row, col);
 }
 
+// V dequantized with a 2^-6 range guard: PV below accumulates f16 over a 64-key tile, and with
+// p in [0,1] the guarded partial is bounded by (sum p)/64 * max|v| <= max|v| — representable for
+// every V the fp16 dequant itself admits. The promotion multiplies the exact power of two back;
+// scaling commutes with f16 rounding above 2^-8, so values change only in the subnormal tail.
 __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* codes8,
                                                              __half scale) {
     const int2 raw       = load_vec<int2>(codes8);
     const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
     const __half2 s2     = __halves2half2(scale, scale);
+    const __half2 guard  = __float2half2_rn(0.015625f); // 2^-6
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const __half2 code2 =
             __floats2half2_rn(static_cast<float>(c[2 * i]), static_cast<float>(c[2 * i + 1]));
-        const __half2 value2 = __hmul2(code2, s2);
+        const __half2 value2 = __hmul2(__hmul2(code2, s2), guard);
         packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
@@ -212,7 +219,7 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
 }
 
 template <typename Geometry, typename Metadata>
-__global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
+__global__ __maxnreg__(128) void gqa_attention_prefill_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
@@ -346,8 +353,11 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    // Keeping exactly two group scales live is the spill-free 120-register point on SM120.
-    // Groups 2/3 reload per key tile; retaining all four creates an 8-byte stack frame.
+    // Keeping exactly two group scales live plus the f16 PV tile partials fits the
+    // 128-register cap (512 threads x 128 = one full SM register file, still 1 CTA/SM); at this
+    // point four of the six instantiations report zero ptxas spills and the worst retains
+    // 36/40 B (its pre-f16-PV state spilled 76/80 B at the old 120 cap). Groups 2/3 reload per
+    // key tile; retaining all four creates a stack frame.
     float q_scale_r0[Groups - 2];
     float q_scale_r1[Groups - 2];
     if (warp < ProducerWarps) {
@@ -548,8 +558,9 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
 
         // PV runs on the f16-accumulate MMA (2x the f32-accumulate issue rate on GeForce): each
         // 64-key tile accumulates into f16 fragments and promotes once into the f32 running sum.
-        // Safe here because P is already f16 in smem, V is bounded by its int8 group scale, and a
-        // tile partial is at most 64 such products; the cross-tile sum stays in f32.
+        // The staged V carries the 2^-6 dequant guard, so a tile partial stays within max|v| of
+        // the fp16 range however peaked the tile's p mass is; the promotion scales the exact 64
+        // back in the same FFMA that adds into the running sum.
         unsigned hacc[PVNtPerWarp][2];
 #pragma unroll
         for (int n = 0; n < PVNtPerWarp; ++n) {
@@ -577,14 +588,14 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         }
 #pragma unroll
         for (int n = 0; n < PVNtPerWarp; ++n) {
-            acc[n][0] +=
-                __half2float(__ushort_as_half(static_cast<unsigned short>(hacc[n][0] & 0xffffu)));
-            acc[n][1] +=
-                __half2float(__ushort_as_half(static_cast<unsigned short>(hacc[n][0] >> 16)));
-            acc[n][2] +=
-                __half2float(__ushort_as_half(static_cast<unsigned short>(hacc[n][1] & 0xffffu)));
-            acc[n][3] +=
-                __half2float(__ushort_as_half(static_cast<unsigned short>(hacc[n][1] >> 16)));
+            const float2 h0 =
+                __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][0]));
+            const float2 h1 =
+                __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][1]));
+            acc[n][0] = fmaf(64.0f, h0.x, acc[n][0]);
+            acc[n][1] = fmaf(64.0f, h0.y, acc[n][1]);
+            acc[n][2] = fmaf(64.0f, h1.x, acc[n][2]);
+            acc[n][3] = fmaf(64.0f, h1.y, acc[n][3]);
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
