@@ -27,6 +27,8 @@ constexpr std::int32_t kMaximumVerifyTokens          = 16;
 constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
+constexpr std::int32_t kHqResidualRows =
+    static_cast<std::int32_t>(kGqaHqSinkKeys + kGqaHqRecentKeys);
 
 std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     if (q_heads == 24) { return 4; }
@@ -56,6 +58,32 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
     }
 }
 
+// The U8 residual window arrives as all-or-none: exact rotated-frame bf16 side planes
+// [head_dim, kv_heads, sink+recent rows, slots] plus U32 ring-validity words [4, slots].
+// Any other cache dtype must not carry them.
+void validate_residual(const Tensor& residual_k, const Tensor& residual_v,
+                       const Tensor& ring_valid, DType dtype, std::int32_t kv_heads,
+                       std::int32_t slots, const char* op) {
+    const bool present =
+        residual_k.data != nullptr || residual_v.data != nullptr || ring_valid.data != nullptr;
+    if (!present) { return; }
+    if (dtype != DType::U8) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": residual planes are an hq-e8-2b-only feature");
+    }
+    if (residual_k.dtype != DType::BF16 || residual_v.dtype != DType::BF16 ||
+        ring_valid.dtype != DType::I32) {
+        throw std::invalid_argument(std::string(op) + ": invalid residual plane dtypes");
+    }
+    require_shape(residual_k, kHeadDim, kv_heads, kHqResidualRows, slots, op, "residual k plane");
+    require_shape(residual_v, kHeadDim, kv_heads, kHqResidualRows, slots, op, "residual v plane");
+    require_shape(ring_valid, static_cast<std::int32_t>(kGqaHqRecentKeys / 32), slots, 1, 1, op,
+                  "residual ring validity");
+    require_contiguous_nonnull(residual_k, op, "residual k plane");
+    require_contiguous_nonnull(residual_v, op, "residual v plane");
+    require_contiguous_nonnull(ring_valid, op, "residual ring validity");
+}
+
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
     if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 && cache.dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
@@ -70,6 +98,8 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     if (cache.dtype == DType::U8 && cache.quant_group != kHqQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": hq-e8-2b KV cache must use quant_group 32");
     }
+    validate_residual(cache.residual_k, cache.residual_v, cache.ring_valid, cache.dtype, kv_heads,
+                      1, op);
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_table.ne[0];
@@ -149,6 +179,8 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_tables.ne[0];
     const std::int32_t table_rows     = cache.block_tables.ne[1];
+    validate_residual(cache.residual_k, cache.residual_v, cache.ring_valid, cache.dtype, kv_heads,
+                      table_rows, op);
     const std::int64_t capacity       = static_cast<std::int64_t>(logical_pages) * kPagedKVPageSize;
     if (physical_pages <= 0 || logical_pages <= 0 || table_rows <= 0 ||
         capacity > std::numeric_limits<std::int32_t>::max()) {

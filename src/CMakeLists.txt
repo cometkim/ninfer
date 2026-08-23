@@ -24,6 +24,7 @@ add_library(ninfer_core STATIC
   core/host_worker_pool.cpp
   core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
+  core/kv_ring_bits.cu
   core/paged_kv_cache.cpp
   core/linear_attention_state.cpp
   core/layout.cpp

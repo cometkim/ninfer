@@ -21,6 +21,16 @@ inline constexpr std::uint32_t kGqaAttentionMaximumLinearVisibleKeys = 262144;
 // bands of at most this many keys (the FA2 kernel carries its online-softmax state between
 // bands), bounding the prompt scratch at 1 GiB regardless of the execution envelope.
 inline constexpr std::uint32_t kGqaHqPromptScratchBandKeys = 262144;
+// hq-e8-2b residual window: every sequence additionally keeps the first kGqaHqSinkKeys and the
+// last kGqaHqRecentKeys K/V rows EXACT (BF16, codec-rotated frame) in per-slot side planes, and
+// every hq consumer reads those rows from the side planes instead of the codec planes — the
+// per-vector quantization bias compounds over long windows (clean through the native envelope,
+// degrading past it), and exact sink+recent rows are the calibration-free protection. Source
+// selection is PER ROW (the ring boundary sits at an arbitrary window offset), so no tile
+// alignment is required; kGqaHqSinkKeys just equals one whole 32-key decode tile, and the
+// recent window is a power-of-two ring (slot = key & (kGqaHqRecentKeys - 1)).
+inline constexpr std::uint32_t kGqaHqSinkKeys   = 32;
+inline constexpr std::uint32_t kGqaHqRecentKeys = 512;
 
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;

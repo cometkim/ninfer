@@ -32,7 +32,10 @@ void gqa_small_t_partial_hq(const Tensor& q, CacheInput input, const Tensor& pos
             GqaTcKVHq{static_cast<std::uint8_t*>(cache.k_pages.data),
                       static_cast<std::uint8_t*>(cache.v_pages.data),
                       static_cast<std::uint8_t*>(cache.k_scale_pages.data),
-                      static_cast<std::uint8_t*>(cache.v_scale_pages.data)},
+                      static_cast<std::uint8_t*>(cache.v_scale_pages.data),
+                      static_cast<__nv_bfloat16*>(cache.residual_k.data),
+                      static_cast<__nv_bfloat16*>(cache.residual_v.data),
+                      static_cast<std::uint32_t*>(cache.ring_valid.data)},
             static_cast<const std::int32_t*>(cache.block_tables.data),
             invocation.valid_columns == nullptr
                 ? nullptr

@@ -19,6 +19,7 @@
 #include <random>
 #include <vector>
 
+#include "hq_dither_host.h"
 #include "ops/kernel/hq_codec.cuh"
 
 using namespace ninfer::ops;
@@ -64,7 +65,8 @@ __global__ void encode_rows_kernel(const __nv_bfloat16* rows, const std::int8_t*
     std::uint32_t* syms = reinterpret_cast<std::uint32_t*>(u + kHqSmemFloatsPerRow);
     hq_encode_row_warp(rows + static_cast<std::size_t>(warp) * kHqHeadDim, signs, 0, u,
                        syms, codes + static_cast<std::size_t>(warp) * kHqRowBudgetBytes,
-                       meta + static_cast<std::size_t>(warp) * kHqMetaBytes);
+                       meta + static_cast<std::size_t>(warp) * kHqMetaBytes,
+                       hq_dither_row_seed(0, warp, false));
 }
 
 __global__ void decode_rows_kernel(const std::uint8_t* codes, const std::uint8_t* meta,
@@ -73,7 +75,8 @@ __global__ void decode_rows_kernel(const std::uint8_t* codes, const std::uint8_t
     if (i >= n_rows) { return; }
     hq_decode_row_thread(codes + static_cast<std::size_t>(i) * kHqRowBudgetBytes,
                          meta + static_cast<std::size_t>(i) * kHqMetaBytes,
-                         out + static_cast<std::size_t>(i) * kHqHeadDim);
+                         out + static_cast<std::size_t>(i) * kHqHeadDim,
+                         hq_dither_row_seed(0, i, false));
 }
 
 __global__ void decode_rows_group_kernel(const std::uint8_t* codes, const std::uint8_t* meta,
@@ -83,7 +86,8 @@ __global__ void decode_rows_group_kernel(const std::uint8_t* codes, const std::u
     if (row >= n_rows) { return; }
     hq_decode_row_group(codes + static_cast<std::size_t>(row) * kHqRowBudgetBytes,
                         meta + static_cast<std::size_t>(row) * kHqMetaBytes,
-                        out + static_cast<std::size_t>(row) * kHqHeadDim, i & 7);
+                        out + static_cast<std::size_t>(row) * kHqHeadDim, i & 7, 0,
+                        hq_dither_row_seed(0, row, false));
 }
 
 // ---- host oracles --------------------------------------------------------------
@@ -350,13 +354,17 @@ int main() {
             const double lattice_step = 2.0 * inv;
             double row_err2 = 0.0, row_sig2 = 0.0;
             if (r < kOracleSample) {
+                const std::uint64_t row_seed = hqhost::dither_row_seed(0, r, false);
                 for (int w = 0; w < kHqWordsPerRow; ++w) {
                     double x8[8];
-                    for (int j = 0; j < 8; ++j) { x8[j] = rot[w * 8 + j] * scale; }
+                    const std::uint64_t wseed = hqhost::dither_word_seed(row_seed, w);
+                    for (int j = 0; j < 8; ++j) {
+                        x8[j] = rot[w * 8 + j] * scale - hqhost::dither(wseed, j);
+                    }
                     int y[8];
                     e8_bf_nearest(x8, y);
                     for (int j = 0; j < 8; ++j) {
-                        const double expected = y[j] * inv;
+                        const double expected = (y[j] + hqhost::dither(wseed, j)) * inv;
                         const double got = bf16_bits_to_float(
                             hout[r * kHqHeadDim + w * 8 + j]);
                         const double err = std::fabs(got - expected);
@@ -421,13 +429,17 @@ int main() {
             const double inv = norm * static_cast<double>(1 << esc) / (kHqAlpha * 16.0);
             const double lattice_step = 2.0 * inv;
             double row_err2 = 0.0, row_sig2 = 0.0;
+            const std::uint64_t row_seed = hqhost::dither_row_seed(0, r, false);
             for (int w = 0; w < kHqWordsPerRow; ++w) {
                 double x8[8];
-                for (int j = 0; j < 8; ++j) { x8[j] = rot[w * 8 + j] * scale; }
+                const std::uint64_t wseed = hqhost::dither_word_seed(row_seed, w);
+                for (int j = 0; j < 8; ++j) {
+                    x8[j] = rot[w * 8 + j] * scale - hqhost::dither(wseed, j);
+                }
                 int y[8];
                 e8_bf_nearest(x8, y);
                 for (int j = 0; j < 8; ++j) {
-                    const double expected = y[j] * inv;
+                    const double expected = (y[j] + hqhost::dither(wseed, j)) * inv;
                     const double got = bf16_bits_to_float(hout[r * kHqHeadDim + w * 8 + j]);
                     const double err = std::fabs(got - expected);
                     if (err > 0.02 * std::fabs(expected) + 0.01 &&
@@ -444,7 +456,7 @@ int main() {
                     oracle_bad, tie_flips, row_bad, max_rel);
         std::printf("[5] rotated-frame decoder-vs-oracle SNR %.2f dB, original-frame cosine %.6f\n",
                     snr, cos);
-        std::printf("[2b] escalated rows: %d (band 50-200), %d oracle mismatches, %d bad rows\n",
+        std::printf("[2b] escalated rows: %d (band 150-600), %d oracle mismatches, %d bad rows\n",
                     esc_count, esc_oracle_bad, esc_row_bad);
         check(oracle_bad == 0,
               "decoded rows deviate from the FP64 oracle beyond tie flips");
@@ -456,7 +468,11 @@ int main() {
         check(cos > 0.93,
               "original-frame cosine fell below 0.93 (nominal ~0.938 at alpha 1.45): 2 "
               "bits/dim reconstruction quality changed");
-        check(esc_count >= 50 && esc_count <= 200,
+        // Subtractive dither shifts the bit demand up slightly (one extra
+        // unary bit on a minority of symbols), so the rescued fraction rises
+        // from ~0.4% (un-dithered) to ~1.5% on this corpus; the band keeps its
+        // tripwire role around the dithered rate.
+        check(esc_count >= 150 && esc_count <= 600,
               "escalation count left its corpus band (rescue behavior changed)");
         check(esc_oracle_bad == 0 && esc_row_bad == 0,
               "escalated rows deviate from the FP64 oracle");

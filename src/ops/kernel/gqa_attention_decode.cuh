@@ -48,6 +48,11 @@ struct GqaTcKVHq {
     std::uint8_t* codes_v;
     std::uint8_t* meta_k;
     std::uint8_t* meta_v;
+    // Residual window (optional): exact rotated-frame bf16 side planes and the
+    // per-slot ring validity words; null = feature off (codec rows everywhere).
+    __nv_bfloat16* residual_k = nullptr;
+    __nv_bfloat16* residual_v = nullptr;
+    std::uint32_t* ring_valid = nullptr;
 };
 
 template <typename Geometry>

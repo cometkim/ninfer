@@ -492,6 +492,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : 0U;
     request.lifecycle = Lifecycle::Empty;
     sequence.retained = false;
+    // Residual-ring revalidation needs the retained bundle's key counts before the
+    // reuse branches reset them; a full reset passes retained 0 (every bit clears).
+    const std::uint32_t retained_text_valid    = sequence.text_kv_valid;
+    const std::uint32_t retained_backend_valid = backend_kv_valid(sequence);
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
@@ -558,6 +562,20 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
 
         trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
         bind_sequence_kv(sequence);
+        if (decoder->text_kv.residual_enabled()) {
+            // After any backward trim, a ring slot is exact only if its last written key
+            // survived inside the new recent window (slot rows written by trimmed-away
+            // keys hold rows the sequence will re-append later, not the older key the
+            // next fetch would name).
+            decoder->text_kv.revalidate_residual_ring(sequence.kv->text.bound_row(),
+                                                      retained_text_valid, base, device.stream);
+            if (qwen3_6::PagedKVCache* backend = backend_kv_cache();
+                backend != nullptr && backend->residual_enabled() && sequence.kv->backend) {
+                backend->revalidate_residual_ring(sequence.kv->backend->bound_row(),
+                                                  retained_backend_valid,
+                                                  backend_kv_valid(sequence), device.stream);
+            }
+        }
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
@@ -816,6 +834,21 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
             sequence.tail_hidden_valid  = true;
+            if (committed < pending.produced && decoder->text_kv.residual_enabled()) {
+                // Rejected drafts wrote ring slots that older still-recent keys may name;
+                // those keys' exact rows were clobbered, so the slots fall back to the
+                // codec planes until their positions are re-appended.
+                decoder->text_kv.invalidate_residual_ring(
+                    sequence.kv->text.bound_row(), sequence.text_kv_valid,
+                    pending.base_E + pending.produced, device.stream);
+                if (qwen3_6::PagedKVCache* backend = backend_kv_cache();
+                    backend != nullptr && backend->residual_enabled() && sequence.kv->backend) {
+                    backend->invalidate_residual_ring(sequence.kv->backend->bound_row(),
+                                                      sequence.text_kv_valid,
+                                                      pending.base_E + pending.produced,
+                                                      device.stream);
+                }
+            }
 
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;

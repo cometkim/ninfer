@@ -16,6 +16,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "hq_dither_host.h"
 #include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/kernel/gqa_attention_prefill_bf16.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
@@ -60,9 +61,11 @@ double host_engine_sign(int d) {
     return (x & 1u) ? 1.0 : -1.0;
 }
 
-// Exact host Rice/unstrip decode of one row -> FP64 rotated-frame values.
-void host_decode_row(const std::uint8_t* codes, const std::uint8_t* meta,
-                     std::vector<double>& out) {
+// Exact host Rice/unstrip decode of one row -> FP64 rotated-frame values
+// (dither included, mirroring the encode-side seeds).
+void host_decode_row(const std::uint8_t* codes, const std::uint8_t* meta, int head, int pos,
+                     bool role_v, std::vector<double>& out) {
+    const std::uint64_t row_seed = hqhost::dither_row_seed(head, pos, role_v);
     const unsigned norm_bits =
         static_cast<unsigned>(meta[0]) | (static_cast<unsigned>(meta[1]) << 8);
     __half h;
@@ -100,6 +103,7 @@ void host_decode_row(const std::uint8_t* codes, const std::uint8_t* meta,
             z[j] = (q >= kHqUnaryGuard) ? 0u : ((q << k) | r);
         }
         // Mirror of hq_unstrip_word.
+        const std::uint64_t wseed = hqhost::dither_word_seed(row_seed, w);
         int s[8];
         int p = 0;
         for (int i = 0; i < 7; ++i) {
@@ -112,13 +116,15 @@ void host_decode_row(const std::uint8_t* codes, const std::uint8_t* meta,
         s[7]         = ((t2 << 1) + (p & 1));
         for (int j = 0; j < 8; ++j) {
             const int y = (s[j] << 1) + c;
-            out[w * 8 + j] = static_cast<double>(y) * norm * inv_scale;
+            out[w * 8 + j] =
+                (static_cast<double>(y) + hqhost::dither(wseed, j)) * norm * inv_scale;
         }
     }
 }
 
 template <typename Metadata>
-int run_scenario(int base, int width, int span, bool shuffle, unsigned seed) {
+int run_scenario(int base, int width, int span, bool shuffle, unsigned seed,
+                 bool residual = false) {
     const int keys    = base + width;
     const int logical = (keys + kPagedKVPageSize - 1) / kPagedKVPageSize;
     const int phys    = logical + 5;
@@ -145,6 +151,19 @@ int run_scenario(int base, int width, int span, bool shuffle, unsigned seed) {
     __nv_bfloat16 *d_q, *d_out, *d_k, *d_v, *d_sk, *d_sv;
     std::uint8_t *d_ck, *d_cv, *d_mk, *d_mv;
     std::int32_t *d_pos_a, *d_pos_b, *d_tables, *d_row;
+    __nv_bfloat16 *d_rk = nullptr, *d_rv = nullptr;
+    std::uint32_t* d_ring = nullptr;
+    const std::size_t side_plane =
+        static_cast<std::size_t>(kGqaHqSinkKeys + kGqaHqRecentKeys) * Geo::KVHeads * kHqHeadDim;
+    if (residual) {
+        cudaMalloc(&d_rk, side_plane * 2);
+        cudaMalloc(&d_rv, side_plane * 2);
+        const int ring_words = static_cast<int>(kGqaHqRecentKeys) / 32;
+        cudaMalloc(&d_ring, static_cast<std::size_t>(ring_words) * 4);
+        cudaMemset(d_rk, 0xCD, side_plane * 2);
+        cudaMemset(d_rv, 0xCD, side_plane * 2);
+        cudaMemset(d_ring, 0xFF, static_cast<std::size_t>(ring_words) * 4);
+    }
     cudaMalloc(&d_q, hq.size() * 2);
     cudaMalloc(&d_out, hq.size() * 2);
     cudaMalloc(&d_k, hk.size() * 2);
@@ -188,7 +207,7 @@ int run_scenario(int base, int width, int span, bool shuffle, unsigned seed) {
         const std::int64_t units = static_cast<std::int64_t>(tokens) * Geo::KVHeads * 2;
         gqa_attention_prefill_fill_hq_kernel<Geo, Metadata>
             <<<(units + kWPB - 1) / kWPB, kWPB * 32, kGqaHqFillSmemBytes>>>(
-                k, v, pos, metadata, d_ck, d_cv, d_mk, d_mv, tokens);
+                k, v, pos, metadata, d_ck, d_cv, d_mk, d_mv, tokens, d_rk, d_rv, d_ring);
     };
     // Two engine-shaped chunks: history (if any) then current.
     if (base > 0) { launch_fill(d_k, d_v, d_pos_a, base); }
@@ -220,16 +239,30 @@ int run_scenario(int base, int width, int span, bool shuffle, unsigned seed) {
         check(attr_carry == cudaSuccess, "carry FA2 smem opt-in rejected");
     }
     const dim3 grid((width + kGqaPrefillBr - 1) / kGqaPrefillBr, Geo::QHeads, 1);
+    const bool has_fresh = residual;
     for (int band = 0; band < bands; ++band) {
         const std::int32_t key_begin = band * span;
         const std::int32_t band_rows = std::min(span, keys_total - key_begin);
+        if (has_fresh) {
+            // REVIEW §8 D2: the current chunk's rows are staged exact from the
+            // call's bf16 k/v (the A1 prompt route's fresh tensors).
+            const std::int64_t fresh_units =
+                static_cast<std::int64_t>(width) * Geo::KVHeads * 2;
+            gqa_attention_prefill_fresh_rotate_kernel<Geo, Metadata>
+                <<<static_cast<int>((fresh_units + kGqaHqFillWarps - 1) / kGqaHqFillWarps),
+                   kGqaHqFillWarps * 32, kHqHeadDim>>>(
+                    d_k + static_cast<std::int64_t>(base) * Geo::KVHeads * kHqHeadDim,
+                    d_v + static_cast<std::int64_t>(base) * Geo::KVHeads * kHqHeadDim, d_pos_b,
+                    metadata, width, span, d_sk, d_sv, key_begin, band_rows);
+        }
         const int band_grid          = static_cast<int>(
             (static_cast<std::int64_t>(band_rows) * Geo::KVHeads * 2 * 8 +
              kGqaHqScratchThreads - 1) /
             kGqaHqScratchThreads);
         gqa_attention_prefill_hq_scratch_kernel<Geo, Metadata>
             <<<band_grid, kGqaHqScratchThreads>>>(d_ck, d_cv, d_mk, d_mv, metadata, d_pos_b, width,
-                                                  span, d_sk, d_sv, key_begin, band_rows);
+                                                  span, d_sk, d_sv, key_begin, band_rows, d_rk,
+                                                  d_rv, d_ring, has_fresh);
         if (bands == 1) {
             gqa_attention_prefill_bf16_kernel<Geo, Metadata, true>
                 <<<grid, kGqaPrefillThreads, kGqaPrefillRotatedSmemBytes>>>(
@@ -270,10 +303,63 @@ int run_scenario(int base, int width, int span, bool shuffle, unsigned seed) {
             const int slot = p & kPagedKVPageMask;
             kr[h * keys + p].resize(kHqHeadDim);
             host_decode_row(row_ptr(hck, kHqCodePlaneExtent, page, h, slot),
-                            row_ptr(hmk, kHqMetaPlaneExtent, page, h, slot), kr[h * keys + p]);
+                            row_ptr(hmk, kHqMetaPlaneExtent, page, h, slot), h, p, false,
+                            kr[h * keys + p]);
             vr[h * keys + p].resize(kHqHeadDim);
             host_decode_row(row_ptr(hcv, kHqCodePlaneExtent, page, h, slot),
-                            row_ptr(hmv, kHqMetaPlaneExtent, page, h, slot), vr[h * keys + p]);
+                            row_ptr(hmv, kHqMetaPlaneExtent, page, h, slot), h, p, true,
+                            vr[h * keys + p]);
+        }
+    }
+    if (residual) {
+        // Exact sources under D2: sink rows and the pre-chunk ring come from the
+        // side planes (dual-written by the earlier chunk's fill); the fresh chunk
+        // [base, keys) comes from the call's bf16 k/v rotated in fp64 (the device
+        // rotate kernel stages fp32 — the row gates below absorb the difference).
+        std::vector<__nv_bfloat16> hrk(side_plane), hrv(side_plane);
+        cudaMemcpy(hrk.data(), d_rk, side_plane * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hrv.data(), d_rv, side_plane * 2, cudaMemcpyDeviceToHost);
+        const int sink = static_cast<int>(kGqaHqSinkKeys);
+        const int ring = static_cast<int>(kGqaHqRecentKeys);
+        for (int h = 0; h < Geo::KVHeads; ++h) {
+            for (int p = 0; p < keys; ++p) {
+                const bool plane_row = p < sink || (p >= base - ring && p < base);
+                const bool fresh_row = p >= base;
+                if (!plane_row && !fresh_row) { continue; }
+                if (fresh_row) {
+                    std::vector<double> rot(kHqHeadDim);
+                    for (int d = 0; d < kHqHeadDim; ++d) {
+                        rot[d] = __bfloat162float(
+                            hk[(static_cast<std::size_t>(p) * Geo::KVHeads + h) * kHqHeadDim + d]) *
+                                 host_engine_sign(d);
+                    }
+                    host_fwht(rot.data(), kHqHeadDim);
+                    for (int d = 0; d < kHqHeadDim; ++d) {
+                        kr[h * keys + p][d] = rot[d] / 16.0;
+                    }
+                    // V is rotated too (planes store both roles rotated).
+                    std::vector<double> rotv(kHqHeadDim);
+                    for (int d = 0; d < kHqHeadDim; ++d) {
+                        rotv[d] =
+                            __bfloat162float(
+                                hv[(static_cast<std::size_t>(p) * Geo::KVHeads + h) * kHqHeadDim +
+                                    d]) *
+                            host_engine_sign(d);
+                    }
+                    host_fwht(rotv.data(), kHqHeadDim);
+                    for (int d = 0; d < kHqHeadDim; ++d) {
+                        vr[h * keys + p][d] = rotv[d] / 16.0;
+                    }
+                } else {
+                    const int row = p < sink ? p : sink + (p & (ring - 1));
+                    const std::size_t off =
+                        (static_cast<std::size_t>(row) * Geo::KVHeads + h) * kHqHeadDim;
+                    for (int d = 0; d < kHqHeadDim; ++d) {
+                        kr[h * keys + p][d] = __bfloat162float(hrk[off + d]);
+                        vr[h * keys + p][d] = __bfloat162float(hrv[off + d]);
+                    }
+                }
+            }
         }
     }
 
@@ -353,6 +439,9 @@ int run_scenario(int base, int width, int span, bool shuffle, unsigned seed) {
     cudaFree(d_pos_b);
     cudaFree(d_tables);
     cudaFree(d_row);
+    if (d_rk) { cudaFree(d_rk); }
+    if (d_rv) { cudaFree(d_rv); }
+    if (d_ring) { cudaFree(d_ring); }
     return g_failed;
 }
 
@@ -375,6 +464,10 @@ int main() {
     // crossing the first band boundary at tile 4096. Narrow width keeps the CPU oracle
     // affordable while exercising every large-index path.
     failed += run_scenario<GqaPrefillDirectMetadata>(390000, 8, 262144, false, 34u);
+    // Residual window (WI-8): sink [0,32) + recent [keys-128, keys) rows exact from
+    // the side planes, middle rows codec — single-band and banded variants.
+    failed += run_scenario<GqaPrefillDirectMetadata>(100, 300, 1024, false, 71u, true);
+    failed += run_scenario<GqaPrefillBatchMetadata<false>>(0, 300, 192, true, 72u, true);
     if (failed != 0) {
         std::fprintf(stderr, "test_hq_prefill: %d failures\n", failed);
         return EXIT_FAILURE;

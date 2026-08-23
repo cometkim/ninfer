@@ -4,13 +4,13 @@
 
 namespace ninfer::ops::detail {
 
-#define NINFER_GQA_PREFILL_HQ27_INSTANTIATE(CACHE_VIEW, METADATA)                                  \
-    template void gqa_prefill_attention_hq<Gqa27Geometry, CACHE_VIEW, METADATA>(                   \
-        const Tensor&, const Tensor&, float, const CACHE_VIEW&, METADATA, const Tensor&,           \
-        const Tensor&, const Tensor&, const Tensor&, const Tensor&, std::uint32_t, Tensor&,        \
-        cudaStream_t);                                                                              \
-    template void gqa_prefill_append_hq<Gqa27Geometry, CACHE_VIEW, METADATA>(                      \
-        const Tensor&, const Tensor&, const Tensor&, CACHE_VIEW, METADATA, cudaStream_t);
+#define NINFER_GQA_PREFILL_HQ27_INSTANTIATE(CACHE_VIEW, METADATA) \
+    template void gqa_prefill_attention_hq<Gqa27Geometry, CACHE_VIEW, METADATA>( \
+        const Tensor&, const Tensor&, float, const CACHE_VIEW&, METADATA, const Tensor&, \
+        const Tensor&, const Tensor&, const Tensor&, const Tensor&, const Tensor&, \
+        const Tensor&, std::uint32_t, Tensor&, cudaStream_t); \
+    template void gqa_prefill_append_hq<Gqa27Geometry, CACHE_VIEW, METADATA>( \
+        const Tensor&, const Tensor&, const Tensor&, CACHE_VIEW, METADATA, cudaStream_t); \
 
 NINFER_GQA_PREFILL_HQ27_INSTANTIATE(PagedKVLayerView, GqaPrefillDirectMetadata)
 NINFER_GQA_PREFILL_HQ27_INSTANTIATE(PagedKVBatchLayerView, GqaPrefillBatchMetadata<false>)

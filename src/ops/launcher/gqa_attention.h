@@ -67,7 +67,8 @@ void gqa_prefill_attention_i8(const Tensor& q, const Tensor& positions, float sc
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float scale,
-                              const CacheView& cache, Metadata metadata, const Tensor& scratch_k,
+                              const CacheView& cache, Metadata metadata, const Tensor& new_k,
+                              const Tensor& new_v, const Tensor& scratch_k,
                               const Tensor& scratch_v, const Tensor& carry_acc,
                               const Tensor& carry_m, const Tensor& carry_l,
                               std::uint32_t visible_keys, Tensor& out, cudaStream_t stream);

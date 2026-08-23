@@ -20,6 +20,7 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 # codec header directly (no engine link) so codec iterations do not pay the
 # full engine build cycle.
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../src)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../include)
 
 add_executable(test_hq_codec test_hq_codec.cu)
 add_executable(verify_hq_retrieval verify_hq_retrieval.cu)

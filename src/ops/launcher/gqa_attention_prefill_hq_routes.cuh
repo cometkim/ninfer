@@ -19,7 +19,8 @@ namespace ninfer::ops::detail {
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float scale,
-                              const CacheView& cache, Metadata metadata, const Tensor& scratch_k,
+                              const CacheView& cache, Metadata metadata, const Tensor& new_k,
+                              const Tensor& new_v, const Tensor& scratch_k,
                               const Tensor& scratch_v, const Tensor& carry_acc,
                               const Tensor& carry_m, const Tensor& carry_l,
                               std::uint32_t visible_keys, Tensor& out, cudaStream_t stream) {
@@ -55,9 +56,29 @@ void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float sc
         // rows below the band. The production band (262144) is tile-aligned.
         throw std::invalid_argument("gqa_attention prompt: scratch band is not tile-aligned");
     }
+    // Fresh-chunk exactness (REVIEW §8 D2): with the residual window on, the A1
+    // route also rotates the current chunk's bf16 k/v rows straight into each
+    // scratch band; the scratch kernel then reads its in-chunk recent window
+    // from those exact rows and the ring bound moves to the W keys before the
+    // chunk. Cached-input routes pass empty tensors and keep tail coverage.
+    const bool has_fresh =
+        cache.residual_k.data != nullptr && new_k.data != nullptr && new_v.data != nullptr;
     for (int band = 0; band < bands; ++band) {
         const std::int32_t key_begin = band * span;
         const std::int32_t band_rows = min(span, visible - key_begin);
+        if (has_fresh) {
+            const auto fresh_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads * 2;
+            const int rotate_grid = static_cast<int>(
+                div_up(fresh_units, static_cast<std::int64_t>(kGqaHqFillWarps)));
+            gqa_attention_prefill_fresh_rotate_kernel<Geometry, Metadata>
+                <<<rotate_grid, kGqaHqFillWarps * 32, kHqHeadDim, stream>>>(
+                    static_cast<const __nv_bfloat16*>(new_k.data),
+                    static_cast<const __nv_bfloat16*>(new_v.data),
+                    static_cast<const std::int32_t*>(positions.data), metadata, tokens, span,
+                    static_cast<__nv_bfloat16*>(scratch_k.data),
+                    static_cast<__nv_bfloat16*>(scratch_v.data), key_begin, band_rows);
+            CUDA_CHECK(cudaGetLastError());
+        }
         const auto units_bound = static_cast<std::int64_t>(band_rows) * Geometry::KVHeads * 2 * 8;
         const int scratch_grid = static_cast<int>(
             div_up(units_bound, static_cast<std::int64_t>(kGqaHqScratchThreads)));
@@ -69,7 +90,10 @@ void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float sc
                 static_cast<const std::uint8_t*>(cache.v_scale_pages.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), tokens, span,
                 static_cast<__nv_bfloat16*>(scratch_k.data),
-                static_cast<__nv_bfloat16*>(scratch_v.data), key_begin, band_rows);
+                static_cast<__nv_bfloat16*>(scratch_v.data), key_begin, band_rows,
+                static_cast<const __nv_bfloat16*>(cache.residual_k.data),
+                static_cast<const __nv_bfloat16*>(cache.residual_v.data),
+                static_cast<const std::uint32_t*>(cache.ring_valid.data), has_fresh);
         CUDA_CHECK(cudaGetLastError());
         if (bands == 1) {
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true>
@@ -115,7 +139,10 @@ void gqa_prefill_append_hq(const Tensor& k, const Tensor& v, const Tensor& posit
             static_cast<const std::int32_t*>(positions.data), metadata,
             static_cast<std::uint8_t*>(cache_k.data), static_cast<std::uint8_t*>(cache_v.data),
             static_cast<std::uint8_t*>(cache_k_meta.data),
-            static_cast<std::uint8_t*>(cache_v_meta.data), tokens);
+            static_cast<std::uint8_t*>(cache_v_meta.data), tokens,
+            static_cast<__nv_bfloat16*>(cache.residual_k.data),
+            static_cast<__nv_bfloat16*>(cache.residual_v.data),
+            static_cast<std::uint32_t*>(cache.ring_valid.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

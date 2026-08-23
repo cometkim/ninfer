@@ -17,6 +17,16 @@
 //      memory; outputs must be bit-identical
 //   G. fused append: last `width` positions supplied through GqaAppendInput
 //      instead of a pre-filled cache; outputs must match the same oracle
+// Residual-window scenarios (WI-8): exact bf16 side rows for sink + recent
+// positions, produced by the same dual-write helpers the engine uses.
+//   K. window 200 > sink+recent: sink [0,32) and ring [72,200) read exact,
+//      middle [32,72) codec; every fetch path exercised
+//   L. append width 3 at window 100 (< sink+recent): fused append dual-writes
+//      the new rows into the ring
+//   M. one recent key's ring bit cleared: that key falls back to the codec
+//      row while its neighbors stay exact
+//   N. batch=2 residual with swapped table rows: each batch reads its own
+//      slot's side planes
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
@@ -129,7 +139,8 @@ __global__ void decode_cache_rows(const std::uint8_t* codes_k, const std::uint8_
         out + (static_cast<std::int64_t>(b) * window * kKVHeads * 2 + rem) * kDim;
     hq_decode_row_thread(
         hq_row_codes<Gqa27Geometry>(role_v ? codes_v : codes_k, table, head, pos),
-        hq_row_meta<Gqa27Geometry>(role_v ? meta_v : meta_k, table, head, pos), dst);
+        hq_row_meta<Gqa27Geometry>(role_v ? meta_v : meta_k, table, head, pos), dst,
+        hq_dither_row_seed(head, pos, role_v));
 }
 
 // Fill dynamic shared memory with a garbage pattern (0xFF bytes = NaN
@@ -155,7 +166,43 @@ struct Scenario {
     int capacity;      // -1: window; else the logical capacity passed to the
                        // kernel (smaller than window exercises the
                        // out-of-range neutral guard)
+    bool residual;     // populate + consume the exact bf16 side planes
+    int ring_clear;    // -1: all ring slots valid; else clear this key's bit
 };
+
+// Dual-write the exact (rotated) bf16 rows a residual scenario needs: one warp
+// per (batch, position, kv_head, role), source = that batch's cache content,
+// destination = the side-plane row of the table row the kernel will select.
+__global__ void fill_residual_rows(const __nv_bfloat16* cache, std::int64_t cache_rows,
+                                   const std::int32_t* table_rows, std::int32_t batch_count,
+                                   std::int32_t fill_window, std::int32_t window_hint,
+                                   __nv_bfloat16* residual_k, __nv_bfloat16* residual_v) {
+    extern __shared__ std::int8_t signs_raw[];
+    hq_engine_signs_fill(reinterpret_cast<std::int8_t*>(signs_raw));
+    __syncthreads();
+    const int warp = static_cast<int>(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
+    const std::int64_t units =
+        static_cast<std::int64_t>(fill_window) * kKVHeads * 2 * batch_count;
+    if (warp >= units) { return; }
+    const std::int64_t per_batch = static_cast<std::int64_t>(fill_window) * kKVHeads * 2;
+    const int b    = static_cast<int>(warp / per_batch);
+    const int rem  = static_cast<int>(warp - static_cast<std::int64_t>(b) * per_batch);
+    const int pos  = rem / (kKVHeads * 2);
+    const int r2   = rem - pos * kKVHeads * 2;
+    const int head = r2 >> 1;
+    const bool role_v = (r2 & 1) != 0;
+    // Only the rows the fetch consumes (sink + current recent window); filling
+    // mid-window rows would race the ring slots of later side rows.
+    const int recent_from = window_hint - static_cast<int>(kGqaHqRecentKeys);
+    if (pos >= static_cast<int>(kGqaHqSinkKeys) && pos < recent_from) { return; }
+    const std::int32_t slot = table_rows[b];
+    const __nv_bfloat16* src =
+        cache + (static_cast<std::int64_t>(b) * cache_rows + static_cast<std::int64_t>(pos) * kKVHeads +
+                 head) * kDim;
+    hq_store_rotated_row_warp(
+        src, reinterpret_cast<std::int8_t*>(signs_raw),
+        hq_residual_row<Gqa27Geometry>(role_v ? residual_v : residual_k, slot, head, pos));
+}
 
 }  // namespace
 
@@ -165,27 +212,35 @@ int main() {
     std::printf("device: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
 
     const std::vector<Scenario> scenarios = {
-        {"A tokens=1 b=1",      1, 1,  1, 0, 200,  -1, false, false, -1},
-        {"B tokens=3 b=1",      1, 3,  3, 0, 200,  -1, false, false, -1},
-        {"C tokens=1 b=2",      2, 1,  1, 0, 150,  -1, false, false, -1},
-        {"D chunk col_begin=6", 1, 12, 6, 6, 120,  -1, false, false, -1},
-        {"E partial valid",     1, 3,  3, 0, 100,  2,  false, false, -1},
-        {"F smem trash",        1, 1,  1, 0, 200,  -1, false, true,  -1},
-        {"G append width=3",    1, 3,  3, 0, 100,  -1, true,  false, -1},
+        {"A tokens=1 b=1",      1, 1,  1, 0, 200,  -1, false, false, -1, false, -1},
+        {"B tokens=3 b=1",      1, 3,  3, 0, 200,  -1, false, false, -1, false, -1},
+        {"C tokens=1 b=2",      2, 1,  1, 0, 150,  -1, false, false, -1, false, -1},
+        {"D chunk col_begin=6", 1, 12, 6, 6, 120,  -1, false, false, -1, false, -1},
+        {"E partial valid",     1, 3,  3, 0, 100,  2,  false, false, -1, false, -1},
+        {"F smem trash",        1, 1,  1, 0, 200,  -1, false, true,  -1, false, -1},
+        {"G append width=3",    1, 3,  3, 0, 100,  -1, true,  false, -1, false, -1},
         // A window large enough that every split runs many chunks, exercising
         // the online-softmax rescale chain across chunk boundaries.
-        {"H window=2560",       1, 1,  1, 0, 2560, -1, false, false, -1},
+        {"H window=2560",       1, 1,  1, 0, 2560, -1, false, false, -1, false, -1},
         // Full MTP-verify tile (width 6 -> 12 append units over 8 warps, two
         // rounds with per-warp scratch reuse) across two batches with
         // disjoint tables, so the append's offsets run together with batch.
-        {"G2 append w6 b2",     2, 6,  6, 0, 150,  -1, true,  false, -1},
+        {"G2 append w6 b2",     2, 6,  6, 0, 150,  -1, true,  false, -1, false, -1},
         // logical_capacity below the last position: every split must write
         // neutral partials instead of indexing the block table out of range.
-        {"I oob guard",         1, 1,  1, 0, 200,  -1, false, false, 199},
+        {"I oob guard",         1, 1,  1, 0, 200,  -1, false, false, 199, false, -1},
         // Beyond the former 262144-key envelope (4,098 pages > 4,096; 16,388
         // keys per split at the test's 16 splits): pins the U8-only absolute
         // ceiling and page-table indices past the old linear boundary.
-        {"J window=262208",     1, 1,  1, 0, 262208, -1, false, false, -1},
+        {"J window=262208",     1, 1,  1, 0, 262208, -1, false, false, -1, false, -1},
+        // Residual window (WI-8): sink + recent rows exact, middle codec.
+        {"K residual w200",     1, 1,  1, 0, 200,  -1, false, false, -1, true,  -1},
+        // Fused append dual-writes the three new rows into the ring.
+        {"L residual append",   1, 3,  3, 0, 100,  -1, true,  false, -1, true,  -1},
+        // One recent key's ring bit cleared: codec fallback for that key only.
+        {"M residual bit=90",   1, 1,  1, 0, 200,  -1, false, false, -1, true,  90},
+        // Two slots with swapped table rows: each batch reads its own plane.
+        {"N residual b=2",      2, 1,  1, 0, 150,  -1, false, false, -1, true,  -1},
     };
 
     for (const auto& sc : scenarios) {
@@ -310,6 +365,41 @@ int main() {
         }
         cudaDeviceSynchronize();
 
+        // Residual side planes: [slots][160][KVHeads][256] per role, plus four
+        // validity words per slot. Pre-fill every position the codec fill wrote
+        // (append scenarios leave the tail to the decode kernel's dual-write).
+        __nv_bfloat16 *d_rk = nullptr, *d_rv = nullptr;
+        std::uint32_t* d_ring = nullptr;
+        const int slots       = sc.batch;
+        const std::int64_t side_plane =
+            static_cast<std::int64_t>(kGqaHqSinkKeys + kGqaHqRecentKeys) * kKVHeads * kDim * slots;
+        if (sc.residual) {
+            cudaMalloc(&d_rk, side_plane * 2);
+            cudaMalloc(&d_rv, side_plane * 2);
+            const int ring_words = static_cast<int>(kGqaHqRecentKeys) / 32;
+            cudaMalloc(&d_ring, static_cast<std::size_t>(slots) * ring_words * 4);
+            cudaMemset(d_rk, 0xCD, side_plane * 2);
+            cudaMemset(d_rv, 0xCD, side_plane * 2);
+            cudaMemset(d_ring, 0xFF, static_cast<std::size_t>(slots) * ring_words * 4);
+            if (sc.ring_clear >= 0) {
+                std::vector<std::uint32_t> words(ring_words, 0xFFFFFFFFu);
+                const int r = sc.ring_clear & (static_cast<int>(kGqaHqRecentKeys) - 1);
+                words[r >> 5] &= ~(1u << (r & 31));
+                cudaMemcpy(d_ring, words.data(),
+                           static_cast<std::size_t>(ring_words) * 4, cudaMemcpyHostToDevice);
+            }
+            const int fill_window = sc.append ? (sc.window - sc.width) : sc.window;
+            const std::int64_t units =
+                static_cast<std::int64_t>(fill_window) * kKVHeads * 2 * sc.batch;
+            fill_residual_rows<<<static_cast<int>((units + 7) / 8), 8 * 32, kDim>>>(
+                d_cache, cache_n / kDim, d_trows, sc.batch, fill_window, sc.window, d_rk, d_rv);
+            cudaDeviceSynchronize();
+            {
+                cudaError_t e = cudaGetLastError();
+                check(e == cudaSuccess, "residual fill kernel failed");
+            }
+        }
+
         // ---- run the decode kernel ----------------------------------------
         const std::int64_t pacc_n = static_cast<std::int64_t>(sc.batch) * kQHeads * kDim *
                                     sc.width * kSplits;
@@ -321,7 +411,7 @@ int main() {
         cudaMalloc(&d_pm, pstat_n * 4);
         cudaMalloc(&d_pl, pstat_n * 4);
         const dim3 grid(kKVHeads, kSplits, sc.batch);
-        const GqaTcKVHq hq_cache{d_ck, d_cv, d_mk, d_mv};
+        const GqaTcKVHq hq_cache{d_ck, d_cv, d_mk, d_mv, d_rk, d_rv, d_ring};
         const auto launch = [&]() {
             if (sc.append) {
                 GqaAppendInput input{d_knew, d_vnew};
@@ -386,6 +476,100 @@ int main() {
             cudaDeviceSynchronize();
             std::vector<std::uint16_t> hdec(dec_n);
             cudaMemcpy(hdec.data(), d_dec, dec_n * 2, cudaMemcpyDeviceToHost);
+
+            if (sc.residual) {
+                // Substitute the exact side-plane rows (the bits the kernel's
+                // fetch reads) for the decoded rows at sink/recent positions.
+                std::vector<std::uint16_t> hrk(side_plane), hrv(side_plane);
+                cudaMemcpy(hrk.data(), d_rk, side_plane * 2, cudaMemcpyDeviceToHost);
+                cudaMemcpy(hrv.data(), d_rv, side_plane * 2, cudaMemcpyDeviceToHost);
+                const int ring_words = static_cast<int>(kGqaHqRecentKeys) / 32;
+                std::vector<std::uint32_t> hring(
+                    static_cast<std::size_t>(slots) * ring_words);
+                cudaMemcpy(hring.data(), d_ring,
+                           static_cast<std::size_t>(slots) * ring_words * 4,
+                           cudaMemcpyDeviceToHost);
+                const int sink = static_cast<int>(kGqaHqSinkKeys);
+                const int ring = static_cast<int>(kGqaHqRecentKeys);
+                for (int b = 0; b < sc.batch; ++b) {
+                    const int slot = table_rows[b];
+                    for (int p = 0; p < sc.window; ++p) {
+                        const bool recent = p >= sc.window - ring;
+                        const bool bit =
+                            recent && ((hring[static_cast<std::size_t>(slot) * ring_words +
+                                               ((p & (ring - 1)) >> 5)] >>
+                                        ((p & (ring - 1)) & 31)) &
+                                       1u) != 0;
+                        if (p >= sink && !bit) { continue; }
+                        const int row = p < sink ? p : sink + (p & (ring - 1));
+                        for (int h = 0; h < kKVHeads; ++h) {
+                            for (int role = 0; role < 2; ++role) {
+                                const std::size_t src_off =
+                                    (static_cast<std::size_t>(slot) * (sink + ring) * kKVHeads +
+                                     static_cast<std::size_t>(row) * kKVHeads + h) * kDim;
+                                const std::uint16_t* srcp = role ? &hrv[src_off] : &hrk[src_off];
+                                std::uint16_t* dst =
+                                    &hdec[((static_cast<std::size_t>(b) * sc.window + p) *
+                                               kKVHeads * 2 +
+                                           h * 2 + role) * kDim];
+                                std::memcpy(dst, srcp, kDim * 2);
+                            }
+                        }
+                    }
+                }
+                // Rotation spot check: a side row must equal the FWHT-rotated
+                // source row (fp64 oracle; the device stages in fp32, so one
+                // cosine gate with margin covers the rounding difference).
+                // Append tails are written from the append inputs, not the
+                // pre-fill cache content, so only pre-filled rows are compared.
+                std::vector<std::uint16_t> hcache(cache_n * sc.batch);
+                cudaMemcpy(hcache.data(), d_cache, cache_n * 2 * sc.batch,
+                           cudaMemcpyDeviceToHost);
+                const int fill_window = sc.append ? (sc.window - sc.width) : sc.window;
+                double min_side_cos = 1.0;
+                for (int b = 0; b < sc.batch; ++b) {
+                    const int slot = table_rows[b];
+                    for (int p = 0; p < fill_window; p += 7) {
+                        const int row = p < sink ? p : sink + (p & (ring - 1));
+                        if (p >= sink && !(p >= sc.window - ring)) { continue; }
+                        for (int h = 0; h < kKVHeads; ++h) {
+                            std::vector<double> rot(kDim);
+                            for (int d = 0; d < kDim; ++d) {
+                                rot[d] = bf16_bits_to_double(
+                                    hcache[(static_cast<std::size_t>(b) * cache_n +
+                                            (static_cast<std::size_t>(p) * kKVHeads + h) * kDim +
+                                            d)]);
+                            }
+                            host_rotate(rot.data());
+                            double xy = 0, xx = 0, yy = 0;
+                            for (int d = 0; d < kDim; ++d) {
+                                const double s = bf16_bits_to_double(
+                                    hrk[(static_cast<std::size_t>(slot) * (sink + ring) * kKVHeads +
+                                         static_cast<std::size_t>(row) * kKVHeads + h) * kDim + d]);
+                                xy += rot[d] * s;
+                                xx += rot[d] * rot[d];
+                                yy += s * s;
+                            }
+                            const double cos = xy / (std::sqrt(xx * yy) + 1e-300);
+                            if (cos < 0.9 && g_failed < 40) {
+                                std::printf("    [diag] slot=%d p=%d row=%d h=%d cos=%.4f "
+                                            "src0=%04x plane0=%04x\n",
+                                            slot, p, row, h, cos,
+                                            hcache[(static_cast<std::size_t>(b) * cache_n +
+                                                    (static_cast<std::size_t>(p) * kKVHeads + h) *
+                                                        kDim)],
+                                            hrk[(static_cast<std::size_t>(slot) * (sink + ring) *
+                                                     kKVHeads +
+                                                 static_cast<std::size_t>(row) * kKVHeads + h) *
+                                                    kDim]);
+                            }
+                            min_side_cos = std::min(min_side_cos, cos);
+                        }
+                    }
+                }
+                std::printf("[%s] side-row rotation min cos %.6f\n", sc.name, min_side_cos);
+                check(min_side_cos > 0.9999, "side rows do not match the rotated source rows");
+            }
 
             double min_cos = 1.0, max_rel = 0.0;
             int rows_checked = 0;
@@ -499,6 +683,9 @@ int main() {
         cudaFree(d_cache);
         cudaFree(d_table);
         cudaFree(d_trows);
+        if (d_rk) { cudaFree(d_rk); }
+        if (d_rv) { cudaFree(d_rv); }
+        if (d_ring) { cudaFree(d_ring); }
         cudaFree(d_pos0);
         cudaFree(d_pos);
         if (d_vc) { cudaFree(d_vc); }

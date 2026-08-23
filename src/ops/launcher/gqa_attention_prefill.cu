@@ -28,16 +28,17 @@ void gqa_prefill_append_route(const Tensor& k, const Tensor& v, const Tensor& po
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_route(const Tensor& q, const Tensor& positions, float scale,
-                                 const CacheView& cache, Metadata metadata,
-                                 const Tensor& scratch_k, const Tensor& scratch_v,
-                                 const Tensor& carry_acc, const Tensor& carry_m,
-                                 const Tensor& carry_l, std::uint32_t visible_keys, Tensor& out,
-                                 cudaStream_t stream) {
+                                 const CacheView& cache, Metadata metadata, const Tensor& new_k,
+                                 const Tensor& new_v, const Tensor& scratch_k,
+                                 const Tensor& scratch_v, const Tensor& carry_acc,
+                                 const Tensor& carry_m, const Tensor& carry_l,
+                                 std::uint32_t visible_keys, Tensor& out, cudaStream_t stream) {
     if (cache.dtype == DType::U8) {
         gqa_prefill_attention_hq<Geometry, CacheView, Metadata>(q, positions, scale, cache,
-                                                                metadata, scratch_k, scratch_v,
-                                                                carry_acc, carry_m, carry_l,
-                                                                visible_keys, out, stream);
+                                                                metadata, new_k, new_v, scratch_k,
+                                                                scratch_v, carry_acc, carry_m,
+                                                                carry_l, visible_keys, out,
+                                                                stream);
     } else if (cache.dtype == DType::I8) {
         gqa_prefill_attention_i8<Geometry, CacheView, Metadata>(q, positions, scale, cache,
                                                                 metadata, out, stream);
@@ -58,14 +59,14 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
     if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata, scratch_k,
-                                                   scratch_v, carry_acc, carry_m, carry_l,
-                                                   visible_keys, out, stream);
+        gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata, Tensor{},
+                                                   Tensor{}, scratch_k, scratch_v, carry_acc,
+                                                   carry_m, carry_l, visible_keys, out, stream);
         return;
     }
-    gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, scratch_k,
-                                               scratch_v, carry_acc, carry_m, carry_l,
-                                               visible_keys, out, stream);
+    gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, Tensor{},
+                                               Tensor{}, scratch_k, scratch_v, carry_acc,
+                                               carry_m, carry_l, visible_keys, out, stream);
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -96,15 +97,15 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
         };
         if (q.ne[1] == Gqa27Geometry::QHeads) {
             gqa_prefill_append_route<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
-            gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata,
+            gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata, k, v,
                                                        scratch_k, scratch_v, carry_acc, carry_m,
                                                        carry_l, visible_keys, out, stream);
             return;
         }
         gqa_prefill_append_route<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
-        gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, scratch_k,
-                                                   scratch_v, carry_acc, carry_m, carry_l,
-                                                   visible_keys, out, stream);
+        gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, k, v,
+                                                   scratch_k, scratch_v, carry_acc, carry_m,
+                                                   carry_l, visible_keys, out, stream);
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

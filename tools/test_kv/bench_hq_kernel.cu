@@ -43,7 +43,8 @@ __global__ void decode_rows_group_bench(const std::uint8_t* codes, const std::ui
     if (row >= n_rows) { return; }
     hq_decode_row_group(codes + static_cast<std::size_t>(row) * kHqRowBudgetBytes,
                         meta + static_cast<std::size_t>(row) * kHqMetaBytes,
-                        out + static_cast<std::size_t>(row) * kHqHeadDim, i & 7);
+                        out + static_cast<std::size_t>(row) * kHqHeadDim, i & 7, 0,
+                        hq_dither_row_seed(0, row, false));
 }
 
 // Partial-block barrier primitives for the warp-specialized variant:
@@ -314,7 +315,7 @@ __global__ void hq_decode_phase_bench_kernel(
                 hq_decode_row_group(
                     hq_row_codes<Geometry>(role_v ? codes_v : codes_k, block_table, kv_head, key),
                     hq_row_meta<Geometry>(role_v ? meta_v : meta_k, block_table, kv_head, key),
-                    row_dst, lane8, key_l & 7);
+                    row_dst, lane8, key_l & 7, hq_dither_row_seed(kv_head, key, role_v));
             } else {
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -609,7 +610,7 @@ __global__ void hq_decode_phase8_kernel(
                 hq_decode_row_group(
                     hq_row_codes<Geometry>(role_v ? codes_v : codes_k, block_table, kv_head, key),
                     hq_row_meta<Geometry>(role_v ? meta_v : meta_k, block_table, kv_head, key),
-                    row_dst, lane8, key_l & 7);
+                    row_dst, lane8, key_l & 7, hq_dither_row_seed(kv_head, key, role_v));
             } else {
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
@@ -806,7 +807,7 @@ __global__ void hq_decode_phase_ws_kernel(
                                               key),
                         hq_row_meta<Geometry>(role_v ? meta_v : meta_k, block_table, kv_head,
                                              key),
-                        row_dst, lane8, key_l & 7);
+                        row_dst, lane8, key_l & 7, hq_dither_row_seed(kv_head, key, role_v));
                 } else {
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {

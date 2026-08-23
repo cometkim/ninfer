@@ -178,6 +178,18 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         __syncthreads();
     }
 
+    // Per-(batch) residual-window state: the side planes and ring-validity words
+    // are slot-row indexed (layer views arrive pre-sliced; batch views offset by
+    // the table row the kernel already selected).
+    constexpr int kRingWords = static_cast<int>(kGqaHqRecentKeys) / 32;
+    const std::uint32_t* ring_valid_row = nullptr;
+    if constexpr (KvSource::hq) {
+        if (kv.ring_valid != nullptr) {
+            ring_valid_row =
+                kv.ring_valid + static_cast<std::int64_t>(table_row) * kRingWords;
+        }
+    }
+
     if constexpr (CacheInput::writes_cache) {
         // The owning split writes each new row. Current attention reads those rows directly from
         // input below, so no split depends on another split's cache write.
@@ -188,6 +200,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             // reader of those rows). (token, role) units are flattened over the warps
             // — one encode per unit, no duplicate work — and the per-warp encoder
             // scratch aliases the qkv tile, which is unused until q staging below.
+            // With the residual window on, the same rows are dual-written exactly
+            // (rotated bf16) into the side planes: the codec planes stay complete so
+            // any side row can fall back to the codec path.
             static_assert(WarpsPerCta * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow) *
                                   sizeof(float) <=
                               QkvRows * D * sizeof(__nv_bfloat16),
@@ -208,7 +223,15 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                                    hq_row_codes_mut<Geometry>(role_v ? kv.codes_v : kv.codes_k,
                                                               block_table, kv_head, p),
                                    hq_row_meta_mut<Geometry>(role_v ? kv.meta_v : kv.meta_k,
-                                                             block_table, kv_head, p));
+                                                             block_table, kv_head, p),
+                                   hq_dither_row_seed(kv_head, p, role_v));
+                if (kv.residual_k != nullptr) {
+                    hq_store_rotated_row_warp(
+                        src, signs_s,
+                        hq_residual_row<Geometry>(role_v ? kv.residual_v : kv.residual_k,
+                                                  table_row, kv_head, p));
+                    hq_ring_mark_valid(const_cast<std::uint32_t*>(ring_valid_row), p);
+                }
             }
         } else {
             for (int chunk = tid; chunk < valid_tokens * (D / 8); chunk += Threads) {
@@ -306,6 +329,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             // (chunk ^ (key row & 7)). Rows outside this split's key range are
             // zeroed so stale shared memory (possibly NaN) never reaches the
             // MMA path. 128 threads cover the 2 x 32 rows in four 16-row waves.
+            // Sink and recent-ring rows come EXACT from the residual side planes
+            // (one 16 B copy per lane chunk, same swizzle); ring slots whose
+            // validity bit was cleared (rollback / prefix-restore trims) fall
+            // back to the codec path.
 #pragma unroll 1
             for (int slot = tid; slot < 2 * Bc * 8; slot += Threads) {
                 const bool role_v = slot >= Bc * 8;
@@ -314,12 +341,28 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 __nv_bfloat16* row_dst = (role_v ? v_s : k_s) + key_l * D;
                 const int key = k0 + key_l;
                 if (key >= split_start && key < split_end) {
-                    hq_decode_row_group(
-                        hq_row_codes<Geometry>(role_v ? kv.codes_v : kv.codes_k, block_table,
-                                              kv_head, key),
-                        hq_row_meta<Geometry>(role_v ? kv.meta_v : kv.meta_k, block_table, kv_head,
-                                             key),
-                        row_dst, lane8, key_l & 7);
+                    const bool side_row =
+                        kv.residual_k != nullptr &&
+                        (key < static_cast<int>(kGqaHqSinkKeys) ||
+                         (key >= window - static_cast<int>(kGqaHqRecentKeys) &&
+                          hq_ring_slot_valid(ring_valid_row, key)));
+                    if (side_row) {
+                        const __nv_bfloat16* side = hq_residual_row<Geometry>(
+                            role_v ? kv.residual_v : kv.residual_k, table_row, kv_head, key);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const int chunk = ((lane8 * 4 + j) ^ (key_l & 7)) << 3;
+                            store_vec(row_dst + chunk,
+                                      load_vec<int4>(side + lane8 * 32 + j * 8));
+                        }
+                    } else {
+                        hq_decode_row_group(
+                            hq_row_codes<Geometry>(role_v ? kv.codes_v : kv.codes_k, block_table,
+                                                  kv_head, key),
+                            hq_row_meta<Geometry>(role_v ? kv.meta_v : kv.meta_k, block_table,
+                                                 kv_head, key),
+                            row_dst, lane8, key_l & 7, hq_dither_row_seed(kv_head, key, role_v));
+                    }
                 } else {
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {

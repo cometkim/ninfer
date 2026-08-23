@@ -53,7 +53,8 @@ __global__ void encode_rows_kernel(const __nv_bfloat16* rows, const std::int8_t*
     std::uint32_t* syms = reinterpret_cast<std::uint32_t*>(u + kHqSmemFloatsPerRow);
     hq_encode_row_warp(rows + static_cast<std::size_t>(warp) * kDim, signs, 0, u, syms,
                        codes + static_cast<std::size_t>(warp) * kHqRowBudgetBytes,
-                       meta + static_cast<std::size_t>(warp) * kHqMetaBytes);
+                       meta + static_cast<std::size_t>(warp) * kHqMetaBytes,
+                       hq_dither_row_seed(0, warp, false));
 }
 
 __global__ void decode_rows_kernel(const std::uint8_t* codes, const std::uint8_t* meta,
@@ -62,7 +63,8 @@ __global__ void decode_rows_kernel(const std::uint8_t* codes, const std::uint8_t
     if (i >= n_rows) { return; }
     hq_decode_row_thread(codes + static_cast<std::size_t>(i) * kHqRowBudgetBytes,
                          meta + static_cast<std::size_t>(i) * kHqMetaBytes,
-                         out + static_cast<std::size_t>(i) * kDim);
+                         out + static_cast<std::size_t>(i) * kDim,
+                         hq_dither_row_seed(0, i, false));
 }
 
 // Rotate queries into the codec frame: one warp per query row.
