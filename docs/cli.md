@@ -181,7 +181,7 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 
 ## Context and memory
 
-The engine context envelope is 1,048,576 tokens with `--kv-dtype hq-e8-2b` and 262,144 tokens
+The engine context envelope is 1,048,576 tokens with `--kv-dtype hq-e8-2b` and 524,288 tokens
 with `bf16` or `int8` (the BF16/I8 decode kernels stage a fixed number of page ids per split).
 The checkpoint's trained position capacity is 262,144 tokens: contexts past it require
 `--rope-scaling yarn:F` (use factor 2 for a 524k deployment, factor 4 for 1M; Qwen notes YaRN

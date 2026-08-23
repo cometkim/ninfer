@@ -1353,11 +1353,15 @@ int verify_workspace_capacity_contract() {
     } catch (const std::invalid_argument&) {}
     try {
         // max_width 17 routes the U8 prompt scratch: 16 q heads resolve to 2 KV heads (35B
-        // geometry), so at the absolute ceiling the one-shot rotated planes are exactly 2 GiB
-        // (2 roles x 2 KV heads x 256 x 1048576 x 2 B).
+        // geometry). Since WI-2 the rotated planes are materialized in bands of at most
+        // kGqaHqPromptScratchBandKeys, so the 1M envelope's scratch is the band-sized planes
+        // plus the banded carry state live alongside them in one prompt call.
         const std::size_t scratch = ops::gqa_attention_workspace_capacity_bytes(
             16, DType::U8, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 17);
-        constexpr std::size_t expected = 2ULL * 2 * 256 * ops::kGqaAttentionMaximumVisibleKeys * 2;
+        constexpr std::size_t span =
+            std::min(ops::kGqaAttentionMaximumVisibleKeys, ops::kGqaHqPromptScratchBandKeys);
+        constexpr std::size_t expected =
+            2ULL * span * 2 * 256 * 2 + (2ULL * 256 + 8) * 16 * 17;
         if (scratch < expected) {
             std::cerr << "gqa_attention U8 prompt scratch at the 1M envelope is undersized\n";
             ++failures;

@@ -79,9 +79,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
-    // The BF16/I8 linear envelope ceiling (262144 keys) spans at most 49 pages in one 27B
+    // The BF16/I8 linear envelope ceiling (524288 keys) spans at most 98 pages in one 27B
     // split; the absolute U8-only envelope never stages pages here.
-    constexpr int PageIds         = 64;
+    constexpr int PageIds         = 128;
     constexpr int ProducerThreads = RowTiles * 32;
     constexpr int VLoaderThreads  = Threads - ProducerThreads;
     constexpr float Log2E         = 1.4426950408889634074f;

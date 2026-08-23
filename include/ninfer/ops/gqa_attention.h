@@ -14,9 +14,11 @@ namespace ninfer::ops {
 // decode kernel computes row addresses from the global block table and the prompt route
 // materializes linear scratch, so neither stages fixed-size page tables.
 inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 1048576;
-// BF16/I8 decode kernels stage at most 64 physical page ids per split in shared memory
-// (64-token pages; the 262144-key linear envelope spans at most 49 pages in one 27B split).
-inline constexpr std::uint32_t kGqaAttentionMaximumLinearVisibleKeys = 262144;
+// BF16/I8 decode kernels stage at most 128 physical page ids per split in shared memory
+// (64-token pages; the 524288-key linear envelope spans at most 98 pages in one 27B split).
+// U8 (hq) alone reaches the absolute envelope; linear caches at this ceiling are memory-bound
+// in practice (int8 fits ~430k keys beside the 16 GiB nvfp4full weights on a 32 GB board).
+inline constexpr std::uint32_t kGqaAttentionMaximumLinearVisibleKeys = 524288;
 // U8 prompt-route scratch band: the one-shot rotated planes are materialized in sequential
 // bands of at most this many keys (the FA2 kernel carries its online-softmax state between
 // bands), bounding the prompt scratch at 1 GiB regardless of the execution envelope.
