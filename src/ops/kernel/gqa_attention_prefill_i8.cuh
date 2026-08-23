@@ -546,6 +546,17 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             acc[n][3] *= alpha1;
         }
 
+        // PV runs on the f16-accumulate MMA (2x the f32-accumulate issue rate on GeForce): each
+        // 64-key tile accumulates into f16 fragments and promotes once into the f32 running sum.
+        // Safe here because P is already f16 in smem, V is bounded by its int8 group scale, and a
+        // tile partial is at most 64 such products; the cross-tile sum stays in f32.
+        unsigned hacc[PVNtPerWarp][2];
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            hacc[n][0] = 0u;
+            hacc[n][1] = 0u;
+        }
+
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
             unsigned pf[4];
@@ -561,9 +572,19 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + gqa_prefill_swz(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                        vf[0], vf[1]);
+                mma_f16_f16acc(hacc[n][0], hacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
+        }
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            acc[n][0] +=
+                __half2float(__ushort_as_half(static_cast<unsigned short>(hacc[n][0] & 0xffffu)));
+            acc[n][1] +=
+                __half2float(__ushort_as_half(static_cast<unsigned short>(hacc[n][0] >> 16)));
+            acc[n][2] +=
+                __half2float(__ushort_as_half(static_cast<unsigned short>(hacc[n][1] & 0xffffu)));
+            acc[n][3] +=
+                __half2float(__ushort_as_half(static_cast<unsigned short>(hacc[n][1] >> 16)));
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
