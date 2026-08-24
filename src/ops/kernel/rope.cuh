@@ -14,6 +14,7 @@
 #include "ninfer/ops/rope.h"
 
 #include "core/pdl.cuh"
+#include "ops/common/warp.cuh"
 
 namespace ninfer::ops {
 
@@ -233,6 +234,90 @@ inline __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             data[base + pair]        = __float2bfloat16_rn(first * c - second * s);
             data[base + pair + half] = __float2bfloat16_rn(second * c + first * s);
         }
+    }
+    pdl::publish();
+}
+
+// Fused Text attention-path Q/K preparation (implements include/ninfer/ops/qk_norm_rope.h):
+// per (side, head, token) row, out = rope(rmsnorm(x; weight, eps)). One warp owns one row. The
+// norm replicates rmsnorm_warp_bf16x2_kernel<Offset>'s exact arithmetic - lane ownership
+// (pair = lane + k*32), accumulation order, rsqrt input, and epilogue association - and rounds
+// to BF16 in registers, which is the sequential chain's global-memory boundary. The rotation
+// runs through the same fixed_sincos + apply_rope_head path as rope_fixed_kernel<Text1D> over
+// the staged rounded row, so the fused outputs are bit-identical to rmsnorm -> rope.
+template <int QHeads, int KHeads, int Block>
+__launch_bounds__(Block) __global__ void rope_norm_fused_kernel(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat162* q_weight,
+    const __nv_bfloat162* k_weight, float eps, const std::int32_t* positions,
+    RopeFrequencies frequencies, __nv_bfloat16* q_out, __nv_bfloat16* k_out,
+    std::int32_t tokens) {
+    static_assert(Block % kWarpSize == 0);
+    constexpr int kHeadDim = 256;
+    constexpr int kHalf    = 32;
+    constexpr int kPairs   = kHeadDim / 2;
+    constexpr int kPerLane = kPairs / kWarpSize;
+    pdl::sync();
+
+    const int lane            = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp            = static_cast<int>(threadIdx.x) / kWarpSize;
+    constexpr int kWarps      = Block / kWarpSize;
+    __shared__ __nv_bfloat162 stage[kWarps][kHalf];
+
+    const int rows = (QHeads + KHeads) * tokens;
+    for (int row = blockIdx.x * kWarps + warp; row < rows; row += gridDim.x * kWarps) {
+        const bool is_q = row < QHeads * tokens;
+        const int heads = is_q ? QHeads : KHeads;
+        const int flat  = is_q ? row : row - QHeads * tokens;
+        const int token = flat / heads;
+        const int head  = flat - token * heads;
+        const auto* x   = reinterpret_cast<const __nv_bfloat162*>(is_q ? q : k) +
+                        static_cast<std::int64_t>(flat) * kPairs;
+        const auto* w   = is_q ? q_weight : k_weight;
+        auto* out       = reinterpret_cast<__nv_bfloat162*>(is_q ? q_out : k_out) +
+                  static_cast<std::int64_t>(flat) * kPairs;
+
+        __nv_bfloat162 values[kPerLane];
+        float sum = 0.0f;
+#pragma unroll
+        for (int kk = 0; kk < kPerLane; ++kk) {
+            const int pair   = lane + kk * kWarpSize;
+            values[kk]       = x[pair];
+            const float2 xf  = __bfloat1622float2(values[kk]);
+            sum += xf.x * xf.x + xf.y * xf.y;
+        }
+        sum       = warp_reduce_sum(sum);
+        float inv = lane == 0 ? rsqrtf(sum / static_cast<float>(kHeadDim) + eps) : 0.0f;
+        inv       = __shfl_sync(kFullWarpMask, inv, 0);
+
+        __nv_bfloat162 normed[kPerLane];
+#pragma unroll
+        for (int kk = 0; kk < kPerLane; ++kk) {
+            const int pair  = lane + kk * kWarpSize;
+            const float2 xf = __bfloat1622float2(values[kk]);
+            const float2 wf = __bfloat1622float2(w[pair]);
+            normed[kk]      = __floats2bfloat162_rn(xf.x * inv * (wf.x + 1.0f),
+                                                    xf.y * inv * (wf.y + 1.0f));
+        }
+
+        stage[warp][lane] = normed[0];
+        __syncwarp();
+        if (lane < kHalf / 2) {
+            float s0, c0, s1, c1;
+            fixed_sincos<RopeKernelMode::Text1D>(positions, tokens, token, lane * 2, frequencies,
+                                                 &s0, &c0);
+            fixed_sincos<RopeKernelMode::Text1D>(positions, tokens, token, lane * 2 + 1,
+                                                 frequencies, &s1, &c1);
+            const float scale = is_q ? rope_q_scale(frequencies) : 1.0f;
+            apply_rope_head<kHeadDim, kHalf>(reinterpret_cast<__nv_bfloat16*>(stage[warp]), 0, 0,
+                                             0, lane, c0 * scale, c1 * scale, s0 * scale,
+                                             s1 * scale);
+        }
+        __syncwarp();
+
+        out[lane]                 = stage[warp][lane];
+        out[lane + kWarpSize]     = normed[1];
+        out[lane + 2 * kWarpSize] = normed[2];
+        out[lane + 3 * kWarpSize] = normed[3];
     }
     pdl::publish();
 }

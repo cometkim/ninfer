@@ -192,6 +192,7 @@ set(ninfer_op_tests
   argmax
   gdn_gating
   gdn_gating_proj
+  qk_norm_rope
   rope
   vision_pos_embed
   vision_attention
