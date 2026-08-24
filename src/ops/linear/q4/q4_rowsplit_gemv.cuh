@@ -420,10 +420,6 @@ void q4_rowsplit_gemv_kernel(
     static_assert(!SplitOutput || SplitRow > 0,
                   "split-output Q4 GEMV requires a positive compile-time seam");
 
-    if constexpr (TriggerPdl) {
-        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
-    }
-
     __shared__ Q4GemvTileStorage<Schedule> shared_tiles;
     __shared__ float row_partials[kRowsPerCta][kWarpsPerRow];
     extern __shared__ __align__(16) unsigned char dynamic_shared[];
@@ -513,6 +509,7 @@ void q4_rowsplit_gemv_kernel(
                                                                 row_accumulator);
         }
     }
+    if constexpr (TriggerPdl) { pdl::publish(); }
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 

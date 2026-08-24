@@ -177,8 +177,9 @@ void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value
     const std::int32_t q4_out_ld = static_cast<std::int32_t>(qk.nb[1] / sizeof(__nv_bfloat16));
     const std::int32_t q5_out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
 
-    // Q5 and Q4 publish disjoint row ranges. Q4 can execute while Q5 drains and joins Q5 only at
-    // exit, before the following convolution/snapshot kernel becomes runnable.
+    // Q5 and Q4 publish disjoint row ranges. Both publish (trigger) at kernel exit after their
+    // stores: Q4 launches only into Q5's drain tail, but its stores — and transitively Q5's —
+    // are visible to any dependent that waits, whatever that dependent is launched as.
     q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, 4, 5, kHidden, true, kValueRows,
                                         Q5Split4StoreEpilogue, true, false>
         <<<q5_grid, kQ5Threads, 0, stream>>>(
