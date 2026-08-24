@@ -1270,6 +1270,14 @@ GPU execution 或 state-integrity failure 属于 Engine-wide failure：停止 ad
 requests 以 unavailable/failure 结束，重新创建 Engine 后才能恢复 serving。Scheduler 不猜测 failed
 shared round 中某一行可以安全继续。
 
+与之互补的是 request-scoped failure 边界：单个 request 自身 admission staging、prefill 推进、或其
+输出发布阶段抛出的 host 侧异常只终止该 request（其 lane 被 abort 丢弃，slot 释放），其余 active
+与 queued requests 以及 Engine 本身继续服务。Device 级失败不会以 C++ 异常形式穿越该边界
+（`cuda_check` 直接终止进程），因此 executor 把这些区段的 host 异常一律按 request 处理；只有来自
+共享引擎工作（round membership 构建或批量 decode 执行本身）的异常才升级为 Engine-wide failure。
+Program 在批量 decode 内部按行产生的异常（如 frontend 字节流错误）目前仍属于后一类 —— 按行错误
+归因需要 BatchedGeneratedRound 携带 per-row error，是记录在案的后续设计。
+
 ---
 
 ## 12. End-to-end examples
