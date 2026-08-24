@@ -417,7 +417,10 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
     const std::size_t norm_interval =
         ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 1, 64);
     const std::size_t norm_witness = std::max(
-        ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 16, 16),
+        std::max(ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden,
+                                                                    8, 8),
+                 ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden,
+                                                                    16, 16)),
         ops::gdn_norm_gating_proj_workspace_capacity_bytes(geometry.heads, geometry.hidden, 64,
                                                            64));
     if (norm_interval != norm_witness) {
@@ -453,8 +456,11 @@ int main() {
             run_projection_case(kQwen35, tokens, 0x2000u + static_cast<std::uint32_t>(tokens));
     }
 
-    // 27B uses the composed implementation; 35B also qualifies both sides of its fused boundary.
+    // 27B qualifies the fused split-80 route (T=1..8) and its composed boundary; the 35B
+    // qualifies both sides of its own fused boundary.
     failures += run_norm_projection_case(kQwen27, 1, 0x3001u);
+    failures += run_norm_projection_case(kQwen27, 6, 0x3006u);
+    failures += run_norm_projection_case(kQwen27, 8, 0x3008u);
     failures += run_norm_projection_case(kQwen27, 9, 0x3009u);
     failures += run_norm_projection_case(kQwen27, 64, 0x3040u);
     failures += run_norm_projection_case(kQwen38Parent, 1, 0x3801u);

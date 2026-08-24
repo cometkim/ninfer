@@ -607,6 +607,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             store_vec(&partial_acc[dst], load_vec<int4>(&qkv_s[row * D + d]));
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

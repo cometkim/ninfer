@@ -61,6 +61,7 @@ __global__ __launch_bounds__(
     gate = warp_reduce_sum(gate);
     up   = warp_reduce_sum(up);
     if (lane == 0) { out[gate_row] = __float2bfloat16_rn(silu(gate) * up); }
+    pdl::publish();
 }
 
 } // namespace

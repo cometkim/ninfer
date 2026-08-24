@@ -346,6 +346,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
             }
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

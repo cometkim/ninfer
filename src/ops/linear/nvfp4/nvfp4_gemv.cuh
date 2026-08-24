@@ -211,7 +211,6 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     static_assert((128 % Schedule::kRowsPerCta) == 0);
 
     __shared__ Nvfp4GemvSharedStorage<Geometry, Schedule> shared;
-    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     constexpr int kCtasPerM128 = 128 / Schedule::kRowsPerCta;
     const int m_tile           = static_cast<int>(blockIdx.x) / kCtasPerM128;
     const int cta_in_tile      = static_cast<int>(blockIdx.x) - m_tile * kCtasPerM128;
@@ -249,6 +248,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             output.store(parent_row, 0, epilogue.apply(parent_row, 0, total));
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

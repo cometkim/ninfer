@@ -73,6 +73,7 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_rowsplit_k16384_decode_
 
     acc = warp_reduce_sum(acc);
     if (lane == 0) { out[row] = __float2bfloat16_rn(acc); }
+    pdl::publish();
 }
 
 template <int RowsPerCta>

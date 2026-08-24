@@ -234,7 +234,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_smal
     const int token0 = kTokenTiles == 1 ? 0 : token_tile * Schedule::kTokenTile;
 
     __shared__ Nvfp4SmallTSharedStorage<Geometry, ActiveTokens, Schedule> shared;
-    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     constexpr int kCtasPerM128 = 128 / Schedule::kRowsPerCta;
     const int m_tile           = row_block / kCtasPerM128;
     const int cta_in_tile      = row_block - m_tile * kCtasPerM128;
@@ -372,6 +371,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_smal
             }
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

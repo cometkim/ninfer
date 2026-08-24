@@ -284,6 +284,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             }
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

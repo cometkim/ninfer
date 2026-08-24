@@ -129,6 +129,7 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, RopeFrequencies
                                              c0, c1, s0, s1);
         }
     }
+    pdl::publish();
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads, int HeadsPerBlock>
@@ -172,6 +173,7 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, RopeFrequ
         apply_rope_head<kHeadDim, kHalf>(k, k_token_stride, combined_head - QHeads, token, lane, c0,
                                          c1, s0, s1);
     }
+    pdl::publish();
 }
 
 // inline: this non-template kernel lives in a header consumed by the launcher and bench TUs;
@@ -232,6 +234,7 @@ inline __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             data[base + pair + half] = __float2bfloat16_rn(second * c + first * s);
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

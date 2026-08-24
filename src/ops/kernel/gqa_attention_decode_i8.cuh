@@ -607,6 +607,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][2], acc[n][3]);
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

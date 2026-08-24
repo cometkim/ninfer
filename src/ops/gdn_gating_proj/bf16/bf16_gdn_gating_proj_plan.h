@@ -16,6 +16,7 @@ enum class Bf16GdnGatingScheduleId {
     SmallTSplit10,
     SimtWarpRowC4,
     SimtWarpRowC8,
+    MmaCooperativeSplit40,
     MmaCooperativeSplit32,
     MmaCooperativeSplit16,
     MmaCooperativeSplit8,
@@ -38,6 +39,7 @@ struct Bf16GdnGatingPlan {
 
 enum class Bf16GdnNormGatingScheduleId {
     Composed,
+    MmaCooperativeSplit40,
     MmaCooperativeSplit32,
 };
 

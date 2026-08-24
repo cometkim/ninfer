@@ -77,6 +77,7 @@ __launch_bounds__(Block) __global__
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
         }
     }
+    pdl::publish();
 }
 
 // Implements: include/ninfer/ops/rmsnorm.h
@@ -122,6 +123,7 @@ __launch_bounds__(Block) __global__
     out[row_base + pair1] =
         __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(x1.x, inv, w1.x, z1.x),
                               rmsnorm_epilogue<Epilogue>(x1.y, inv, w1.y, z1.y));
+    pdl::publish();
 }
 
 // Fast geometry for wide rows. One CTA owns one row and keeps up to MaxPairsPerThread BF16x2
@@ -133,7 +135,6 @@ __launch_bounds__(Block) __global__
                                    std::int64_t rows, float eps) {
     pdl::sync();
     static_assert(Block % kWarpSize == 0);
-    pdl::sync();
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 
@@ -175,6 +176,7 @@ __launch_bounds__(Block) __global__
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
         }
     }
+    pdl::publish();
 }
 
 // Implements: include/ninfer/ops/rmsnorm.h
@@ -221,6 +223,7 @@ __launch_bounds__(512) __global__
     out[row_base + pair1] =
         __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(x1.x, inv, w1.x, z1.x),
                               rmsnorm_epilogue<Epilogue>(x1.y, inv, w1.y, z1.y));
+    pdl::publish();
 }
 
 // Functional fallback outside the aligned fast domains. It intentionally favors a simple complete
@@ -230,6 +233,7 @@ __launch_bounds__(256) __global__
     void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                 const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
                                 std::int64_t rows, float eps) {
+    pdl::sync();
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 
@@ -257,6 +261,7 @@ __launch_bounds__(256) __global__
         if constexpr (Epilogue == RmsEpilogue::Gated) { zv = __bfloat162float(z[index]); }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

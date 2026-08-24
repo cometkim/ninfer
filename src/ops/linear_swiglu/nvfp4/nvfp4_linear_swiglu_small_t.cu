@@ -72,6 +72,7 @@ __global__ __launch_bounds__(
                 __float2bfloat16_rn(silu(gate) * up);
         }
     }
+    pdl::publish();
 }
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);

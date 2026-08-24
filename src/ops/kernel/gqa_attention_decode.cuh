@@ -283,6 +283,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     }
     const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
     out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

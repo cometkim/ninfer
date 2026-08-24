@@ -109,6 +109,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         store_qk_lane(s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
                       dqk_base);
     }
+    pdl::publish();
 }
 
 inline constexpr float kQkL2NormEps = 1.0e-6f;
@@ -269,6 +270,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         store_qk_lane(state[r], write_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
                       dqk_base);
     }
+    pdl::publish();
 }
 
 enum class RecurrentMode {
@@ -682,6 +684,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Snapshot, NormalizeInputs>(access, coord, access.width,
                                                                   access.active_columns(coord));
+    pdl::publish();
 }
 
 template <bool Masked>
@@ -691,6 +694,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Record, true>(access, coord, access.width,
                                                      access.active_columns(coord));
+    pdl::publish();
 }
 
 template <class Geometry>
@@ -700,6 +704,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Fold, true>(access, coord, access.width,
                                                    access.active_columns(coord));
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

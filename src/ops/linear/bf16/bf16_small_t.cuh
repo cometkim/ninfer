@@ -231,6 +231,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_small
             }
         }
     }
+    pdl::publish();
 }
 
 struct Bf16SmallTContiguousOutput {
