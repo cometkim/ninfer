@@ -28,7 +28,6 @@ __global__ void sparse_moe_small_t_s1_kernel(const __nv_bfloat16* __restrict__ x
                                              float* __restrict__ partial_scores) {
     static_assert(Tokens >= 1 && Tokens <= kSparseMoeSmallTMax);
     __shared__ float partial[kRouterWarps][Tokens];
-    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     const int row       = static_cast<int>(blockIdx.x) / kRouterPartitions;
     const int partition = static_cast<int>(blockIdx.x) - row * kRouterPartitions;
     const int warp      = static_cast<int>(threadIdx.x) >> 5;
@@ -71,6 +70,7 @@ __global__ void sparse_moe_small_t_s1_kernel(const __nv_bfloat16* __restrict__ x
                            partition] = sum;
         }
     }
+    pdl::publish();
 }
 
 template <int Tokens>
@@ -81,7 +81,6 @@ sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores, int* __re
     __shared__ float scores[Tokens][kRouterRows];
     __shared__ float selected_logits[Tokens][kTopK];
     const int tid = static_cast<int>(threadIdx.x);
-    if (tid == 0) { pdl::trigger_dependents(); }
     pdl::wait_for_dependencies();
     for (int index = tid; index < Tokens * kRouterRows; index += static_cast<int>(blockDim.x)) {
         float sum = 0.0f;
@@ -99,6 +98,7 @@ sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores, int* __re
                                     token_alpha + token * kTopK, shared_scale + token,
                                     selected_logits[token]);
     }
+    pdl::publish();
 }
 
 template <int Tokens>
@@ -112,7 +112,6 @@ __global__ void sparse_moe_small_t_s2_two_batch_kernel(const float* __restrict__
     __shared__ float selected_logits[kBatchTokens][kTopK];
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
-    if (tid == 0) { pdl::trigger_dependents(); }
     pdl::wait_for_dependencies();
 
 #pragma unroll
@@ -141,6 +140,7 @@ __global__ void sparse_moe_small_t_s2_two_batch_kernel(const float* __restrict__
         }
         __syncthreads();
     }
+    pdl::publish();
 }
 
 template <int Tokens>
