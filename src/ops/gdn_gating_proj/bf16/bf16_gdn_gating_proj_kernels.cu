@@ -175,6 +175,7 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
             g[row]         = -expf(A_log[row]) * sp;
         }
     }
+    pdl::publish();
 }
 
 template <int ColsPerTile>
@@ -463,6 +464,31 @@ void bf16_gdn_gating_proj_35_mma_split32_launch(Bf16GdnGatingTokenVariant varian
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 32, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
                                                       b_weight, A_log, dt_bias, workspace, g, beta,
                                                       stream);
+}
+
+void bf16_gdn_norm_gating_proj_27_mma_split40_launch(Bf16GdnGatingTokenVariant variant,
+                                                     const Tensor& x, const Tensor& norm_weight,
+                                                     float eps, Tensor& h, const Weight& a_weight,
+                                                     const Weight& b_weight, const Tensor& A_log,
+                                                     const Tensor& dt_bias, void* workspace,
+                                                     Tensor& g, Tensor& beta, cudaStream_t stream) {
+    require_shape(a_weight, "a_weight");
+    require_shape(b_weight, "b_weight");
+    // 40 splits of two k64 tiles each: 120 cooperative CTAs at one token tile, co-resident even
+    // at one CTA/SM (the fused variant carries more registers than the plain split-8 route).
+    const auto launch = [&](auto token_capacity) {
+        constexpr int TokenCapacity = decltype(token_capacity)::value;
+        launch_bf16_prefill_mma<Bf16Gdn27Geometry, 40, 8, true, TokenCapacity>(
+            variant, x, &norm_weight, eps, &h, a_weight, b_weight, A_log, dt_bias, workspace, g,
+            beta, stream);
+    };
+    if (x.ne[1] <= 6) {
+        launch(std::integral_constant<int, 6>{});
+    } else if (x.ne[1] <= 8) {
+        launch(std::integral_constant<int, 8>{});
+    } else {
+        throw std::invalid_argument("fused 27B BF16 GDN norm/control requires T=1..8");
+    }
 }
 
 void bf16_gdn_norm_gating_proj_35_mma_split32_launch(Bf16GdnGatingTokenVariant variant,

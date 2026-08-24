@@ -402,7 +402,7 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
         norm_splits = 32;
-    } else if (false && is_27(problem) && problem.cols <= 8) {
+    } else if (is_27(problem) && problem.cols <= 8) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit40,
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit40;
