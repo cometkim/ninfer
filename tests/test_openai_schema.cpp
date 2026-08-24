@@ -488,6 +488,71 @@ int test_parse_tool_history_messages() {
               "non-object tool call arguments rejected");
     return failures;
 }
+int test_parse_tool_media_content() {
+    int failures    = 0;
+    // VSCode Copilot's browser tool returns a screenshot inside the tool message as
+    // array content (issue #3): string content must keep working, and array content
+    // with text + image_url parts must parse and reach the media path.
+    const Json tool_msg = Json{{"role", "tool"},
+                                {"tool_call_id", "call_shot"},
+                                {"content",
+                                 Json::array({Json{{"type", "text"}, {"text", "Screenshot saved"}},
+                                               Json{{"type", "image_url"},
+                                                    {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}}})}};
+    const Json body = {
+        {"model", "m"},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "take a shot"}},
+                                   Json{{"role", "assistant"},
+                                        {"content", nullptr},
+                                        {"tool_calls",
+                                         Json::array({Json{{"id", "call_shot"},
+                                                      {"type", "function"},
+                                                      {"function", Json{{"name", "browser_screenshot"},
+                                                                        {"arguments", R"({})"}}}}})}},
+                                   tool_msg})}};
+    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+    const ChatTurn& turn        = req.messages[2];
+    failures += check(turn.role == ninfer::ChatRole::Tool, "tool role parsed");
+    failures += check(turn.tool_call_id == "call_shot", "tool_call_id parsed");
+    failures += check(turn.content.size() == 2, "tool message array content parsed");
+    failures += check(turn.content[0].kind == ContentKind::Text && turn.content[0].text == "Screenshot saved",
+                      "tool message text part parsed");
+    failures += check(turn.content[1].kind == ContentKind::Image &&
+                          turn.content[1].source.kind == ninfer::product::media_acquire::SourceKind::Data,
+                      "tool message image part parsed");
+    failures += check(req.media_item_count() == 1, "tool message media counted");
+    const ninfer::PromptInput prompt = translate(req);
+    failures += check(prompt.messages.size() == 3, "tool media translated");
+    failures += check(prompt.messages[2].parts.size() == 2, "two translated parts");
+    failures += check(prompt.messages[2].parts[1].kind == ninfer::MessagePartKind::Media &&
+                          prompt.messages[2].parts[1].media.kind == ninfer::MediaKind::Image,
+                      "tool message image translated to media part");
+    // String tool content keeps the exact single-text-part shape.
+    Json string_body = body;
+    string_body["messages"][2]["content"] = "plain text result";
+    const GenerationRequest string_req = parse_chat_completion_request(string_body, default_limits());
+    failures += check(string_req.messages[2].content.size() == 1 &&
+                          string_req.messages[2].content[0].kind == ContentKind::Text &&
+                          string_req.messages[2].content[0].text == "plain text result",
+                      "string tool content unchanged");
+    // An unsupported part type on a tool message still fails, like on any role:
+    // it parses as Unsupported and translate rejects it with modality_not_supported.
+    Json unsupported = body;
+    unsupported["messages"][2]["content"] =
+        Json::array({Json{{"type", "file"}, {"file_url", "https://example.test/f.pdf"}}});
+    const GenerationRequest unsupported_req = parse_chat_completion_request(unsupported, default_limits());
+    failures += check(unsupported_req.messages[2].content[0].kind == ContentKind::Unsupported,
+                      "unsupported tool content part marked Unsupported");
+    failures += check(throws_api([&] { (void)translate(unsupported_req); }),
+                      "unsupported tool content part rejected in translation");
+    // Tool messages still require content and tool_call_id.
+    Json no_content = body;
+    no_content["messages"][2].erase("content");
+    failures += check(throws_api([&] { (void)parse_chat_completion_request(no_content, default_limits()); }),
+                      "tool message without content rejected");
+    return failures;
+}
+
 
 int test_parse_stop_and_max_tokens() {
     int failures          = 0;
@@ -876,6 +941,7 @@ int main() {
     failures += test_reject_unsupported();
     failures += test_parse_function_tools_and_choices();
     failures += test_parse_tool_history_messages();
+    failures += test_parse_tool_media_content();
     failures += test_parse_stop_and_max_tokens();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();

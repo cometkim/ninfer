@@ -250,12 +250,15 @@ void parse_messages(const Json& body, GenerationRequest& out) {
                 item.at("tool_call_id").get<std::string>().empty()) {
                 bad_request("tool messages must contain a string tool_call_id", "messages");
             }
-            if (!item.contains("content") || !item.at("content").is_string()) {
-                bad_request("tool messages must contain string content", "messages");
+            // Array content (text + image_url/video_url parts) is legal on
+            // tool messages and is how clients such as VSCode Copilot's browser tool
+            // return screenshots; parse it the same way as any other role so the
+            // media reaches the vision path like the Anthropic tool_result layer.
+            if (!item.contains("content") || item.at("content").is_null()) {
+                bad_request("tool messages must contain content", "messages");
             }
+            parse_content_parts(item.at("content"), turn, i);
             turn.tool_call_id = item.at("tool_call_id").get<std::string>();
-            turn.content.push_back(
-                ContentPart{ContentKind::Text, item.at("content").get<std::string>(), "text"});
             out.messages.push_back(std::move(turn));
             continue;
         }
