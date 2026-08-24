@@ -140,7 +140,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                                            __nv_bfloat16* __restrict__ carry_acc   = nullptr,
                                            float* __restrict__ carry_m             = nullptr,
                                            float* __restrict__ carry_l             = nullptr,
-                                           std::int32_t store_carry                = 0) {
+                                           std::int32_t store_carry                = 0,
+                                           float* __restrict__ partial_acc         = nullptr,
+                                           float* __restrict__ partial_m           = nullptr,
+                                           float* __restrict__ partial_l           = nullptr,
+                                           std::int32_t split_count                = 1) {
+    // Key-split partials (ROADMAP WI-K1a) share the small-T layout contract with the INT8
+    // kernel; split_count > 1 is only legal on non-Carry launches (banded carry state is
+    // sequential across bands, enforced by the launcher).
     static_assert(!Carry || Rotated, "band carry exists only on the rotated scratch route");
     constexpr int D             = kGqaPrefillHeadDim; // 256
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
@@ -264,6 +271,13 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const int kb_begin      = Carry ? (key_begin / Bc) : 0;
     const int n_block_max   = (key_limit + Bc - 1) / Bc; // tiles [kb_begin, n_block_max)
 
+    // Key-split segment of the tile range (ROADMAP WI-K1a): identical merge contract to the
+    // INT8 kernel — each split stores pre-normalized FP32 partials for the shared reducer.
+    const int split           = static_cast<int>(blockIdx.z);
+    const int tiles_per_split = (n_block_max - kb_begin + split_count - 1) / split_count;
+    const int kb_split_begin  = kb_begin + split * tiles_per_split;
+    const int kb_split_end    = min(kb_split_begin + tiles_per_split, n_block_max);
+
     if constexpr (Carry) {
         if (key_begin > 0) {
             // Resume the online softmax from the previous band's state. The carried acc is
@@ -330,12 +344,18 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const float scale_l2 = scale * Log2E;
     int physical_page    = block_table[kb_begin];
 
-    // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
+    // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both. An empty
+    // split segment skips the K(0) stage entirely — the block table past this CTA's key range
+    // holds no valid page, and the staged rows would never be consumed anyway.
     ninfer::ops::cp_commit();
-    gqa_prefill_stage_kv<Geometry, Rotated>(k_s, cache_k, kv_head, kb_begin * Bc, max_query_abs,
-                                            physical_page, tid, scratch_span,
-                                            Carry ? key_begin : 0, Carry ? key_end : 0x7fffffff);
-    ninfer::ops::cp_commit();
+    if (kb_split_begin < kb_split_end) {
+        physical_page = block_table[kb_split_begin];
+        gqa_prefill_stage_kv<Geometry, Rotated>(k_s, cache_k, kv_head, kb_split_begin * Bc,
+                                                max_query_abs, physical_page, tid, scratch_span,
+                                                Carry ? key_begin : 0,
+                                                Carry ? key_end : 0x7fffffff);
+        ninfer::ops::cp_commit();
+    }
 
     if constexpr (Rotated) {
         // Rotate the staged q rows into the codec frame before any QK MMA reads
@@ -360,9 +380,10 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         __syncthreads();
     }
 
-    for (int kb = kb_begin; kb < n_block_max; ++kb) {
+    for (int kb = kb_split_begin; kb < kb_split_end; ++kb) {
         const int k0                 = kb * Bc;
-        const int next_physical_page = (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
+        const int next_physical_page =
+            (kb + 1 < kb_split_end) ? block_table[kb + 1] : physical_page;
 
         ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
@@ -465,8 +486,13 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const float nm1        = fmaxf(m1, bm1);
         const float nm0_scaled = nm0 * scale_l2;
         const float nm1_scaled = nm1 * scale_l2;
-        const float alpha0     = exp2_approx(__fmaf_rn(m0, scale_l2, -nm0_scaled));
-        const float alpha1     = exp2_approx(__fmaf_rn(m1, scale_l2, -nm1_scaled));
+        // A split segment can lie entirely past a row's causal limit, so both m and the
+        // block max stay -inf here: the naive exp2 would compute -inf - (-inf) = NaN. The
+        // INT8 kernel guards the same case; the single-pass bf16 launch never met it.
+        const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f
+                                               : exp2_approx(__fmaf_rn(m0, scale_l2, -nm0_scaled));
+        const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f
+                                               : exp2_approx(__fmaf_rn(m1, scale_l2, -nm1_scaled));
 
         // P = exp2(S - m), repacked into the PV A-fragment layout, plus local block row-sum.
         // The row-sum allreduce is deferred to the epilogue; only row max must be reduced per tile.
@@ -534,7 +560,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         __syncthreads();
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
-        if (kb + 1 < n_block_max) {
+        if (kb + 1 < kb_split_end) {
             physical_page = next_physical_page;
             gqa_prefill_stage_kv<Geometry, Rotated>(k_s, cache_k, kv_head, (kb + 1) * Bc,
                                                     max_query_abs, physical_page, tid,
@@ -580,6 +606,30 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     l0 = warp_sum<4>(l0, FullMask);
     l1 = warp_sum<4>(l1, FullMask);
 
+    if (split_count > 1) {
+        // Split mode: drain any pending Q staging (empty segments never entered the loop),
+        // publish per-row (m, l) from the warp's registers, and neutralize dead rows that
+        // still own merge slots. Rows past width own no slot and are never written; acc
+        // partials are stored pre-normalized inside the epilogues below.
+        ninfer::ops::cp_wait<0>();
+        if (lid == 0) {
+            const int r0 = q0 + warp_row0 + gid;
+            const int r1 = r0 + 8;
+            if (r0 < width) {
+                partial_m[gqa_prefill_partial_stat_index<Geometry>(q_head, r0, split, width)] =
+                    r0 < tokens ? m0 : -CUDART_INF_F;
+                partial_l[gqa_prefill_partial_stat_index<Geometry>(q_head, r0, split, width)] =
+                    r0 < tokens ? l0 : 0.0f;
+            }
+            if (r1 < width) {
+                partial_m[gqa_prefill_partial_stat_index<Geometry>(q_head, r1, split, width)] =
+                    r1 < tokens ? m1 : -CUDART_INF_F;
+                partial_l[gqa_prefill_partial_stat_index<Geometry>(q_head, r1, split, width)] =
+                    r1 < tokens ? l1 : 0.0f;
+            }
+        }
+    }
+
     if constexpr (Rotated) {
         // Un-rotate each output row once in FP32, then normalize and store bf16.
         // Each warp stages its 16 rows through a private 8-row FP32 window in
@@ -613,7 +663,15 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 hq_ifwht256_sign(reg, signs, 0, lane);
                 const int qrow = q0 + warp_row0 + half * 8 + i;
                 if (qrow < tokens) {
-                    if constexpr (Carry) {
+                    if (split_count > 1) {
+                        // Split partial in the un-rotated output frame, pre-normalized (FP32)
+                        // for the shared prefill reducer.
+#pragma unroll
+                        for (int s = 0; s < 8; ++s) {
+                            partial_acc[gqa_prefill_partial_acc_index<Geometry>(
+                                q_head, s * 32 + lane, qrow, split, width)] = reg[s] * inv_l;
+                        }
+                    } else if constexpr (Carry) {
                         if (store_carry != 0) {
                             // Hand the unnormalized un-rotated accumulator and the running
                             // softmax state to the next band; the row's lanes [4i,4i+4) agree
@@ -657,17 +715,37 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             const int d0    = n * 8 + 2 * lid;
             const int qrow0 = q0 + warp_row0 + gid;
             const int qrow1 = q0 + warp_row0 + gid + 8;
-            if (qrow0 < tokens) {
-                *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow0)]) =
-                    pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
-            }
-            if (qrow1 < tokens) {
-                *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow1)]) =
-                    pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+            if (split_count > 1) {
+                if (qrow0 < tokens) {
+                    float2* slot = reinterpret_cast<float2*>(
+                        &partial_acc[gqa_prefill_partial_acc_index<Geometry>(q_head, d0, qrow0,
+                                                                             split, width)]);
+                    *slot        = make_float2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+                }
+                if (qrow1 < tokens) {
+                    float2* slot = reinterpret_cast<float2*>(
+                        &partial_acc[gqa_prefill_partial_acc_index<Geometry>(q_head, d0, qrow1,
+                                                                             split, width)]);
+                    *slot        = make_float2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+                }
+            } else {
+                if (qrow0 < tokens) {
+                    *reinterpret_cast<unsigned*>(
+                        &out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow0)]) =
+                        pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+                }
+                if (qrow1 < tokens) {
+                    *reinterpret_cast<unsigned*>(
+                        &out[gqa_prefill_q_index<Geometry>(q_head, d0, qrow1)]) =
+                        pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+                }
             }
         }
     }
-    gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads);
+    if (split_count == 1) {
+        gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid,
+                                               Threads);
+    }
 }
 
 } // namespace ninfer::ops

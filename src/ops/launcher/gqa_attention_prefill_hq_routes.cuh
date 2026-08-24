@@ -23,7 +23,9 @@ void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float sc
                               const Tensor& new_v, const Tensor& scratch_k,
                               const Tensor& scratch_v, const Tensor& carry_acc,
                               const Tensor& carry_m, const Tensor& carry_l,
-                              std::uint32_t visible_keys, Tensor& out, cudaStream_t stream) {
+                              std::uint32_t visible_keys, const Tensor& partial_acc,
+                              const Tensor& partial_m, const Tensor& partial_l,
+                              std::int32_t split_count, Tensor& out, cudaStream_t stream) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     if (scratch_k.data == nullptr || scratch_v.data == nullptr ||
@@ -48,14 +50,18 @@ void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float sc
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const auto span   = static_cast<std::int32_t>(scratch_k.ne[2]);
     const auto visible = static_cast<std::int32_t>(visible_keys);
-    const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
-                              static_cast<unsigned>(Geometry::QHeads), 1u);
     const int bands = static_cast<int>(div_up(visible, span));
     if (bands > 1 && (span % kGqaPrefillBc) != 0) {
         // Band bases index the FA2 key-tile grid; a mid-tile base would stage scratch
         // rows below the band. The production band (262144) is tile-aligned.
         throw std::invalid_argument("gqa_attention prompt: scratch band is not tile-aligned");
     }
+    // Key-splitting applies only to the single-band launch: banded runs chain (m, l, acc)
+    // state sequentially across bands, so their launches stay whole.
+    const std::int32_t bands_split = (bands == 1) ? split_count : 1;
+    const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
+                              static_cast<unsigned>(Geometry::QHeads),
+                              static_cast<unsigned>(bands_split));
     // Fresh-chunk exactness (REVIEW §8 D2): with the residual window on, the A1
     // route also rotates the current chunk's bf16 k/v rows straight into each
     // scratch band; the scratch kernel then reads its in-chunk recent window
@@ -102,7 +108,22 @@ void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float sc
                     static_cast<const __nv_bfloat16*>(scratch_k.data),
                     static_cast<const __nv_bfloat16*>(scratch_v.data), metadata,
                     static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens, span);
+                    static_cast<__nv_bfloat16*>(out.data), tokens, span, 0, 0x7fffffff, nullptr,
+                    nullptr, nullptr, 0, static_cast<float*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                    bands_split);
+            CUDA_CHECK(cudaGetLastError());
+            if (bands_split > 1) {
+                const dim3 reduce_grid(static_cast<unsigned>(tokens),
+                                       static_cast<unsigned>(Geometry::QHeads), 1u);
+                gqa_attention_prefill_reduce_kernel<Geometry>
+                    <<<reduce_grid, kGqaPrefillHeadDim, 0, stream>>>(
+                        static_cast<const float*>(partial_acc.data),
+                        static_cast<const float*>(partial_m.data),
+                        static_cast<const float*>(partial_l.data), scale, tokens, bands_split,
+                        static_cast<__nv_bfloat16*>(out.data));
+                CUDA_CHECK(cudaGetLastError());
+            }
         } else {
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, true, true>
                 <<<attention_grid, kGqaPrefillThreads, kGqaPrefillRotatedSmemBytes, stream>>>(

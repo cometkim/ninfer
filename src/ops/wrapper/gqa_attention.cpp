@@ -477,9 +477,12 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         const detail::GqaAttentionRoute route =
             detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope);
         if (route == detail::GqaAttentionRoute::Prompt) {
-            // The INT8 prompt route key-splits into partials (ROADMAP WI-K1a); every other
-            // prompt dtype — and widths the split policy keeps at S=1 — needs no workspace.
-            if (cache_dtype != DType::I8) { return std::size_t{0}; }
+            // INT8/BF16 prompt routes key-split into partials (ROADMAP WI-K1a); U8 splits
+            // only its single-band launch; widths the policy keeps at S=1 need no workspace.
+            const bool dtype_splits = cache_dtype == DType::I8 || cache_dtype == DType::BF16 ||
+                                      (cache_dtype == DType::U8 && envelope.max_visible_keys <=
+                                                                       kGqaHqPromptScratchBandKeys);
+            if (!dtype_splits) { return std::size_t{0}; }
             const std::int32_t splits = detail::gqa_prefill_split_count(width, q_heads);
             if (splits == 1) { return std::size_t{0}; }
             WorkspaceLayoutBuilder layout;
@@ -526,13 +529,28 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                 scratch += (2ULL * kHeadDim + 8) * static_cast<std::size_t>(q_heads) *
                            static_cast<std::size_t>(max_width);
             }
+            if (span >= envelope.max_visible_keys) {
+                // Single band: the key-split partials are live alongside the scratch inside
+                // one prompt call - size the sum, not the max. S(width) changes only at
+                // 64-token boundaries.
+                std::size_t partial_max  = 0;
+                const std::int32_t first = std::max(min_width, kMaximumVerifyTokens + 1);
+                for (std::int32_t width = first; width <= max_width; width += 64) {
+                    partial_max = std::max(partial_max, exact_capacity(width));
+                }
+                partial_max = std::max(partial_max, exact_capacity(max_width));
+                scratch += partial_max;
+            }
             maximum = std::max(maximum, scratch);
         }
     }
-    // The INT8 prompt route key-splits into per-(head, token, split) partials (ROADMAP
+    // The splitting prompt routes key-split into per-(head, token, split) partials (ROADMAP
     // WI-K1a); the buffers scale with width and S(width), which only changes at 64-token
     // q-block boundaries.
-    if (cache_dtype == DType::I8 && batch_size == 1 && max_width > kMaximumVerifyTokens) {
+    const bool splits_prompt_dtype = cache_dtype == DType::I8 || cache_dtype == DType::BF16 ||
+                                     (cache_dtype == DType::U8 &&
+                                      envelope.max_visible_keys <= kGqaHqPromptScratchBandKeys);
+    if (splits_prompt_dtype && batch_size == 1 && max_width > kMaximumVerifyTokens) {
         const std::int32_t first = std::max(min_width, kMaximumVerifyTokens + 1);
         for (std::int32_t width = first; width <= max_width; width += 64) {
             maximum = std::max(maximum, exact_capacity(width));
@@ -590,7 +608,12 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     Tensor split_m;
     Tensor split_l;
     std::int32_t split_count = 1;
-    if (cache.dtype == DType::I8) {
+    // U8 splits only the single-band prompt launch: banded runs chain carry state across
+    // bands and stay whole (the hq route enforces the same condition).
+    const bool prompt_splits =
+        cache.dtype == DType::I8 || cache.dtype == DType::BF16 ||
+        (cache.dtype == DType::U8 && envelope.max_visible_keys <= kGqaHqPromptScratchBandKeys);
+    if (prompt_splits) {
         split_count = detail::gqa_prefill_split_count(width, q.ne[1]);
         if (split_count > 1) {
             split_acc = workspace.alloc(DType::FP32, {kHeadDim, q.ne[1], width, split_count});
@@ -662,7 +685,10 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     Tensor split_m;
     Tensor split_l;
     std::int32_t split_count = 1;
-    if (cache.dtype == DType::I8) {
+    const bool prompt_splits =
+        cache.dtype == DType::I8 || cache.dtype == DType::BF16 ||
+        (cache.dtype == DType::U8 && envelope.max_visible_keys <= kGqaHqPromptScratchBandKeys);
+    if (prompt_splits) {
         split_count = detail::gqa_prefill_split_count(q.ne[2], q.ne[1]);
         if (split_count > 1) {
             split_acc = workspace.alloc(DType::FP32, {kHeadDim, q.ne[1], q.ne[2], split_count});

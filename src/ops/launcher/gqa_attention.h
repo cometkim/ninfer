@@ -58,6 +58,8 @@ void gqa_small_t_partial_hq(const Tensor& q, CacheInput input, const Tensor& pos
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_attention_bf16(const Tensor& q, const Tensor& positions, float scale,
                                 const CacheView& cache, Metadata metadata, Tensor& out,
+                                const Tensor& partial_acc, const Tensor& partial_m,
+                                const Tensor& partial_l, std::int32_t split_count,
                                 cudaStream_t stream);
 
 template <typename Geometry, typename CacheView, typename Metadata>
@@ -80,7 +82,9 @@ void gqa_prefill_attention_hq(const Tensor& q, const Tensor& positions, float sc
                               const Tensor& new_v, const Tensor& scratch_k,
                               const Tensor& scratch_v, const Tensor& carry_acc,
                               const Tensor& carry_m, const Tensor& carry_l,
-                              std::uint32_t visible_keys, Tensor& out, cudaStream_t stream);
+                              std::uint32_t visible_keys, const Tensor& partial_acc,
+                              const Tensor& partial_m, const Tensor& partial_l,
+                              std::int32_t split_count, Tensor& out, cudaStream_t stream);
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_append_bf16(const Tensor& k, const Tensor& v, const Tensor& positions,

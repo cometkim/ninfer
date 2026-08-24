@@ -36,11 +36,10 @@ void gqa_prefill_attention_route(const Tensor& q, const Tensor& positions, float
                                  const Tensor& partial_m, const Tensor& partial_l,
                                  std::int32_t split_count, Tensor& out, cudaStream_t stream) {
     if (cache.dtype == DType::U8) {
-        gqa_prefill_attention_hq<Geometry, CacheView, Metadata>(q, positions, scale, cache,
-                                                                metadata, new_k, new_v, scratch_k,
-                                                                scratch_v, carry_acc, carry_m,
-                                                                carry_l, visible_keys, out,
-                                                                stream);
+        gqa_prefill_attention_hq<Geometry, CacheView, Metadata>(
+            q, positions, scale, cache, metadata, new_k, new_v, scratch_k, scratch_v, carry_acc,
+            carry_m, carry_l, visible_keys, partial_acc, partial_m, partial_l, split_count, out,
+            stream);
     } else if (cache.dtype == DType::I8) {
         gqa_prefill_attention_i8<Geometry, CacheView, Metadata>(q, positions, scale, cache,
                                                                 metadata, out, partial_acc,
@@ -48,7 +47,9 @@ void gqa_prefill_attention_route(const Tensor& q, const Tensor& positions, float
                                                                 stream);
     } else {
         gqa_prefill_attention_bf16<Geometry, CacheView, Metadata>(q, positions, scale, cache,
-                                                                  metadata, out, stream);
+                                                                  metadata, out, partial_acc,
+                                                                  partial_m, partial_l,
+                                                                  split_count, stream);
     }
 }
 
