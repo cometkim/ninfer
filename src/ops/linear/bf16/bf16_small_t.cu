@@ -1,6 +1,7 @@
 #include "ops/linear/bf16/bf16_launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_small_t.cuh"
 
@@ -21,10 +22,11 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     const Bf16SmallTContiguousOutput output{static_cast<__nv_bfloat16*>(out.data),
                                             Geometry::kOutputRows};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    bf16_small_t_inner_kernel<Geometry, ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const __nv_bfloat16*>(weight.qdata), output);
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        bf16_small_t_inner_kernel<Geometry, ActiveTokens, Schedule, Bf16SmallTContiguousOutput>,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(weight.qdata), output));
     CUDA_CHECK(cudaGetLastError());
 }
 

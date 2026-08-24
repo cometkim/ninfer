@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
@@ -210,11 +211,14 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     static_assert((128 % Schedule::kRowsPerCta) == 0);
 
     __shared__ Nvfp4GemvSharedStorage<Geometry, Schedule> shared;
+    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     constexpr int kCtasPerM128 = 128 / Schedule::kRowsPerCta;
     const int m_tile           = static_cast<int>(blockIdx.x) / kCtasPerM128;
     const int cta_in_tile      = static_cast<int>(blockIdx.x) - m_tile * kCtasPerM128;
     const int rmod_base        = cta_in_tile * (Schedule::kRowsPerCta / 4);
     stage_nvfp4_scales<Geometry, Schedule>(scales, shared, m_tile, rmod_base);
+    // The staged scales are weights; the activation x is the first producer-dependent read.
+    pdl::wait_for_dependencies();
 
     const int lane      = static_cast<int>(threadIdx.x) & 31;
     const int warp      = static_cast<int>(threadIdx.x) >> 5;

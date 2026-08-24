@@ -1,6 +1,7 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/gdn_input_proj/gdn_conv_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_small_t.cuh"
@@ -30,14 +31,15 @@ void launch_exact(const Tensor& x, const Weight& weight, const Tensor& conv_weig
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
-                         GdnConvOutput<ActiveTokens, Publish>, Nvfp4SmallTFinalization::RowVector>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
+                         GdnConvOutput<ActiveTokens, Publish>, Nvfp4SmallTFinalization::RowVector>,
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
             make_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns,
-                                               initial_slot, query, key, value, z, publish));
+                                               initial_slot, query, key, value, z, publish)));
     CUDA_CHECK(cudaGetLastError());
 }
 

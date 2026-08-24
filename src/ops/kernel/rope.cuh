@@ -13,6 +13,8 @@
 
 #include "ninfer/ops/rope.h"
 
+#include "core/pdl.cuh"
+
 namespace ninfer::ops {
 
 enum class RopeKernelMode : std::int32_t {
@@ -92,6 +94,7 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, RopeFrequencies
     constexpr int kHalf    = Mode == RopeKernelMode::Vision2D       ? 36
                              : Mode == RopeKernelMode::DflashText1D ? 64
                                                                     : 32;
+    pdl::sync();
     const int token        = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
 
@@ -138,6 +141,7 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, RopeFrequ
     constexpr int kHalf          = 64;
     constexpr int kCombinedHeads = QHeads + KHeads;
     constexpr int kHeadGroups    = (kCombinedHeads + HeadsPerBlock - 1) / HeadsPerBlock;
+    pdl::sync();
     const int token              = static_cast<int>(blockIdx.x) / kHeadGroups;
     const int head_group         = static_cast<int>(blockIdx.x) % kHeadGroups;
     if (token >= tokens) { return; }
@@ -178,6 +182,7 @@ inline __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
                                     std::int32_t rotary_dim, std::int32_t q_heads,
                                     std::int32_t k_heads, std::int32_t tokens,
                                     std::int64_t q_token_stride, std::int64_t k_token_stride) {
+    pdl::sync();
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;

@@ -10,6 +10,7 @@
 
 #include "ops/kernel/gqa_attention_decode_hq.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
 
 #include <cstddef>
 #include <cstdint>
@@ -24,10 +25,11 @@ void gqa_small_t_partial_hq(const Tensor& q, CacheInput input, const Tensor& pos
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     // Static shared memory only (~36.6 KB: qkv tile 32 KB + P 4 KB + page ids +
     // RHT signs); no dynamic-smem opt-in attribute is needed.
-    gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 6, 4, true, true, CacheInput,
-                                                 GqaTcKVHq><<<grid, kGqaHqDecodeThreads, 0,
-                                                              stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data), input,
+    CUDA_CHECK(pdl::launch_dependent(
+        {grid, dim3(kGqaHqDecodeThreads), 0, stream},
+        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 6, 4, true, true, CacheInput,
+                                                    GqaTcKVHq>,
+        static_cast<const __nv_bfloat16*>(q.data), input,
             static_cast<const std::int32_t*>(pos.data),
             GqaTcKVHq{static_cast<std::uint8_t*>(cache.k_pages.data),
                       static_cast<std::uint8_t*>(cache.v_pages.data),
@@ -46,7 +48,7 @@ void gqa_small_t_partial_hq(const Tensor& q, CacheInput input, const Tensor& pos
             cache.block_tables.ne[0], invocation.width, invocation.full_width,
             invocation.column_begin, logical_capacity, scale,
             static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
-            static_cast<float*>(partial_l.data));
+            static_cast<float*>(partial_l.data)));
     CUDA_CHECK(cudaGetLastError());
 }
 

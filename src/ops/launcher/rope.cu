@@ -2,6 +2,7 @@
 #include "ops/launcher/rope.h"
 
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
 #include "ops/kernel/rope.cuh"
 
 #include <cstdint>
@@ -34,11 +35,12 @@ template <RopeKernelMode Mode, int QHeads, int KHeads>
 void launch_fixed_block(const RopeFrequencies& frequencies, const Tensor& positions, Tensor* q,
                         Tensor* k, int block, cudaStream_t stream) {
     const int tokens = positions.ne[0];
-    rope_fixed_kernel<Mode, QHeads, KHeads><<<tokens, block, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(tokens), dim3(block), 0, stream}, rope_fixed_kernel<Mode, QHeads, KHeads>,
         static_cast<const std::int32_t*>(positions.data), frequencies,
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), tokens, token_stride(q),
-        token_stride(k));
+        token_stride(k)));
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads>

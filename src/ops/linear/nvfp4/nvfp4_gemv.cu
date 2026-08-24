@@ -1,6 +1,7 @@
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 
@@ -23,10 +24,11 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
                                        Geometry::kOutputRows};
     constexpr int kBlocks              = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
-    nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream}, nvfp4_gemv_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4ContiguousOutput>,
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
-        Nvfp4IdentityEpilogue{}, output);
+        Nvfp4IdentityEpilogue{}, output));
     CUDA_CHECK(cudaGetLastError());
 }
 

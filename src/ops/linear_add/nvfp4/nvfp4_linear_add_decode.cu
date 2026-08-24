@@ -1,6 +1,7 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh"
@@ -14,11 +15,13 @@ void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
     auto* output          = static_cast<__nv_bfloat16*>(residual.data);
-    nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_gemv_kernel<Geometry, Schedule, Nvfp4AddResidualEpilogue, Nvfp4ContiguousOutput>,
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse,
         Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},
-        Nvfp4ContiguousOutput{output, Geometry::kOutputRows});
+        Nvfp4ContiguousOutput{output, Geometry::kOutputRows}));
     CUDA_CHECK(cudaGetLastError());
 }
 

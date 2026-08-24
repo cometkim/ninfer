@@ -1,3 +1,4 @@
+#include "core/pdl.cuh"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 
 #include "ops/common/math.cuh"
@@ -145,6 +146,7 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
                                                  const __nv_bfloat16* a_weight,
                                                  const __nv_bfloat16* b_weight, const float* A_log,
                                                  const float* dt_bias, float* g, float* beta) {
+    pdl::sync();
     const int global_row = static_cast<int>(blockIdx.x);
     const bool is_b      = global_row >= kN;
     const int row        = is_b ? global_row - kN : global_row;
@@ -336,12 +338,13 @@ void bf16_gdn_gating_proj_gemv_launch(const Tensor& x, const Weight& a_weight,
                                       cudaStream_t stream) {
     require_shape(a_weight, "a_weight");
     require_shape(b_weight, "b_weight");
-    bf16_gdn_gating_proj_gemv_kernel<<<2 * kN, kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(2 * kN), dim3(kThreads), 0, stream}, bf16_gdn_gating_proj_gemv_kernel,
         static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const __nv_bfloat16*>(a_weight.qdata),
         static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
         static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
-        static_cast<float*>(beta.data));
+        static_cast<float*>(beta.data)));
     CUDA_CHECK(cudaGetLastError());
 }
 

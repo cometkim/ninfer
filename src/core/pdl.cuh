@@ -42,4 +42,13 @@ __device__ __forceinline__ void trigger_dependents() { cudaTriggerProgrammaticLa
 // Call on every consumer control path before its first access to producer-dependent data.
 __device__ __forceinline__ void wait_for_dependencies() { cudaGridDependencySynchronize(); }
 
+// Entry prologue for kernels whose inputs are entirely producer-dependent: announce dependent
+// launches immediately, then wait for the producer's writes before any dependent read. Both
+// instructions are no-ops in launches without the programmatic-serialization attribute, so a
+// shared kernel body may be launched through plain stream serialization as well.
+__device__ __forceinline__ void sync() {
+    if (threadIdx.x == 0) { trigger_dependents(); }
+    wait_for_dependencies();
+}
+
 } // namespace ninfer::pdl

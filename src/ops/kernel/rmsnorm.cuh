@@ -2,6 +2,7 @@
 
 // ninfer::ops - RMSNorm kernels over contiguous BF16 rows.
 
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 
@@ -33,6 +34,7 @@ __launch_bounds__(Block) __global__
     void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                     const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
                                     std::int64_t rows, float eps) {
+    pdl::sync();
     static_assert(Block % kWarpSize == 0);
     constexpr int kWarpsPerBlock   = Block / kWarpSize;
     constexpr int kMaxPairsPerLane = 4;
@@ -85,6 +87,7 @@ __launch_bounds__(Block) __global__
     void rmsnorm_d128_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                     const __nv_bfloat162* z, __nv_bfloat162* out, std::int64_t rows,
                                     float eps) {
+    pdl::sync();
     static_assert(Block % kWarpSize == 0);
     constexpr int kWarpsPerBlock = Block / kWarpSize;
     constexpr int kPairsPerRow   = 64;
@@ -128,7 +131,9 @@ __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                    const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
                                    std::int64_t rows, float eps) {
+    pdl::sync();
     static_assert(Block % kWarpSize == 0);
+    pdl::sync();
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 
@@ -180,6 +185,7 @@ __launch_bounds__(512) __global__
     void rmsnorm_d2048_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                      const __nv_bfloat162* z, __nv_bfloat162* out,
                                      std::int64_t rows, float eps) {
+    pdl::sync();
     constexpr int kBlock       = 512;
     constexpr int kPairsPerRow = 1024;
     const std::int64_t row     = static_cast<std::int64_t>(blockIdx.x);

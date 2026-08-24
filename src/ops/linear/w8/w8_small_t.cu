@@ -1,6 +1,7 @@
 #include "ops/linear/w8/w8_launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/w8/w8_config.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
 
@@ -20,11 +21,14 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output);
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule, W8ContiguousOutput,
+                             W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows>,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaStoreEpilogue{},
+        W8SmallTMmaIdentityRows{}));
     CUDA_CHECK(cudaGetLastError());
 }
 

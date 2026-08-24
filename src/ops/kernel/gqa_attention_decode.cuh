@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/pdl.cuh"
+
 // ninfer::ops - split-KV GQA small-T attention shared scaffolding. The bf16 and
 // int8 partial kernels live in gqa_attention_decode_bf16.cuh and
 // gqa_attention_decode_i8.cuh respectively; they are fully separate kernels (no
@@ -173,6 +175,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
     std::int32_t split_count, __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
+    pdl::sync();
 
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;

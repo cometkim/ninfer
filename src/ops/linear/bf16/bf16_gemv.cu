@@ -1,6 +1,7 @@
 #include "ops/linear/bf16/bf16_launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/bf16/bf16_gemv.cuh"
 
 #include <cuda_bf16.h>
@@ -16,9 +17,10 @@ void launch_geometry(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
 
     const Bf16ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data)};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    bf16_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream}, bf16_gemv_kernel<Geometry, Schedule, Bf16ContiguousOutput, Bf16StoreEpilogue>,
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.qdata),
-        output);
+        output, Bf16StoreEpilogue{}));
     CUDA_CHECK(cudaGetLastError());
 }
 

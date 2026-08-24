@@ -1,6 +1,7 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/gdn_input_proj/gdn_conv_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
@@ -17,14 +18,17 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_gemv_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue,
+                          GdnConvOutput<1, SnapshotHistoryPublish>>,
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
         make_gdn_conv_output<1>(
             conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
             SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
                                    static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                                   kGdnChannels}));
+                                   kGdnChannels})));
     CUDA_CHECK(cudaGetLastError());
 }
 
