@@ -24,10 +24,10 @@
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/qk_norm_rope.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
-#include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 
 #include <cuda_runtime.h>
@@ -382,10 +382,9 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     const auto results = workspace_recipe::mtp_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, rope_frequencies_, qn, kn, s);
+    ops::qk_norm_rope(q, k, *mtp_.q_norm, *mtp_.k_norm, kCfg.rms_eps, rope_for_op,
+                      rope_frequencies_, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     if (active_sequence_batch_ != 0) {
@@ -400,13 +399,12 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
-                           *active_backend_kv_table_rows_, kAttnScale,
+                           *active_backend_kv_table_rows_, gate, kAttnScale,
                            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
     } else {
-        ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, kAttnScale,
-                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
+        ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, gate,
+                           kAttnScale, batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
     }
-    ops::sigmoid_mul(gate, a, s);
 
     const auto post = workspace_recipe::mtp_post_attention<TextConfig>(work_, T);
     Tensor o        = post.output;
@@ -533,9 +531,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                   s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), envelope,
-                                  work_, a, s);
-        ops::sigmoid_mul(gate, a, s);
+        ops::gqa_attention_cached(qn, last_position, gate, kAttnScale, mtp_kv_.layer_view(0),
+                                  envelope, work_, a, s);
 
         Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
         ops::linear(a.view({kCfg.q_size, 1}), *mtp_.o_proj, o, s);
@@ -818,14 +815,13 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, rope_frequencies_, qn, kn, s);
+    ops::qk_norm_rope(q, k, *w.q_norm, *w.k_norm, kCfg.rms_eps, rope_for_op,
+                      rope_frequencies_, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
@@ -841,15 +837,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows, gate,
                            kAttnScale, batch_text_kv_->batch_layer_view(fidx),
                            *active_gqa_envelope_, work_, a_batch, s);
     } else {
-        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
+        ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, gate, kAttnScale,
                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
                            s);
     }
-    ops::sigmoid_mul(gate, a, s);
 
     Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
 }

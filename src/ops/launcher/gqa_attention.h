@@ -108,13 +108,14 @@ const char* gqa_attention_route_name(GqaAttentionRoute route);
 
 void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& positions, const Tensor& valid_columns,
-                                  const Tensor& table_rows, float scale,
+                                  const Tensor& table_rows, const Tensor& gate, float scale,
                                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                                   std::int32_t column_begin, std::int32_t width,
                                   Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                   Tensor& out, cudaStream_t stream);
 
-void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
+void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions,
+                                         const Tensor& gate, float scale,
                                          const PagedKVLayerView& cache,
                                          GqaExecutionEnvelope envelope, Tensor& partial_acc,
                                          Tensor& partial_m, Tensor& partial_l, Tensor& out,

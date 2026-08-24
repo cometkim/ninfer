@@ -107,13 +107,17 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * position plus one over nonempty rows lies in the declared execution envelope. The envelope is a
  * host launch-resource promise over that batch maximum; it does not alter any row's causal mask.
  *
- * q/k/v/positions/valid_columns/kv_table_rows/out, every cache plane/table, and live workspace
- * suballocations are pairwise non-overlapping. The Op overwrites every addressed cache row but
- * owns no persistent frontier, allocation, request identity, or commit authority.
+ * The output is sigmoid-gated: out is the attention result multiplied elementwise by
+ * sigmoid(gate), with gate contiguous BF16 carrying out's flat element layout. Invalid columns
+ * gate to exact zero. The gate read is read-only.
+ *
+ * q/k/v/positions/valid_columns/kv_table_rows/gate/out, every cache plane/table, and live
+ * workspace suballocations are pairwise non-overlapping. The Op overwrites every addressed cache
+ * row but owns no persistent frontier, allocation, request identity, or commit authority.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-                   const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
-                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                   const Tensor& valid_columns, const Tensor& kv_table_rows, const Tensor& gate,
+                   float scale, PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 /**
@@ -127,11 +131,13 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 /**
  * A3: compute causal attention from an already populated cache without accepting new K/V or
  * mutating any cache plane. q/out are contiguous BF16 `[256,24|16,T]`, positions is contiguous
- * sequential I32 [T], and the mathematical formula and execution-envelope contract are identical
- * to A1. Caller workspace is reported by gqa_attention_workspace_capacity_bytes().
+ * sequential I32 [T], and the mathematical formula, sigmoid-gated output, and execution-envelope
+ * contract are identical to A1. Caller workspace is reported by
+ * gqa_attention_workspace_capacity_bytes().
  */
-void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
-                          const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
-                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor& gate,
+                          float scale, const PagedKVLayerView& cache,
+                          GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
+                          cudaStream_t stream);
 
 } // namespace ninfer::ops

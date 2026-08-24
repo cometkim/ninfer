@@ -168,12 +168,16 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
     q_head            = kv_head * Geometry::GroupSize + local_q;
 }
 
+// The gate is the op's sigmoid-gated-output input: out[i] = bf16(attn[i]) * sigmoid(gate[i]),
+// with the attention value rounded to BF16 first so the fused store is bit-identical to the
+// reducer-then-sigmoid_mul kernel chain it replaces.
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
-    const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    const std::int32_t* positions, const std::int32_t* valid_columns,
+    const __nv_bfloat16* gate, std::int32_t tokens, std::int32_t full_width,
+    std::int32_t column_begin, std::int32_t batch_size, std::int32_t split_count,
+    __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
     pdl::sync();
 
@@ -282,7 +286,10 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         valid = absolute_column < valid_columns[batch];
     }
     const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    const std::int64_t output_index = gqa_q_index<Geometry>(q_head, d, output_column);
+    const __nv_bfloat16 attention   = __float2bfloat16(value);
+    out[output_index]               = __float2bfloat16_rn(
+        __bfloat162float(attention) * sigmoid(__bfloat162float(gate[output_index])));
     pdl::publish();
 }
 
