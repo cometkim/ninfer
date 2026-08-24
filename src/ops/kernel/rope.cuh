@@ -243,9 +243,11 @@ inline __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
 // norm replicates rmsnorm_warp_bf16x2_kernel<Offset>'s exact arithmetic - lane ownership
 // (pair = lane + k*32), accumulation order, rsqrt input, and epilogue association - and rounds
 // to BF16 in registers, which is the sequential chain's global-memory boundary. The rotation
-// runs through the same fixed_sincos + apply_rope_head path as rope_fixed_kernel<Text1D> over
-// the staged rounded row, so the fused outputs are bit-identical to rmsnorm -> rope.
-template <int QHeads, int KHeads, int Block>
+// runs through the same fixed_sincos + apply_rope_head path as rope_fixed_kernel<Mode> over
+// the staged rounded row, so the fused outputs are bit-identical to rmsnorm -> rope. Mode is
+// Text1D for positions [T] and TextMrope for positions [T,3] (axis = pair % 3), exactly as
+// ops::rope dispatches them.
+template <RopeKernelMode Mode, int QHeads, int KHeads, int Block>
 __launch_bounds__(Block) __global__ void rope_norm_fused_kernel(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat162* q_weight,
     const __nv_bfloat162* k_weight, float eps, const std::int32_t* positions,
@@ -303,10 +305,8 @@ __launch_bounds__(Block) __global__ void rope_norm_fused_kernel(
         __syncwarp();
         if (lane < kHalf / 2) {
             float s0, c0, s1, c1;
-            fixed_sincos<RopeKernelMode::Text1D>(positions, tokens, token, lane * 2, frequencies,
-                                                 &s0, &c0);
-            fixed_sincos<RopeKernelMode::Text1D>(positions, tokens, token, lane * 2 + 1,
-                                                 frequencies, &s1, &c1);
+            fixed_sincos<Mode>(positions, tokens, token, lane * 2, frequencies, &s0, &c0);
+            fixed_sincos<Mode>(positions, tokens, token, lane * 2 + 1, frequencies, &s1, &c1);
             const float scale = is_q ? rope_q_scale(frequencies) : 1.0f;
             apply_rope_head<kHeadDim, kHalf>(reinterpret_cast<__nv_bfloat16*>(stage[warp]), 0, 0,
                                              0, lane, c0 * scale, c1 * scale, s0 * scale,

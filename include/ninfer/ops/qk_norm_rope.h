@@ -19,10 +19,11 @@ namespace ninfer::ops {
  * norm and the rotation is the sequential chain's global-memory boundary, so the fused kernel's
  * outputs are bit-identical to `rmsnorm(q) -> rmsnorm(k) -> rope(qn, kn)` over the same inputs.
  *
- * Registered domain: head_dim 256, rotary_dim 64, Text 1-D positions I32 [T], and the text head
- * geometries (Hq,Hkv) = (24,4) or (16,2); other profiles throw. q/k/q_out/k_out are contiguous
- * BF16 `[256,Hq|Hkv,T]`, weights are contiguous BF16 [256], positions is contiguous sequential
- * I32 [T]. Inputs are read-only; q_out/k_out receive every element of both sides.
+ * Registered domain: head_dim 256, rotary_dim 64, Text positions I32 [T] (1-D) or [T,3]
+ * (MRoPE; pair i uses axis i%3, matching ops::rope's Text modes), and the text head geometries
+ * (Hq,Hkv) = (24,4) or (16,2); other profiles throw. q/k/q_out/k_out are contiguous BF16
+ * `[256,Hq|Hkv,T]`, weights are contiguous BF16 [256], positions is contiguous sequential I32.
+ * Inputs are read-only; q_out/k_out receive every element of both sides.
  */
 void qk_norm_rope(const Tensor& q, const Tensor& k, const Tensor& q_weight,
                   const Tensor& k_weight, float eps, const Tensor& positions,

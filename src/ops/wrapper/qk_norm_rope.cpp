@@ -53,9 +53,11 @@ void qk_norm_rope(const Tensor& q, const Tensor& k, const Tensor& q_weight,
     if (k.ne[2] != tokens || q_out.ne[2] != tokens || k_out.ne[2] != tokens || tokens < 1) {
         throw std::invalid_argument(std::string(op) + ": side token counts must match and be >=1");
     }
-    if (positions.dtype != DType::I32 || positions.ne[0] != tokens || positions.ne[1] != 1 ||
-        !positions.is_contiguous() || positions.data == nullptr) {
-        throw std::invalid_argument(std::string(op) + ": positions must be contiguous I32 [T]");
+    if (positions.dtype != DType::I32 || positions.ne[0] != tokens ||
+        (positions.ne[1] != 1 && positions.ne[1] != 3) || positions.ne[2] != 1 ||
+        positions.ne[3] != 1 || !positions.is_contiguous() || positions.data == nullptr) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": positions must be contiguous I32 [T] or [T,3]");
     }
     if (!std::isfinite(eps) || eps < 0.0f) {
         throw std::invalid_argument(std::string(op) + ": eps must be finite and non-negative");

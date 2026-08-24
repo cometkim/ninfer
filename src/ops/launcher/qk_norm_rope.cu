@@ -22,10 +22,10 @@ void qk_norm_rope_launch(const Tensor& q, const Tensor& k, const Tensor& q_weigh
     const int rows       = static_cast<int>(q.ne[1] + k.ne[1]) * tokens;
     constexpr int kWarps = kBlock / 32;
     const int blocks     = (rows + kWarps - 1) / kWarps;
-    const auto launch    = [&]<int QHeads, int KHeads>() {
+    const auto launch    = [&]<RopeKernelMode Mode, int QHeads, int KHeads>() {
         CUDA_CHECK(pdl::launch_dependent(
             {dim3(static_cast<unsigned>(blocks)), dim3(kBlock), 0, stream},
-            rope_norm_fused_kernel<QHeads, KHeads, kBlock>,
+            rope_norm_fused_kernel<Mode, QHeads, KHeads, kBlock>,
             static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
             static_cast<const __nv_bfloat162*>(q_weight.data),
             static_cast<const __nv_bfloat162*>(k_weight.data), eps,
@@ -33,10 +33,17 @@ void qk_norm_rope_launch(const Tensor& q, const Tensor& k, const Tensor& q_weigh
             static_cast<__nv_bfloat16*>(q_out.data), static_cast<__nv_bfloat16*>(k_out.data),
             tokens));
     };
+    const auto launch_for_geometry = [&]<int QHeads, int KHeads>() {
+        if (positions.ne[1] == 3) {
+            launch.template operator()<RopeKernelMode::TextMrope, QHeads, KHeads>();
+        } else {
+            launch.template operator()<RopeKernelMode::Text1D, QHeads, KHeads>();
+        }
+    };
     if (q.ne[1] == 24 && k.ne[1] == 4) {
-        launch.template operator()<24, 4>();
+        launch_for_geometry.template operator()<24, 4>();
     } else {
-        launch.template operator()<16, 2>();
+        launch_for_geometry.template operator()<16, 2>();
     }
     CUDA_CHECK(cudaGetLastError());
 }
