@@ -536,24 +536,33 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
             const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
             const std::size_t span      = std::min(envelope.max_visible_keys,
                                                   kGqaHqPromptScratchBandKeys);
-            std::size_t scratch         = 2 * span * static_cast<std::size_t>(kv_heads) *
-                                  kHeadDim * sizeof(std::uint16_t);
-            if (span < envelope.max_visible_keys) {
-                // The banded carry state (acc [head_dim, q_heads, width] bf16 + m/l fp32) is
-                // live alongside the scratch inside one prompt call - size the sum.
-                scratch += (2ULL * kHeadDim + 8) * static_cast<std::size_t>(q_heads) *
-                           static_cast<std::size_t>(max_width);
+            const std::size_t span_planes = 2 * span * static_cast<std::size_t>(kv_heads) *
+                                            kHeadDim * sizeof(std::uint16_t);
+            std::size_t scratch           = span_planes;
+            // The key-split partials are live alongside the span-sized scratch inside one
+            // prompt call whenever the call's own envelope fits one band - and a banded
+            // engine envelope is queried once while its runtime chunk envelopes sweep up to
+            // the band top, so both riders must be covered independently of which route the
+            // outer envelope resolves to. Carry and partials are never live together (banded
+            // launches do not split; split launches do not carry), so the max rider suffices.
+            std::size_t partial_max  = 0;
+            const std::int32_t first = std::max(min_width, kMaximumVerifyTokens + 1);
+            for (std::int32_t width = first; width <= max_width; width += 64) {
+                const std::int32_t splits = detail::gqa_prefill_split_count(width, q_heads);
+                if (splits <= 1) { continue; }
+                WorkspaceLayoutBuilder layout;
+                (void)layout.alloc(DType::FP32, {kHeadDim, q_heads, width, splits});
+                (void)layout.alloc(DType::FP32, {q_heads, width, splits});
+                (void)layout.alloc(DType::FP32, {q_heads, width, splits});
+                partial_max = std::max(partial_max, layout.peak_bytes(1));
             }
-            if (span >= envelope.max_visible_keys) {
-                // Single band: the key-split partials are live alongside the scratch inside
-                // one prompt call - size the sum, not the max. S(width) changes only at
-                // 64-token boundaries.
-                std::size_t partial_max  = 0;
-                const std::int32_t first = std::max(min_width, kMaximumVerifyTokens + 1);
-                for (std::int32_t width = first; width <= max_width; width += 64) {
-                    partial_max = std::max(partial_max, exact_capacity(width));
-                }
-                partial_max = std::max(partial_max, exact_capacity(max_width));
+            if (span < envelope.max_visible_keys) {
+                // Banded carry state (acc [head_dim, q_heads, width] bf16 + m/l fp32).
+                const std::size_t carry = (2ULL * kHeadDim + 8) *
+                                          static_cast<std::size_t>(q_heads) *
+                                          static_cast<std::size_t>(max_width);
+                scratch += std::max(carry, partial_max);
+            } else {
                 scratch += partial_max;
             }
             maximum = std::max(maximum, scratch);
