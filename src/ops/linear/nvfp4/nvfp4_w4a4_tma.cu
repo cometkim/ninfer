@@ -56,12 +56,16 @@ static_assert((kGateRows % TmaM256N128::kBlockN) == 0);
 #ifdef _WIN32
 // MSVC cannot pass an alignas(128) struct by value as a kernel parameter (C2719). Keep the
 // descriptor block in a device buffer and hand the kernel a pointer; the TMA unit reads the
-// tensor map from that address. cudaMallocAsync is pool-backed; the free is stream-ordered
-// after the kernel that consumes the block.
+// tensor map from that address. cudaMallocAsync is pool-backed; BOTH the allocation and the
+// free are ordered on the consuming compute stream - a NULL-stream free is ordered against
+// nothing when the compute stream is cudaStreamNonBlocking, and the pool can recycle the
+// block while the GEMM's TMA unit is still reading the tensor map (a half-overwritten map
+// deadlocks the kernel's mbarrier transaction wait - the 786432 prefill live-lock).
 struct Nvfp4TmaDescriptorBlock {
     Nvfp4W4a4TmaDescriptors* device = nullptr;
+    cudaStream_t stream             = nullptr;
 
-    explicit Nvfp4TmaDescriptorBlock(cudaStream_t stream) {
+    explicit Nvfp4TmaDescriptorBlock(cudaStream_t allocation_stream) : stream(allocation_stream) {
         CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&device),
                                    sizeof(Nvfp4W4a4TmaDescriptors), stream));
     }
@@ -71,7 +75,7 @@ struct Nvfp4TmaDescriptorBlock {
 
     ~Nvfp4TmaDescriptorBlock() {
         if (device == nullptr) { return; }
-        CUDA_CHECK(cudaFreeAsync(device, nullptr));
+        CUDA_CHECK(cudaFreeAsync(device, stream));
     }
 };
 #endif
