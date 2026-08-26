@@ -73,6 +73,10 @@ def tensor_spec(
 
 
 def _input_scale_divisor_name(matrix_name: str) -> str | None:
+    if matrix_name.startswith("dflash2/"):
+        # The drafter runs A16: its NVFP4 parents are weight-only and carry
+        # no input-divisor sites.
+        return None
     prefix, suffix = matrix_name.rsplit("/", 1)
     if suffix == "query_key_gate_value" and prefix.endswith("/attention"):
         return prefix + "/input_projection/input_scale_divisor"
@@ -166,9 +170,11 @@ DFLASH2_LAYERS = tuple(range(5))
 
 
 def _build_dflash2_specs() -> tuple[TensorSpec, ...]:
-    """The DFlash2 block-diffusion drafter module (all BF16, one complete image)."""
+    """The DFlash2 block-diffusion drafter module of the complete image: matrices in
+    NVFP4 (weight-only - the drafter runs A16, so the module carries no input-divisor
+    sites), norms and conv base kernels in BF16."""
     specs: list[TensorSpec] = [
-        tensor_spec("dflash2/feature_projection", (5120, 25600), BF16),
+        tensor_spec("dflash2/feature_projection", (5120, 25600), NVFP4),
         tensor_spec("dflash2/context_norm", (5120,), BF16),
     ]
     for layer in DFLASH2_LAYERS:
@@ -176,25 +182,25 @@ def _build_dflash2_specs() -> tuple[TensorSpec, ...]:
         specs.extend(
             (
                 tensor_spec(prefix + "input_norm", (5120,), BF16),
-                tensor_spec(prefix + "attention/query_key_value", (6144, 5120), BF16),
+                tensor_spec(prefix + "attention/query_key_value", (6144, 5120), NVFP4),
                 tensor_spec(prefix + "attention/query_norm", (128,), BF16),
                 tensor_spec(prefix + "attention/key_norm", (128,), BF16),
-                tensor_spec(prefix + "attention/output", (5120, 4096), BF16),
+                tensor_spec(prefix + "attention/output", (5120, 4096), NVFP4),
                 tensor_spec(prefix + "attention/conv_base", (2, 2, 5120), BF16),
-                tensor_spec(prefix + "attention/conv_proj", (1280, 5120), BF16),
+                tensor_spec(prefix + "attention/conv_proj", (1280, 5120), NVFP4),
                 tensor_spec(prefix + "post_attention_norm", (5120,), BF16),
-                tensor_spec(prefix + "mlp/gate_up", (34816, 5120), BF16),
-                tensor_spec(prefix + "mlp/down", (5120, 17408), BF16),
+                tensor_spec(prefix + "mlp/gate_up", (34816, 5120), NVFP4),
+                tensor_spec(prefix + "mlp/down", (5120, 17408), NVFP4),
                 tensor_spec(prefix + "mlp/conv_base", (2, 2, 5120), BF16),
-                tensor_spec(prefix + "mlp/conv_proj", (1280, 5120), BF16),
+                tensor_spec(prefix + "mlp/conv_proj", (1280, 5120), NVFP4),
             )
         )
     specs.extend(
         (
             tensor_spec("dflash2/final_norm", (5120,), BF16),
-            tensor_spec("dflash2/selector/hidden", (256, 5120), BF16),
-            tensor_spec("dflash2/selector/predecessor", (248320, 256), BF16),
-            tensor_spec("dflash2/selector/successor", (248320, 256), BF16),
+            tensor_spec("dflash2/selector/hidden", (256, 5120), NVFP4),
+            tensor_spec("dflash2/selector/predecessor", (248320, 256), NVFP4),
+            tensor_spec("dflash2/selector/successor", (248320, 256), NVFP4),
         )
     )
     return tuple(specs)
@@ -403,7 +409,10 @@ SOURCE_NVFP4_WEIGHT_SPECS = tuple(
     and spec.name.endswith(("/mlp/gate_up", "/mlp/down"))
 )
 LOCAL_NVFP4_WEIGHT_SPECS = tuple(
-    spec for spec in NVFP4_TENSOR_SPECS if spec not in SOURCE_NVFP4_WEIGHT_SPECS
+    spec
+    for spec in NVFP4_TENSOR_SPECS
+    if spec not in SOURCE_NVFP4_WEIGHT_SPECS
+    and not spec.name.startswith("dflash2/")
 )
 BF16_EXCEPTION_SPECS = tuple(
     spec
@@ -435,32 +444,37 @@ def validate_inventory() -> None:
         len(INPUT_SCALE_DIVISOR_SPECS),
         len(SOURCE_NVFP4_WEIGHT_SPECS),
         len(LOCAL_NVFP4_WEIGHT_SPECS),
-    ) != (906, 2, 12, 333, 66, 1319, 1325, 247, 247, 112, 135):
+    ) != (906, 2, 12, 333, 66, 1319, 1325, 281, 247, 112, 135):
         raise ValueError("Qwen3.8 nvfp4full inventory is incomplete")
     if FORMAT_COUNTS != {
-        BF16: 609,
+        BF16: 575,
         FP32: 343,
         I32: 1,
         Q4: 55,
         Q5: 54,
         Q6: 1,
         W8: 9,
-        NVFP4: 247,
+        NVFP4: 281,
     }:
         raise ValueError(f"unexpected numeric allocation: {FORMAT_COUNTS}")
     if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 953,
+        CONTIGUOUS_LAYOUT: 919,
         ROW_SPLIT_LAYOUT: 119,
-        BLOCK_SCALE_LAYOUT: 247,
+        BLOCK_SCALE_LAYOUT: 281,
     }:
         raise ValueError(f"unexpected layout allocation: {LAYOUT_COUNTS}")
     for spec in NVFP4_TENSOR_SPECS:
+        if spec.name.startswith("dflash2/"):
+            # weight-only drafter parents: no activation quantization sites
+            continue
         scalar = _input_scale_divisor_name(spec.name)
         if scalar is None:
             raise ValueError(f"NVFP4 parent {spec.name} has no divisor site name")
     divisor_names = {spec.name for spec in INPUT_SCALE_DIVISOR_SPECS}
     expected = {
-        _input_scale_divisor_name(spec.name) for spec in NVFP4_TENSOR_SPECS
+        _input_scale_divisor_name(spec.name)
+        for spec in NVFP4_TENSOR_SPECS
+        if not spec.name.startswith("dflash2/")
     }
     if divisor_names != expected:
         raise ValueError("NVFP4 divisor sites do not cover the NVFP4 parents")

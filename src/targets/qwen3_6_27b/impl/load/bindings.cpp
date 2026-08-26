@@ -567,35 +567,44 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     const artifact::TensorPlacement dflash2_placement =
         features.dflash2() ? artifact::TensorPlacement::Device
                            : artifact::TensorPlacement::ValidateOnly;
-    const auto bind_dflash2 = [&](std::string_view name, std::initializer_list<std::uint64_t> shape) {
-        return artifact::bind_tensor(binder, name, NumericFormat::BF16, shape, dflash2_placement);
+    const auto bind_dflash2 = [&](std::string_view name, NumericFormat format,
+                                  std::initializer_list<std::uint64_t> shape) {
+        return artifact::bind_tensor(binder, name, format, shape, dflash2_placement);
+    };
+    const auto dflash2_matrix = [&](std::string_view name,
+                                  std::initializer_list<std::uint64_t> shape) {
+        return bind_dflash2(name, NumericFormat::NVFP4, shape);
+    };
+    const auto dflash2_small = [&](std::string_view name,
+                                  std::initializer_list<std::uint64_t> shape) {
+        return bind_dflash2(name, NumericFormat::BF16, shape);
     };
     out.dflash2.feature_projection =
-        bind_dflash2("dflash2/feature_projection", {5120, 25600});
-    out.dflash2.context_norm = bind_dflash2("dflash2/context_norm", {5120});
+        dflash2_matrix("dflash2/feature_projection", {5120, 25600});
+    out.dflash2.context_norm = dflash2_small("dflash2/context_norm", {5120});
     for (std::size_t layer = 0; layer < out.dflash2.layers.size(); ++layer) {
         auto& target           = out.dflash2.layers[layer];
         const std::string prefix = "dflash2/layers/" + std::to_string(layer) + "/";
-        target.input_norm        = bind_dflash2(prefix + "input_norm", {5120});
+        target.input_norm        = dflash2_small(prefix + "input_norm", {5120});
         target.query_key_value =
-            bind_dflash2(prefix + "attention/query_key_value", {6144, 5120});
-        target.query_norm = bind_dflash2(prefix + "attention/query_norm", {128});
-        target.key_norm   = bind_dflash2(prefix + "attention/key_norm", {128});
+            dflash2_matrix(prefix + "attention/query_key_value", {6144, 5120});
+        target.query_norm = dflash2_small(prefix + "attention/query_norm", {128});
+        target.key_norm   = dflash2_small(prefix + "attention/key_norm", {128});
         target.attention_output =
-            bind_dflash2(prefix + "attention/output", {5120, 4096});
-        target.attention_conv.base = bind_dflash2(prefix + "attention/conv_base", {2, 2, 5120});
+            dflash2_matrix(prefix + "attention/output", {5120, 4096});
+        target.attention_conv.base = dflash2_small(prefix + "attention/conv_base", {2, 2, 5120});
         target.attention_conv.projection =
-            bind_dflash2(prefix + "attention/conv_proj", {1280, 5120});
-        target.post_attention_norm = bind_dflash2(prefix + "post_attention_norm", {5120});
-        target.gate_up = bind_dflash2(prefix + "mlp/gate_up", {34816, 5120});
-        target.down    = bind_dflash2(prefix + "mlp/down", {5120, 17408});
-        target.mlp_conv.base       = bind_dflash2(prefix + "mlp/conv_base", {2, 2, 5120});
-        target.mlp_conv.projection = bind_dflash2(prefix + "mlp/conv_proj", {1280, 5120});
+            dflash2_matrix(prefix + "attention/conv_proj", {1280, 5120});
+        target.post_attention_norm = dflash2_small(prefix + "post_attention_norm", {5120});
+        target.gate_up = dflash2_matrix(prefix + "mlp/gate_up", {34816, 5120});
+        target.down    = dflash2_matrix(prefix + "mlp/down", {5120, 17408});
+        target.mlp_conv.base       = dflash2_small(prefix + "mlp/conv_base", {2, 2, 5120});
+        target.mlp_conv.projection = dflash2_matrix(prefix + "mlp/conv_proj", {1280, 5120});
     }
-    out.dflash2.final_norm           = bind_dflash2("dflash2/final_norm", {5120});
-    out.dflash2.selector_hidden      = bind_dflash2("dflash2/selector/hidden", {256, 5120});
-    out.dflash2.selector_predecessor = bind_dflash2("dflash2/selector/predecessor", {248320, 256});
-    out.dflash2.selector_successor   = bind_dflash2("dflash2/selector/successor", {248320, 256});
+    out.dflash2.final_norm           = dflash2_small("dflash2/final_norm", {5120});
+    out.dflash2.selector_hidden      = dflash2_matrix("dflash2/selector/hidden", {256, 5120});
+    out.dflash2.selector_predecessor = dflash2_matrix("dflash2/selector/predecessor", {248320, 256});
+    out.dflash2.selector_successor   = dflash2_matrix("dflash2/selector/successor", {248320, 256});
     }
 
     load_plan.materialization = binder.finish();

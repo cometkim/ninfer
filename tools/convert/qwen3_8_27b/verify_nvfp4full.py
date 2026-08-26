@@ -284,8 +284,10 @@ def _verify_bf16_exception_matrices(
 
 
 def _verify_dflash2_module(artifact: Artifact, dflash2_dir: Path) -> None:
-    """Every module tensor must equal its fused/direct BF16 source bytes."""
+    """Module tensors vs source: BF16 smalls word-exact; NVFP4 parents
+    code-exact against a reference re-encode of the same source tensor."""
     from tools.convert.common.safetensors import ShardReader as _Reader
+    from tools.convert.qwen3_8_27b import nvfp4_encode
 
     with _Reader.from_file(dflash2_dir / "model.safetensors") as reader:
         for selected in recipe.DFLASH2_RECIPES:
@@ -293,9 +295,18 @@ def _verify_dflash2_module(artifact: Artifact, dflash2_dir: Path) -> None:
             if not isinstance(obj, TensorObject):
                 _error(f"{selected.object_name}: expected tensor")
             expected = convert.family_recipe_materialize(selected, reader)
-            stored = decode_direct(artifact.payload(obj), obj.format, obj.shape)
-            if not torch.equal(stored.view(torch.int16), expected.view(torch.int16)):
-                _error(f"{obj.name}: BF16 words differ from the DFlash2 source")
+            if obj.format == "NVFP4":
+                reference = nvfp4_encode.encode_nvfp4_parent(
+                    expected, device="cuda"
+                )
+                if artifact.payload(obj) != reference:
+                    _error(f"{obj.name}: NVFP4 words differ from a reference re-encode")
+            else:
+                stored = decode_direct(artifact.payload(obj), obj.format, obj.shape)
+                if not torch.equal(
+                    stored.view(torch.int16), expected.view(torch.int16)
+                ):
+                    _error(f"{obj.name}: BF16 words differ from the DFlash2 source")
 
 
 def verify_artifact(

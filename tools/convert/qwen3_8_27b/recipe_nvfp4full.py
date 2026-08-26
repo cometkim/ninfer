@@ -489,7 +489,12 @@ def validate_recipe() -> None:
     ) != (112, 135, 112, 135, 9, 56, 168, 401):
         raise ValueError("Qwen3.8 nvfp4full source recipe is incomplete")
 
-    inventory_nvfp4_names = {spec.name for spec in inventory.NVFP4_TENSOR_SPECS}
+    inventory_nvfp4_names = {
+        spec.name
+        for spec in inventory.NVFP4_TENSOR_SPECS
+        if not spec.name.startswith("dflash2/")
+    }
+    # The dflash2 module matrices are their own (weight-only) route.
     if set(SOURCE_NVFP4_WEIGHTS_BY_NAME) | set(LOCAL_NVFP4_WEIGHTS_BY_NAME) != inventory_nvfp4_names:
         raise ValueError("NVFP4 weight routes do not cover the NVFP4 parents")
     if set(SOURCE_NVFP4_WEIGHTS_BY_NAME) & set(LOCAL_NVFP4_WEIGHTS_BY_NAME):

@@ -39,7 +39,7 @@ from . import nvfp4_encode
 from . import recipe_nvfp4full as recipe
 
 
-RECIPE_ID = "qwen3_8_27b_nvfp4full-v1"
+RECIPE_ID = "qwen3_8_27b_nvfp4full-v2"
 OUTPUT_BASENAME = "qwen3_8_27b_nvfp4full.ninfer"
 
 
@@ -453,7 +453,28 @@ def convert(
                     tensor = family_recipe_materialize(
                         recipe.DFLASH2_RECIPES_BY_NAME[spec.name], dflash2_reader
                     )
-                    payload = encode_direct(tensor, spec.format)
+                    if spec.format == inventory.NVFP4:
+                        # Weight-only drafter parents: the fork's NVFP4 encoder,
+                        # no activation calibration (the drafter runs A16).
+                        payload = nvfp4_encode.encode_nvfp4_parent(
+                            tensor, device=resolved_device
+                        )
+                        quantization_report["parents"][spec.name] = {
+                            "weight_scale_divisor": None,
+                            "relative_frobenius_error": (
+                                nvfp4_encode.relative_frobenius_error(
+                                    tensor,
+                                    nvfp4_encode.dequantize_nvfp4(
+                                        nvfp4_encode.quantize_nvfp4(
+                                            tensor, device=resolved_device
+                                        ),
+                                        device=resolved_device,
+                                    ),
+                                )
+                            ),
+                        }
+                    else:
+                        payload = encode_direct(tensor, spec.format)
                     del tensor
                 else:
                     payload = _materialize_official(

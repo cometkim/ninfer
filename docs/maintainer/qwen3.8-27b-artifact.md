@@ -767,7 +767,7 @@ filename   = qwen3_8_27b_nvfp4full.ninfer
 model_id   = qwen3.8-27b
 weights_id = nvfp4full
 target_key = qwen3_8_27b
-recipe_id  = qwen3_8_27b_nvfp4full-v1
+recipe_id  = qwen3_8_27b_nvfp4full-v2
 converter  = tools.convert.qwen3_8_27b.convert_nvfp4full
 ```
 
@@ -788,22 +788,22 @@ This yields 247 NVFP4 parents, 247 site-level FP32 input divisors, and nine BF16
 
 | Format | Tensors |
 |---|---:|
-| `BF16` | 609 |
+| `BF16` | 575 |
 | `FP32` | 343 |
 | `I32` | 1 |
 | `Q4G64_F16S` | 55 |
 | `Q5G64_F16S` | 54 |
 | `Q6G64_F16S` | 1 |
 | `W8G32_F16S` | 9 |
-| `NVFP4` | 247 |
+| `NVFP4` | 281 |
 
 | Layout | Tensors |
 |---|---:|
-| `contiguous-le-v1` | 953 |
+| `contiguous-le-v1` | 919 |
 | `row-split-k128-v1` | 119 |
-| `blockscale-k16-m128x4-v1` | 247 |
+| `blockscale-k16-m128x4-v1` | 281 |
 
-The generated file is 22,172,880,896 bytes (20.65 GiB) including the 3.85 GiB DFlash2 module.
+The generated file is 19,406,942,468 bytes (18.07 GiB) including the ~1.3 GiB NVFP4 DFlash2 module.
 
 ### 14.2 Sources and provenance
 
@@ -907,7 +907,7 @@ define a second artifact or an optional profile; module-less `nvfp4full` files a
 | candidate selector | rank 256, top-k 16; per-token `predecessor`/`successor` codebooks `[248320, 256]` |
 | rope | own unscaled table, base 1e7, max position 262144 |
 | mask token id | 248070 |
-| numeric format | BF16 for every module tensor (no quantization; the adopted BF16-drafter plan) |
+| numeric format | matrices NVFP4 (`NVFP4_MAXABS_DIVISOR_RNE_V1`, weight-only — the drafter runs A16, so no input-divisor sites); norms and conv base kernels BF16 (34 NVFP4 + 32 BF16 tensors) |
 
 **Position contract.** The drafter's rope table is its own unscaled base-1e7 table consumed at
 sliding-window-local positions; target YaRN scaling applies to Text and MTP sites only and never
