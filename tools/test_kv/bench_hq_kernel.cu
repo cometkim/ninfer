@@ -1006,7 +1006,7 @@ int main() {
             cudaMemcpy(d_posa, &last, 4, cudaMemcpyHostToDevice);
             GqaAppendInput input{d_knew, d_vnew};
             const GqaTcKVHq hq_cache{d_cka, d_cva, d_mka, d_mva};
-            gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaAppendInput, GqaTcKVHq>
+            gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 8, 4, true, true, GqaAppendInput, GqaTcKVHq>
                 <<<dim3(4, 32, 1), kGqaHqDecodeThreads>>>(
                     d_q1, input, d_posa, hq_cache, d_table, nullptr, nullptr, 32, 1, 1, 0, window,
                     0.0625f, d_pacc, d_pm, d_pl);
@@ -1025,7 +1025,7 @@ int main() {
             cudaEventCreate(&b4);
             cudaEventRecord(a4);
             for (int rep = 0; rep < 8; ++rep) {
-                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaAppendInput, GqaTcKVHq>
+                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 8, 4, true, true, GqaAppendInput, GqaTcKVHq>
                     <<<dim3(4, 32, 1), kGqaHqDecodeThreads>>>(
                         d_q1, input, d_posa, hq_cache, d_table, nullptr, nullptr, 32, 1, 1, 0,
                         window, 0.0625f, d_pacc, d_pm, d_pl);
@@ -1064,14 +1064,14 @@ int main() {
             cudaEventCreate(&b2);
             cudaGetLastError();
             // Warm-up (cold launch measures setup, not steady state).
-            gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaCachedInput, GqaTcKVHq>
+            gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 8, 4, true, true, GqaCachedInput, GqaTcKVHq>
                 <<<dim3(4, gridsplit, 1), kGqaHqDecodeThreads>>>(
                     d_out, no_append, d_pos2, hq_cache, d_table, nullptr, nullptr, kRows / 64,
                     1, window, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
             cudaDeviceSynchronize();
             cudaEventRecord(a2);
             for (int rep = 0; rep < 8; ++rep) {
-                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaCachedInput, GqaTcKVHq>
+                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 8, 4, true, true, GqaCachedInput, GqaTcKVHq>
                     <<<dim3(4, gridsplit, 1), kGqaHqDecodeThreads>>>(
                         d_out, no_append, d_pos2, hq_cache, d_table, nullptr, nullptr,
                         kRows / 64, 1, window, 0, window, 0.0625f, d_pacc, d_pm, d_pl);
@@ -1092,7 +1092,7 @@ int main() {
         int blocks_per_sm = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks_per_sm,
-            gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaCachedInput, GqaTcKVHq>, kGqaHqDecodeThreads, 0);
+            gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 8, 4, true, true, GqaCachedInput, GqaTcKVHq>, kGqaHqDecodeThreads, 0);
         std::printf("phase-bench occupancy: %d blocks/SM\n", blocks_per_sm);
 
         std::int32_t* d_pos3;

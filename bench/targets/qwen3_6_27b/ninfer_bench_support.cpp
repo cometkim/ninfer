@@ -272,7 +272,7 @@ std::string usage_text(std::string_view program) {
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
         << "  --kv-dtype <bf16|int8>      KV cache storage (default: bf16)\n"
-        << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
+        << "  --mtp-draft-tokens <0..7>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"

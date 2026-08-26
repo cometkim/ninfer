@@ -25,9 +25,12 @@ void gqa_small_t_partial_hq(const Tensor& q, CacheInput input, const Tensor& pos
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     // Static shared memory only (~36.6 KB: qkv tile 32 KB + P 4 KB + page ids +
     // RHT signs); no dynamic-smem opt-in attribute is needed.
+    // TokenTile=8: the hq route's single runtime-width instantiation covers every
+    // decode/verify width 1..8, so a width-8 block verify (draft 7 + bonus) is one
+    // pass; GroupSize 6 (27B: 48 rows) and 8 (35B: 64 rows = Br) both fit the row tile.
     CUDA_CHECK(pdl::launch_dependent(
         {grid, dim3(kGqaHqDecodeThreads), 0, stream},
-        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 6, 4, true, true, CacheInput,
+        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 8, 4, true, true, CacheInput,
                                                     GqaTcKVHq>,
         static_cast<const __nv_bfloat16*>(q.data), input,
             static_cast<const std::int32_t*>(pos.data),

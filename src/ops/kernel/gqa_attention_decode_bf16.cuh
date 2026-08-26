@@ -39,7 +39,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     pdl::sync();
-    static_assert(TokenTile >= 1 && TokenTile <= 6);
+    static_assert(TokenTile >= 1 && TokenTile <= 8);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
     static_assert(KvSource::hq == KvSource::rotated, "hq tiles only exist in the rotated frame");
     static_assert(!KvSource::rotated || kHqHeadDim == kGqaHeadDim);

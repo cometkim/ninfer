@@ -241,6 +241,14 @@ int main() {
         {"M residual bit=90",   1, 1,  1, 0, 200,  -1, false, false, -1, true,  90},
         // Two slots with swapped table rows: each batch reads its own plane.
         {"N residual b=2",      2, 1,  1, 0, 150,  -1, false, false, -1, true,  -1},
+        // Width-8 tile (TokenTile=8): the single-pass block-verify widths.
+        // Width 7 and 8 cached, width 8 with the fused append (16 encode units
+        // over 8 warps — two full scratch-reuse rounds), and width 8 across
+        // two batches with disjoint tables.
+        {"O tokens=7 b=1",      1, 7,  7, 0, 200,  -1, false, false, -1, false, -1},
+        {"P tokens=8 b=1",      1, 8,  8, 0, 200,  -1, false, false, -1, false, -1},
+        {"Q append w8",         1, 8,  8, 0, 100,  -1, true,  false, -1, false, -1},
+        {"R tokens=8 b=2",      2, 8,  8, 0, 150,  -1, false, false, -1, false, -1},
     };
 
     for (const auto& sc : scenarios) {
@@ -415,14 +423,14 @@ int main() {
         const auto launch = [&]() {
             if (sc.append) {
                 GqaAppendInput input{d_knew, d_vnew};
-                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaAppendInput, GqaTcKVHq>
+                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 8, 4, true, true, GqaAppendInput, GqaTcKVHq>
                     <<<grid, kGqaHqDecodeThreads, 0>>>(
                         d_q, input, d_pos, hq_cache, d_table, d_vc, d_trows, sc.window + 1,
                         sc.width, sc.full_width, sc.column_begin,
                         sc.capacity >= 0 ? sc.capacity : sc.window, kScale, d_pacc, d_pm, d_pl);
             } else {
                 GqaCachedInput no_append{};
-                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 6, 4, true, true, GqaCachedInput, GqaTcKVHq>
+                gqa_attention_small_t_tc_partial_bf16_kernel<Gqa27Geometry, 8, 4, true, true, GqaCachedInput, GqaTcKVHq>
                     <<<grid, kGqaHqDecodeThreads, 0>>>(
                         d_q, no_append, d_pos, hq_cache, d_table, d_vc, d_trows, sc.window + 1,
                         sc.width, sc.full_width, sc.column_begin,

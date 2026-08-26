@@ -10,12 +10,12 @@
 // batch/column offsets are the TC kernel's own contracts.
 //
 // Deliberately ONE runtime-width instantiation per (Geometry, CacheInput):
-// TokenTile=6 covers every decode/verify width 1..6 (the phased loops are
+// TokenTile=8 covers every decode/verify width 1..8 (the phased loops are
 // width-agnostic), MultiBatch=true is exact for batch_size 1 (batch 0 offsets
 // vanish), and Masked=true reads valid_columns=nullptr as unmasked. The
 // codec-heavy instantiation keeps the CUDA front-end's memory footprint
 // bounded; per-geometry TUs compile in parallel. Launch sites instantiate
-// gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 6, 4, true, true,
+// gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, 8, 4, true, true,
 // CacheInput, GqaTcKVHq> with kGqaHqDecodeThreads threads and no dynamic smem.
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
 #include "ops/kernel/gqa_attention_prefill_hq.cuh"

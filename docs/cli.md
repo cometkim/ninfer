@@ -143,7 +143,7 @@ measured recommendation rather than a semantic limit.
 | `--kv-dtype bf16\|int8\|hq-e8-2b` | KV-cache storage | `bf16` |
 | `--rope-scaling none\|yarn:F[,t=c][,bf=n][,bs=n]` | text RoPE position scaling; `yarn:2`/`yarn:4` select YaRN with that factor (HF/vLLM semantics). Optional fields: `t` the attention temperature coefficient (attention factor = `t·ln F + 1`, default 0.1), `bf`/`bs` the ramp bounds beta_fast/beta_slow (defaults 32/1) | `none` |
 | `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--draft-tokens N` | MTP `1..7`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |

@@ -88,7 +88,7 @@ struct DFlashConfig {
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
-inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 7;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
 // Engine envelope ceiling. The checkpoint's trained position capacity stays 262144; contexts
 // past it require YaRN rope scaling, and only the U8 (hq-e8-2b) KV cache can hold a window
