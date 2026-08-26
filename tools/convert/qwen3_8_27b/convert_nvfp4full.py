@@ -45,6 +45,9 @@ OUTPUT_BASENAME = "qwen3_8_27b_nvfp4full.ninfer"
 
 @dataclass(frozen=True, slots=True)
 class ConversionPreflight:
+    dflash2_dir: Path | None
+    dflash2_summary: dict[str, object] | None
+    dflash2_source: object | None
     base_dir: Path
     quantized_dir: Path
     calibration_path: Path
@@ -90,14 +93,88 @@ def build_object_plan(
     return family_conversion.build_object_plan(inventory.OBJECT_SPECS, resources)
 
 
+DFLASH2_REQUIRED = True
+
+_DFLASH2_FLAT_MEMBERS = {
+    "architectures": ["DFlash2DraftModel"],
+    "hidden_size": 5120,
+    "intermediate_size": 17408,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "num_hidden_layers": 5,
+    "num_target_layers": 64,
+    "sliding_window": 2048,
+    "max_position_embeddings": 262144,
+    "is_causal": False,
+    "vocab_size": 248320,
+    "rms_norm_eps": 1e-06,
+    "layer_types": ["sliding_attention"] * 5,
+}
+
+_DFLASH2_NESTED_MEMBERS = {
+    "dflash_config": {
+        "block_size": 8,
+        "conv_kernel_size": 2,
+        "conv_group_size": 16,
+        "selector_rank": 256,
+        "selector_top_k": 16,
+        "mask_token_id": 248070,
+        "target_layer_ids": [5, 19, 33, 47, 61],
+    },
+    "rope_parameters": {"rope_theta": 10000000.0, "rope_type": "default"},
+}
+
+
+def validate_dflash2_config(config: Mapping[str, object]) -> dict[str, object]:
+    summary: dict[str, object] = {}
+    for member, expected in _DFLASH2_FLAT_MEMBERS.items():
+        actual = config.get(member)
+        if actual != expected:
+            raise ValueError(
+                f"DFlash2 config.{member} = {actual!r} != registered {expected!r}"
+            )
+        summary[member] = actual
+    for section, members in _DFLASH2_NESTED_MEMBERS.items():
+        nested = config.get(section)
+        if not isinstance(nested, Mapping):
+            raise ValueError(f"DFlash2 config.{section} must be a mapping")
+        for member, expected in members.items():
+            actual = nested.get(member)
+            if actual != expected:
+                raise ValueError(
+                    f"DFlash2 config.{section}.{member} = {actual!r} "
+                    f"!= registered {expected!r}"
+                )
+            summary[f"{section}.{member}"] = actual
+    return summary
+
+
 def preflight_conversion(
     base_dir: str | Path,
     quantized_dir: str | Path,
     calibration_path: str | Path,
+    dflash2_dir: str | Path | None = None,
 ) -> ConversionPreflight:
     base = Path(base_dir)
     quantized = Path(quantized_dir)
     calibration = Path(calibration_path)
+    dflash2 = Path(dflash2_dir) if dflash2_dir is not None else None
+    dflash2_summary: dict[str, object] | None = None
+    dflash2_source = None
+    if dflash2 is not None:
+        dflash2_summary = validate_dflash2_config(
+            family_conversion.load_json(dflash2 / "config.json")
+        )
+        from tools.convert.qwen3_6.common import recipe as family_recipe
+
+        with ShardReader.from_file(dflash2 / "model.safetensors") as dflash2_reader:
+            dflash2_source = family_recipe.preflight_source_reader(
+                dflash2_reader, recipe.DFLASH2_RECIPES
+            )
+    elif DFLASH2_REQUIRED:
+        raise ValueError("this recipe requires --dflash2-model (the module is part "
+                         "of the complete product image)")
     _validate_index(base)
     _validate_index(quantized)
 
@@ -134,6 +211,9 @@ def preflight_conversion(
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, base)
     return ConversionPreflight(
+        dflash2_dir=dflash2,
+        dflash2_summary=dflash2_summary,
+        dflash2_source=dflash2_source,
         base_dir=base,
         quantized_dir=quantized,
         calibration_path=calibration,
@@ -286,8 +366,14 @@ def convert(
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
+    dflash2_dir: str | Path | None = None,
 ) -> Path:
-    """Run the closed three-source conversion and return its report path."""
+    """Run the closed three-source conversion and return its report path.
+
+    The DFlash2 drafter module is a required member of the complete product
+    image; `dflash2_dir` points at the incoai BF16 drafter checkpoint and is
+    mandatory for this recipe.
+    """
 
     started = time.perf_counter()
     output = Path(out_path)
@@ -297,7 +383,7 @@ def convert(
         )
     requested_device = str(device)
     resolved_device = pick_device(device)
-    preflight = preflight_conversion(base_dir, quantized_dir, calibration_path)
+    preflight = preflight_conversion(base_dir, quantized_dir, calibration_path, dflash2_dir)
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
@@ -314,9 +400,18 @@ def convert(
         "encoder_profile": recipe.LOCAL_ENCODER_PROFILE,
         "parents": {},
     }
-    with ShardReader(preflight.base_dir) as base_reader, ShardReader(
-        preflight.quantized_dir
-    ) as quantized_reader:
+    from contextlib import ExitStack
+
+    with ExitStack() as sources:
+        base_reader = sources.enter_context(ShardReader(preflight.base_dir))
+        quantized_reader = sources.enter_context(ShardReader(preflight.quantized_dir))
+        dflash2_reader = (
+            sources.enter_context(
+                ShardReader.from_file(preflight.dflash2_dir / "model.safetensors")
+            )
+            if preflight.dflash2_dir is not None
+            else None
+        )
         with ArtifactWriter(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
@@ -352,6 +447,14 @@ def convert(
                     payload = _encode_bf16_exception(spec, base_reader)
                 elif spec.name in recipe.BASE_DIRECT_BY_NAME:
                     payload = _materialize_base_direct(spec, base_reader)
+                elif spec.name in recipe.DFLASH2_RECIPES_BY_NAME:
+                    if dflash2_reader is None:
+                        raise RuntimeError("dflash2 spec reached without a source reader")
+                    tensor = family_recipe_materialize(
+                        recipe.DFLASH2_RECIPES_BY_NAME[spec.name], dflash2_reader
+                    )
+                    payload = encode_direct(tensor, spec.format)
+                    del tensor
                 else:
                     payload = _materialize_official(
                         spec, base_reader, derived, resolved_device
@@ -407,6 +510,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--quantized-model", required=True, type=Path)
     parser.add_argument("--calibration", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--dflash2-model", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     arguments = parser.parse_args(argv)
     convert(
@@ -415,6 +519,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         arguments.calibration,
         arguments.out,
         device=arguments.device,
+        dflash2_dir=arguments.dflash2_model,
     )
 
 

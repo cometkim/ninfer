@@ -591,6 +591,9 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         if (options.speculative.backend == SpeculativeBackend::DFlash) {
             throw std::invalid_argument("DFlash does not support rope scaling");
         }
+        // DFlash2 keeps its own unscaled rope table at SWA-local positions; target
+        // YaRN applies to Text/MTP only. No scaling reject exists for DFlash2.
+
         if (!(options.rope_scaling_temperature > 0.0F) ||
             !std::isfinite(options.rope_scaling_temperature)) {
             throw std::invalid_argument("rope_scaling_temperature must be positive and finite");
@@ -613,7 +616,7 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     case SpeculativeBackend::Mtp:
         if (options.speculative.draft_tokens == 0 ||
             options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
-            throw std::invalid_argument("MTP draft window must be in [1,5]");
+            throw std::invalid_argument("MTP draft window must be in [1,7]");
         }
         break;
     case SpeculativeBackend::DFlash:
@@ -628,6 +631,17 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
             throw std::invalid_argument("DFlash and Vision cannot be enabled together");
         }
         break;
+    case SpeculativeBackend::DFlash2:
+        if (options.speculative.draft_tokens == 0 ||
+            options.speculative.draft_tokens > kMaximumDFlash2DraftTokens) {
+            throw std::invalid_argument("DFlash2 draft window must be in [1,7]");
+        }
+        // The artifact module, binder rows, and config facts are landed; the draft
+        // kernels and schedule integration are the next port items. This gate is
+        // the single explicit seam and is removed with them.
+        throw std::invalid_argument(
+            "DFlash2 execution is not yet enabled: the draft kernels land with the "
+            "DFlash2 port's kernel work items");
     }
     if (device.sm() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");

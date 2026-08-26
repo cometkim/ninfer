@@ -1,4 +1,4 @@
-"""Verify the fuller Qwen3.8-27B NVFP4 artifact against its three source roles."""
+"""Verify the fuller Qwen3.8-27B NVFP4 artifact against its four source roles."""
 
 from __future__ import annotations
 
@@ -52,6 +52,7 @@ class VerificationSummary:
     local_nvfp4_weights: int
     local_nvfp4_max_relative_error: float
     bf16_exception_matrices: int
+    dflash2_tensors: int
     input_divisors_source: int
     input_divisors_local: int
     payload_bytes: int
@@ -282,20 +283,38 @@ def _verify_bf16_exception_matrices(
             _error(f"{obj.name}: BF16 words differ from base source")
 
 
+def _verify_dflash2_module(artifact: Artifact, dflash2_dir: Path) -> None:
+    """Every module tensor must equal its fused/direct BF16 source bytes."""
+    from tools.convert.common.safetensors import ShardReader as _Reader
+
+    with _Reader.from_file(dflash2_dir / "model.safetensors") as reader:
+        for selected in recipe.DFLASH2_RECIPES:
+            obj = artifact.find(selected.object_name)
+            if not isinstance(obj, TensorObject):
+                _error(f"{selected.object_name}: expected tensor")
+            expected = convert.family_recipe_materialize(selected, reader)
+            stored = decode_direct(artifact.payload(obj), obj.format, obj.shape)
+            if not torch.equal(stored.view(torch.int16), expected.view(torch.int16)):
+                _error(f"{obj.name}: BF16 words differ from the DFlash2 source")
+
+
 def verify_artifact(
     artifact: Artifact,
     base_dir: str | Path,
     quantized_dir: str | Path,
     calibration_path: str | Path,
+    dflash2_dir: str | Path,
     *,
     device: str | torch.device = "cuda",
 ) -> VerificationSummary:
     base = Path(base_dir)
     quantized = Path(quantized_dir)
+    dflash2 = Path(dflash2_dir)
     payload_bytes = validate_structure(artifact)
-    convert.preflight_conversion(base, quantized_dir, calibration_path)
+    convert.preflight_conversion(base, quantized_dir, calibration_path, dflash2)
     divisor_table = recipe.LocalDivisorTable(calibration_path)
     _verify_resources(artifact, base)
+    _verify_dflash2_module(artifact, dflash2)
     with ShardReader(base) as base_reader:
         w8_endpoint_rows, w8_endpoint_groups = _verify_w8_endpoints(
             artifact, base_reader
@@ -319,6 +338,7 @@ def verify_artifact(
         local_nvfp4_weights=len(recipe.LOCAL_NVFP4_WEIGHT_RECIPES),
         local_nvfp4_max_relative_error=max_error,
         bf16_exception_matrices=len(recipe.BF16_WEIGHT_RECIPES),
+        dflash2_tensors=len(recipe.DFLASH2_RECIPES),
         input_divisors_source=len(recipe.SOURCE_INPUT_DIVISOR_RECIPES),
         input_divisors_local=len(recipe.LOCAL_INPUT_DIVISOR_RECIPES),
         payload_bytes=payload_bytes,
@@ -331,6 +351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--quantized-model", type=Path, required=True)
     parser.add_argument("--calibration", type=Path, required=True)
+    parser.add_argument("--dflash2-model", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     arguments = parser.parse_args(argv)
     with Artifact.open(arguments.artifact) as artifact:
@@ -339,6 +360,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.model,
             arguments.quantized_model,
             arguments.calibration,
+            arguments.dflash2_model,
             device=arguments.device,
         )
     print(json.dumps(asdict(summary), indent=2, sort_keys=True))

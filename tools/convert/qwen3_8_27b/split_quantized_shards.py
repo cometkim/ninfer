@@ -107,14 +107,26 @@ def split_shards(model_dir: str | Path, target_bytes: int = TARGET_SHARD_BYTES) 
     total_estimate = part + (1 if pending else 0)
     flush(total_hint=total_estimate)
     if part != total_estimate:
-        # The final flush disagreed with the estimate; rewrite only its name.
         raise RuntimeError("final shard count estimate failed; rerun the split")
+    # The streaming pass names each shard with the only total it can know at
+    # write time (its own index); rewrite every name to the final count before
+    # the index is published.
+    total = part
+    written_names = sorted(set(new_map.values()))
+    renames = {}
+    for written in written_names:
+        stem, _, _ = written.rpartition("-of-")
+        renames[written] = f"{stem}-of-{total:05d}.safetensors"
+    for written, final_name in renames.items():
+        if written != final_name:
+            (base / written).rename(base / final_name)
+    final_map = {tensor: renames[shard] for tensor, shard in new_map.items()}
     final_index = {
         "metadata": index.get("metadata", {}),
-        "weight_map": new_map,
+        "weight_map": final_map,
     }
     index_path.write_text(json.dumps(final_index, indent=2))
-    print(f"split {len(new_map)} tensors into {total} shards")
+    print(f"split {len(final_map)} tensors into {total} shards")
 
 
 def main() -> None:

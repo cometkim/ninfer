@@ -162,16 +162,59 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
     )
 
 
+DFLASH2_LAYERS = tuple(range(5))
+
+
+def _build_dflash2_specs() -> tuple[TensorSpec, ...]:
+    """The DFlash2 block-diffusion drafter module (all BF16, one complete image)."""
+    specs: list[TensorSpec] = [
+        tensor_spec("dflash2/feature_projection", (5120, 25600), BF16),
+        tensor_spec("dflash2/context_norm", (5120,), BF16),
+    ]
+    for layer in DFLASH2_LAYERS:
+        prefix = f"dflash2/layers/{layer}/"
+        specs.extend(
+            (
+                tensor_spec(prefix + "input_norm", (5120,), BF16),
+                tensor_spec(prefix + "attention/query_key_value", (6144, 5120), BF16),
+                tensor_spec(prefix + "attention/query_norm", (128,), BF16),
+                tensor_spec(prefix + "attention/key_norm", (128,), BF16),
+                tensor_spec(prefix + "attention/output", (5120, 4096), BF16),
+                tensor_spec(prefix + "attention/conv_base", (2, 2, 5120), BF16),
+                tensor_spec(prefix + "attention/conv_proj", (1280, 5120), BF16),
+                tensor_spec(prefix + "post_attention_norm", (5120,), BF16),
+                tensor_spec(prefix + "mlp/gate_up", (34816, 5120), BF16),
+                tensor_spec(prefix + "mlp/down", (5120, 17408), BF16),
+                tensor_spec(prefix + "mlp/conv_base", (2, 2, 5120), BF16),
+                tensor_spec(prefix + "mlp/conv_proj", (1280, 5120), BF16),
+            )
+        )
+    specs.extend(
+        (
+            tensor_spec("dflash2/final_norm", (5120,), BF16),
+            tensor_spec("dflash2/selector/hidden", (256, 5120), BF16),
+            tensor_spec("dflash2/selector/predecessor", (248320, 256), BF16),
+            tensor_spec("dflash2/selector/successor", (248320, 256), BF16),
+        )
+    )
+    return tuple(specs)
+
+
 TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()
 DRAFT_HEAD_TENSOR_SPECS = _build_draft_head_specs()
 MTP_TENSOR_SPECS = _build_mtp_specs()
 VISION_TENSOR_SPECS = build_vision_specs(5120)
+DFLASH2_TENSOR_SPECS = _build_dflash2_specs()
 
+# The DFlash2 module appends after the Vision merger objects, mirroring how the
+# v1 drafter rides the 35B artifact: one complete product image, no optional
+# profiles; older module-less artifacts are superseded.
 TENSOR_SPECS = (
     TEXT_CORE_TENSOR_SPECS
     + DRAFT_HEAD_TENSOR_SPECS
     + MTP_TENSOR_SPECS
     + VISION_TENSOR_SPECS
+    + DFLASH2_TENSOR_SPECS
 )
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
@@ -385,16 +428,17 @@ def validate_inventory() -> None:
         len(DRAFT_HEAD_TENSOR_SPECS),
         len(MTP_TENSOR_SPECS),
         len(VISION_TENSOR_SPECS),
+        len(DFLASH2_TENSOR_SPECS),
         len(TENSOR_SPECS),
         len(OBJECT_SPECS),
         len(NVFP4_TENSOR_SPECS),
         len(INPUT_SCALE_DIVISOR_SPECS),
         len(SOURCE_NVFP4_WEIGHT_SPECS),
         len(LOCAL_NVFP4_WEIGHT_SPECS),
-    ) != (906, 2, 12, 333, 1253, 1259, 247, 247, 112, 135):
+    ) != (906, 2, 12, 333, 66, 1319, 1325, 247, 247, 112, 135):
         raise ValueError("Qwen3.8 nvfp4full inventory is incomplete")
     if FORMAT_COUNTS != {
-        BF16: 543,
+        BF16: 609,
         FP32: 343,
         I32: 1,
         Q4: 55,
@@ -405,7 +449,7 @@ def validate_inventory() -> None:
     }:
         raise ValueError(f"unexpected numeric allocation: {FORMAT_COUNTS}")
     if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 887,
+        CONTIGUOUS_LAYOUT: 953,
         ROW_SPLIT_LAYOUT: 119,
         BLOCK_SCALE_LAYOUT: 247,
     }:

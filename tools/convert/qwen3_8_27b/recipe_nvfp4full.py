@@ -525,6 +525,7 @@ def validate_recipe() -> None:
         set(BF16_WEIGHTS_BY_NAME),
         set(BASE_DIRECT_BY_NAME),
         set(OFFICIAL_RECIPES_BY_NAME),
+        set(DFLASH2_RECIPES_BY_NAME),
     )
     names: set[str] = set()
     for route in ownership:
@@ -542,6 +543,116 @@ def validate_recipe() -> None:
         _validate_parts(recipe.object_name, recipe.shape, recipe.parts)
     for recipe in BF16_WEIGHT_RECIPES:
         _validate_parts(recipe.object_name, recipe.shape, recipe.parts)
+
+
+
+def _build_dflash2_recipes() -> tuple[TensorRecipe, ...]:
+    """DFlash2 module recipes: the incoai BF16 drafter, fused to the artifact
+    conventions (concat q/k/v, concat gate/up); everything else direct."""
+    from tools.convert.qwen3_6.common.recipe import Concat, source
+
+    TensorRecipe = family_recipe.TensorRecipe
+
+    recipes: list[TensorRecipe] = [
+        TensorRecipe(
+            "dflash2/feature_projection",
+            source("fc.weight", (5120, 25600)),
+        ),
+        TensorRecipe(
+            "dflash2/context_norm",
+            source("hidden_norm.weight", (5120,)),
+        ),
+    ]
+    for layer in inventory.DFLASH2_LAYERS:
+        source_prefix = f"layers.{layer}."
+        object_prefix = f"dflash2/layers/{layer}/"
+        recipes.extend(
+            (
+                TensorRecipe(
+                    object_prefix + "input_norm",
+                    source(source_prefix + "input_layernorm.weight", (5120,)),
+                ),
+                TensorRecipe(
+                    object_prefix + "attention/query_key_value",
+                    Concat(
+                        (
+                            source(source_prefix + "self_attn.q_proj.weight", (4096, 5120)),
+                            source(source_prefix + "self_attn.k_proj.weight", (1024, 5120)),
+                            source(source_prefix + "self_attn.v_proj.weight", (1024, 5120)),
+                        ),
+                        0,
+                    ),
+                ),
+                TensorRecipe(
+                    object_prefix + "attention/query_norm",
+                    source(source_prefix + "self_attn.q_norm.weight", (128,)),
+                ),
+                TensorRecipe(
+                    object_prefix + "attention/key_norm",
+                    source(source_prefix + "self_attn.k_norm.weight", (128,)),
+                ),
+                TensorRecipe(
+                    object_prefix + "attention/output",
+                    source(source_prefix + "self_attn.o_proj.weight", (5120, 4096)),
+                ),
+                TensorRecipe(
+                    object_prefix + "attention/conv_base",
+                    source(source_prefix + "attention_conv.base_kernel", (2, 2, 5120)),
+                ),
+                TensorRecipe(
+                    object_prefix + "attention/conv_proj",
+                    source(source_prefix + "attention_conv.kernel_projection.weight", (1280, 5120)),
+                ),
+                TensorRecipe(
+                    object_prefix + "post_attention_norm",
+                    source(source_prefix + "post_attention_layernorm.weight", (5120,)),
+                ),
+                TensorRecipe(
+                    object_prefix + "mlp/gate_up",
+                    Concat(
+                        (
+                            source(source_prefix + "mlp.gate_proj.weight", (17408, 5120)),
+                            source(source_prefix + "mlp.up_proj.weight", (17408, 5120)),
+                        ),
+                        0,
+                    ),
+                ),
+                TensorRecipe(
+                    object_prefix + "mlp/down",
+                    source(source_prefix + "mlp.down_proj.weight", (5120, 17408)),
+                ),
+                TensorRecipe(
+                    object_prefix + "mlp/conv_base",
+                    source(source_prefix + "mlp_conv.base_kernel", (2, 2, 5120)),
+                ),
+                TensorRecipe(
+                    object_prefix + "mlp/conv_proj",
+                    source(source_prefix + "mlp_conv.kernel_projection.weight", (1280, 5120)),
+                ),
+            )
+        )
+    recipes.extend(
+        (
+            TensorRecipe("dflash2/final_norm", source("norm.weight", (5120,))),
+            TensorRecipe(
+                "dflash2/selector/hidden",
+                source("candidate_selector.hidden_projection.weight", (256, 5120)),
+            ),
+            TensorRecipe(
+                "dflash2/selector/predecessor",
+                source("candidate_selector.predecessor_codebook", (248320, 256)),
+            ),
+            TensorRecipe(
+                "dflash2/selector/successor",
+                source("candidate_selector.successor_codebook", (248320, 256)),
+            ),
+        )
+    )
+    return tuple(recipes)
+
+
+DFLASH2_RECIPES = _build_dflash2_recipes()
+DFLASH2_RECIPES_BY_NAME = {entry.object_name: entry for entry in DFLASH2_RECIPES}
 
 
 def source_field_requirements() -> dict[str, tuple[tuple[int, ...], str]]:

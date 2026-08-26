@@ -755,7 +755,8 @@ numeric recipes before opening the output, then writes the sibling
 ## 14. Fork artifact: `nvfp4full`
 
 This fork additionally builds a fuller-NVFP4 Qwen3.8-27B artifact with the memory profile of the
-Qwen3.6 NVFP4 recipe. It is produced and verified by the fork-local tools
+Qwen3.6 NVFP4 recipe, carrying the DFlash2 drafter module (Section 15) in the same complete
+image. It is produced and verified by the fork-local tools
 `tools.convert.qwen3_8_27b.{nvfp4_encode, calibrate_nvfp4full, convert_nvfp4full, verify_nvfp4full}`
 and binds through the same registered target as an additional weights contract.
 
@@ -770,7 +771,8 @@ recipe_id  = qwen3_8_27b_nvfp4full-v1
 converter  = tools.convert.qwen3_8_27b.convert_nvfp4full
 ```
 
-The artifact contains 1253 tensors and the same six frontend resources (1259 objects). Its Text
+The artifact contains 1319 tensors and the same six frontend resources (1325 objects), including
+the DFlash2 drafter module of Section 15. Its Text
 allocation applies the Qwen3.6-27B NVFP4 exception pattern to this checkpoint and object naming:
 
 - `attention/query_key_gate_value` is `BF16` on layers `3,7,11,15,19,23` and `NVFP4` on the other
@@ -786,7 +788,7 @@ This yields 247 NVFP4 parents, 247 site-level FP32 input divisors, and nine BF16
 
 | Format | Tensors |
 |---|---:|
-| `BF16` | 543 |
+| `BF16` | 609 |
 | `FP32` | 343 |
 | `I32` | 1 |
 | `Q4G64_F16S` | 55 |
@@ -797,11 +799,11 @@ This yields 247 NVFP4 parents, 247 site-level FP32 input divisors, and nine BF16
 
 | Layout | Tensors |
 |---|---:|
-| `contiguous-le-v1` | 887 |
+| `contiguous-le-v1` | 953 |
 | `row-split-k128-v1` | 119 |
 | `blockscale-k16-m128x4-v1` | 247 |
 
-The generated file is 18,324,059,648 bytes (17.07 GiB).
+The generated file is 22,172,880,896 bytes (20.65 GiB) including the 3.85 GiB DFlash2 module.
 
 ### 14.2 Sources and provenance
 
@@ -882,3 +884,61 @@ the artifact scores **89.39% (177 / 198)** against the official NVFP4 artifact's
 published 90.40% (179 / 198) - a two-question difference on single-sample runs, within the
 ~2.1% sampling error at n=198; the 198-sample run averaged 129.3 tok/s with 11,927 output
 tokens per question.
+
+
+## 15. Fork artifact: the DFlash2 drafter module
+
+The `nvfp4full` artifact additionally carries the DFlash2 block-diffusion drafter as part of its
+one complete image (the conversion recipe `qwen3_8_27b_nvfp4full-v1` takes a fourth source,
+`--dflash2-model`, pointing at the incoai/z-lab 2B BF16 drafter checkpoint). The module does not
+define a second artifact or an optional profile; module-less `nvfp4full` files are superseded.
+
+### 15.1 Fixed module facts
+
+| Fact | Value |
+|---|---|
+| draft layers | 5, all `sliding_attention`, window 2048 (no full-context layer) |
+| hidden / intermediate width | 5120 / 17408 (hidden equals the target's) |
+| query / KV heads / head width | 32 / 8 / 128 |
+| block size / draft positions | 8 / 7 (in-place masked denoising, non-causal) |
+| target-feature layers | `[5, 19, 33, 47, 61]` (0-based taps into the 64 Text layers) |
+| target-feature input width | `5 x 5120 = 25600` |
+| two-tap dynamic convs | per role: `conv_base [2,2,5120]` + `conv_proj [1280,5120]` (320 groups x 2 taps x 2) |
+| candidate selector | rank 256, top-k 16; per-token `predecessor`/`successor` codebooks `[248320, 256]` |
+| rope | own unscaled table, base 1e7, max position 262144 |
+| mask token id | 248070 |
+| numeric format | BF16 for every module tensor (no quantization; the adopted BF16-drafter plan) |
+
+**Position contract.** The drafter's rope table is its own unscaled base-1e7 table consumed at
+sliding-window-local positions; target YaRN scaling applies to Text and MTP sites only and never
+to the drafter. No rope-scaling rejection exists for DFlash2 (unlike v1's full-context layer on
+the 35B, whose reject remains).
+
+### 15.2 Object namespace and order
+
+The 66 module objects append after the Vision merger objects: two globals
+(`dflash2/feature_projection [5120,25600]`, `dflash2/context_norm [5120]`), five layer groups of
+twelve under `dflash2/layers/{l}/` (`input_norm [5120]`,
+`attention/query_key_value [6144,5120]` = concat(q,k,v),
+`attention/query_norm [128]`, `attention/key_norm [128]`,
+`attention/output [5120,4096]`, `attention/conv_base [2,2,5120]`,
+`attention/conv_proj [1280,5120]`, `post_attention_norm [5120]`,
+`mlp/gate_up [34816,5120]` = concat(gate,up), `mlp/down [5120,17408]`,
+`mlp/conv_base [2,2,5120]`, `mlp/conv_proj [1280,5120]`), then four closing globals
+(`dflash2/final_norm [5120]`, `dflash2/selector/hidden [256,5120]`,
+`dflash2/selector/predecessor [248320,256]`, `dflash2/selector/successor [248320,256]`).
+
+Source mapping: `fc.weight` -> feature projection; `hidden_norm.weight` -> context norm;
+`norm.weight` -> final norm; `self_attn.{q,k,v,o}_proj` fused in q,k,v order;
+`mlp.{gate,up}_proj` fused in gate,up order; `attention_conv`/`mlp_conv`
+`base_kernel`/`kernel_projection.weight`; `candidate_selector.{hidden_projection,
+predecessor_codebook,successor_codebook}` -> the selector objects. The converter validates the
+checkpoint's `config.json` against the registered facts above before reading any tensor.
+
+### 15.3 Binding and materialization
+
+The binder enumerates every module object unconditionally for the `qwen3.8-27b/nvfp4full`
+identity (validation-only placement until the DFlash2 startup feature selects device
+materialization, exactly like the Vision and proposal-head placement rules). Execution
+(`--spec dflash2 --draft-tokens N`, N in 1..7) is enabled by the draft-kernel work items; the
+engine rejects it with an explicit single-seam error until then.

@@ -121,6 +121,36 @@ struct BindingPlan {
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
     qwen3_6::VisionMergerNormPlan vision_merger_norm;
+
+    // DFlash2 module: contract-enumerated objects appended after the Vision merger
+    // rows. Validation is unconditional (one complete product image); Device
+    // materialization waits for the execution enablement (port items 3-4).
+    struct DFlash2ConvPlan {
+        artifact::ObjectHandle base;
+        artifact::ObjectHandle projection;
+    };
+    struct DFlash2LayerPlan {
+        artifact::ObjectHandle input_norm;
+        artifact::ObjectHandle query_key_value;
+        artifact::ObjectHandle query_norm;
+        artifact::ObjectHandle key_norm;
+        artifact::ObjectHandle attention_output;
+        DFlash2ConvPlan attention_conv;
+        artifact::ObjectHandle post_attention_norm;
+        artifact::ObjectHandle gate_up;
+        artifact::ObjectHandle down;
+        DFlash2ConvPlan mlp_conv;
+    };
+    struct DFlash2Plan {
+        artifact::ObjectHandle feature_projection;
+        artifact::ObjectHandle context_norm;
+        std::array<DFlash2LayerPlan, 5> layers;
+        artifact::ObjectHandle final_norm;
+        artifact::ObjectHandle selector_hidden;
+        artifact::ObjectHandle selector_predecessor;
+        artifact::ObjectHandle selector_successor;
+    };
+    DFlash2Plan dflash2;
 };
 
 struct ArtifactLoadPlan {

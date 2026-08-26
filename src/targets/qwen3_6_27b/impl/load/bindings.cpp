@@ -559,6 +559,45 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
     out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
 
+    // DFlash2 module (all BF16; local SWA-2048 drafter at target hidden width).
+    // The module is part of the qwen3.8/nvfp4full identity's complete product
+    // image; the other registered 27B profiles do not carry it. Placement
+    // follows the DFlash2 startup feature exactly like v1's rows on the 35B.
+    if (weights_profile == WeightsProfile::Qwen38Nvfp4Full) {
+    const artifact::TensorPlacement dflash2_placement =
+        features.dflash2() ? artifact::TensorPlacement::Device
+                           : artifact::TensorPlacement::ValidateOnly;
+    const auto bind_dflash2 = [&](std::string_view name, std::initializer_list<std::uint64_t> shape) {
+        return artifact::bind_tensor(binder, name, NumericFormat::BF16, shape, dflash2_placement);
+    };
+    out.dflash2.feature_projection =
+        bind_dflash2("dflash2/feature_projection", {5120, 25600});
+    out.dflash2.context_norm = bind_dflash2("dflash2/context_norm", {5120});
+    for (std::size_t layer = 0; layer < out.dflash2.layers.size(); ++layer) {
+        auto& target           = out.dflash2.layers[layer];
+        const std::string prefix = "dflash2/layers/" + std::to_string(layer) + "/";
+        target.input_norm        = bind_dflash2(prefix + "input_norm", {5120});
+        target.query_key_value =
+            bind_dflash2(prefix + "attention/query_key_value", {6144, 5120});
+        target.query_norm = bind_dflash2(prefix + "attention/query_norm", {128});
+        target.key_norm   = bind_dflash2(prefix + "attention/key_norm", {128});
+        target.attention_output =
+            bind_dflash2(prefix + "attention/output", {5120, 4096});
+        target.attention_conv.base = bind_dflash2(prefix + "attention/conv_base", {2, 2, 5120});
+        target.attention_conv.projection =
+            bind_dflash2(prefix + "attention/conv_proj", {1280, 5120});
+        target.post_attention_norm = bind_dflash2(prefix + "post_attention_norm", {5120});
+        target.gate_up = bind_dflash2(prefix + "mlp/gate_up", {34816, 5120});
+        target.down    = bind_dflash2(prefix + "mlp/down", {5120, 17408});
+        target.mlp_conv.base       = bind_dflash2(prefix + "mlp/conv_base", {2, 2, 5120});
+        target.mlp_conv.projection = bind_dflash2(prefix + "mlp/conv_proj", {1280, 5120});
+    }
+    out.dflash2.final_norm           = bind_dflash2("dflash2/final_norm", {5120});
+    out.dflash2.selector_hidden      = bind_dflash2("dflash2/selector/hidden", {256, 5120});
+    out.dflash2.selector_predecessor = bind_dflash2("dflash2/selector/predecessor", {248320, 256});
+    out.dflash2.selector_successor   = bind_dflash2("dflash2/selector/successor", {248320, 256});
+    }
+
     load_plan.materialization = binder.finish();
     return load_plan;
 }
