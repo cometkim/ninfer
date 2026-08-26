@@ -14,6 +14,12 @@ void dflash2_dynamic_conv_launch(const Tensor& hidden, const Tensor& dynamic, co
                                  std::int32_t side, std::int32_t block_size, Tensor& out,
                                  cudaStream_t stream);
 
+void dflash2_topk_launch(const Tensor& logits, std::int32_t k, Tensor& ids, Tensor& values,
+                         cudaStream_t stream);
+
+void dflash2_selector_walk_launch(const Tensor& scores, const Tensor& candidates, Tensor& out,
+                                  cudaStream_t stream);
+
 void dflash2_selector_scores_launch(const Tensor& candidates, const Tensor& predecessor_ids,
                                     const Tensor& unary, const Tensor& hidden_proj,
                                     const Tensor& successor_rows, const Tensor& predecessor_rows,

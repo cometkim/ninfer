@@ -23,6 +23,29 @@ void dflash2_dynamic_conv_launch(const Tensor& hidden, const Tensor& dynamic, co
         static_cast<__nv_bfloat16*>(out.data));
 }
 
+void dflash2_topk_launch(const Tensor& logits, std::int32_t k, Tensor& ids, Tensor& values,
+                         cudaStream_t stream) {
+    const int warps_per_block = 4;
+    const int threads         = warps_per_block * 32;
+    const int blocks          = static_cast<int>((logits.ne[1] + warps_per_block - 1) / warps_per_block);
+    dflash2_topk_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t>(logits.ne[0]),
+        static_cast<std::int32_t>(logits.ne[1]), k, static_cast<std::int32_t*>(ids.data),
+        static_cast<__nv_bfloat16*>(values.data));
+}
+
+void dflash2_selector_walk_launch(const Tensor& scores, const Tensor& candidates, Tensor& out,
+                                  cudaStream_t stream) {
+    const int threads = 64;
+    const int blocks =
+        static_cast<int>((scores.ne[3] + threads - 1) / threads);
+    dflash2_selector_walk_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const float*>(scores.data),
+        static_cast<const std::int32_t*>(candidates.data),
+        static_cast<std::int32_t>(scores.ne[0]), static_cast<std::int32_t>(scores.ne[2]),
+        static_cast<std::int32_t>(scores.ne[3]), static_cast<std::int32_t*>(out.data));
+}
+
 void dflash2_selector_scores_launch(const Tensor& candidates, const Tensor& predecessor_ids,
                                     const Tensor& unary, const Tensor& hidden_proj,
                                     const Tensor& successor_rows, const Tensor& predecessor_rows,

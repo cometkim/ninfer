@@ -1,5 +1,7 @@
 #include "ninfer/ops/dflash2_dynamic_conv.h"
 #include "ninfer/ops/dflash2_selector_scores.h"
+#include "ninfer/ops/dflash2_selector_walk.h"
+#include "ninfer/ops/dflash2_topk.h"
 
 #include "ops/launcher/dflash2_draft.h"
 
@@ -122,6 +124,53 @@ void dflash2_selector_scores(const Tensor& candidates, const Tensor& predecessor
     if (top_k * positions * lanes == 0) { return; }
     detail::dflash2_selector_scores_launch(candidates, predecessor_ids, unary, hidden_proj,
                                            successor_rows, predecessor_rows, out, stream);
+}
+
+void dflash2_topk(const Tensor& logits, std::int32_t k, Tensor& ids, Tensor& values,
+                  cudaStream_t stream) {
+    constexpr const char* op = "dflash2_topk";
+    require_contiguous_bf16(logits, op, "logits");
+    require_contiguous_i32(ids, op, "ids");
+    require_contiguous_bf16(values, op, "values");
+    const std::int64_t rows    = logits.ne[0];
+    const std::int64_t columns = logits.ne[1];
+    if (logits.ne[2] != 1 || logits.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": logits must be [rows, columns]");
+    }
+    if (k < 1 || k > 64 || rows < k || rows > (std::int64_t{1} << 25) || columns < 1 ||
+        columns > 64) {
+        throw std::invalid_argument(std::string(op) + ": supported domain violated");
+    }
+    if (ids.ne[0] != k || ids.ne[1] != columns || ids.ne[2] != 1 || ids.ne[3] != 1 ||
+        values.ne[0] != k || values.ne[1] != columns || values.ne[2] != 1 || values.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": ids/values must be [k, columns]");
+    }
+    detail::dflash2_topk_launch(logits, k, ids, values, stream);
+}
+
+void dflash2_selector_walk(const Tensor& scores, const Tensor& candidates, Tensor& out,
+                           cudaStream_t stream) {
+    constexpr const char* op = "dflash2_selector_walk";
+    require_contiguous_f32(scores, op, "scores");
+    require_contiguous_i32(candidates, op, "candidates");
+    require_contiguous_i32(out, op, "out");
+    const std::int64_t top_k     = scores.ne[0];
+    const std::int64_t positions = scores.ne[2];
+    const std::int64_t lanes     = scores.ne[3];
+    if (scores.ne[1] != top_k) {
+        throw std::invalid_argument(std::string(op) + ": scores must be [K, K, P, L]");
+    }
+    if (top_k < 1 || top_k > 32 || positions < 1 || positions > 15 || lanes < 1 || lanes > 8) {
+        throw std::invalid_argument(std::string(op) + ": supported domain violated");
+    }
+    if (candidates.ne[0] != top_k || candidates.ne[1] != positions ||
+        candidates.ne[2] != lanes || candidates.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": candidates must be [K, P, L]");
+    }
+    if (out.ne[0] != positions || out.ne[1] != lanes || out.ne[2] != 1 || out.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": out must be [P, L]");
+    }
+    detail::dflash2_selector_walk_launch(scores, candidates, out, stream);
 }
 
 } // namespace ninfer::ops

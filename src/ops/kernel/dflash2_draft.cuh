@@ -95,3 +95,102 @@ __global__ void dflash2_selector_scores_kernel(
 }
 
 } // namespace ninfer::ops
+
+// Per-column top-k: one warp owns one column; each lane keeps a private
+// running top-k (insertion over registers), then k warp-reduction rounds
+// consume the best remaining head.
+struct TopkEntry {
+    float value;
+    int row;
+};
+
+__device__ __forceinline__ bool topk_less(const TopkEntry& a, const TopkEntry& b) {
+    return a.value > b.value || (a.value == b.value && a.row < b.row);
+}
+
+__global__ void dflash2_topk_kernel(const __nv_bfloat16* __restrict__ logits,
+                                    std::int32_t rows, std::int32_t columns,
+                                    std::int32_t k, std::int32_t* __restrict__ ids,
+                                    __nv_bfloat16* __restrict__ values) {
+    const int column = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (column >= columns) { return; }
+    const int lane = threadIdx.x % 32;
+    TopkEntry list[64];
+    int count      = 0;
+    for (int row = lane; row < rows; row += 32) {
+        TopkEntry e{
+            __bfloat162float(logits[static_cast<std::int64_t>(row) * columns + column]), row};
+        if (count < k) {
+            int pos = count++;
+            while (pos > 0 && topk_less(e, list[pos - 1])) {
+                list[pos] = list[pos - 1];
+                --pos;
+            }
+            list[pos] = e;
+        } else if (topk_less(e, list[k - 1])) {
+            int pos = k - 1;
+            while (pos > 0 && topk_less(e, list[pos - 1])) {
+                list[pos] = list[pos - 1];
+                --pos;
+            }
+            list[pos] = e;
+        }
+    }
+    int cursor = 0;
+    for (int slot = 0; slot < k; ++slot) {
+        float my_v = -INFINITY;
+        int my_r   = 0x7fffffff;
+        if (cursor < count) {
+            my_v = list[cursor].value;
+            my_r = list[cursor].row;
+        }
+        // warp argmax on (value, smaller row); ties between equal (value,row)
+        // cannot occur because rows are unique per column.
+        int my_lane = lane;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            const float ov = __shfl_down_sync(0xffffffffu, my_v, offset);
+            const int or_  = __shfl_down_sync(0xffffffffu, my_r, offset);
+            const int ol   = __shfl_down_sync(0xffffffffu, my_lane, offset);
+            if (ov > my_v || (ov == my_v && or_ < my_r)) {
+                my_v    = ov;
+                my_r    = or_;
+                my_lane = ol;
+            }
+        }
+        my_v    = __shfl_sync(0xffffffffu, my_v, 0);
+        my_r    = __shfl_sync(0xffffffffu, my_r, 0);
+        my_lane = __shfl_sync(0xffffffffu, my_lane, 0);
+        if (lane == 0) {
+            ids[static_cast<std::int64_t>(slot) * columns + column] = my_r;
+            values[static_cast<std::int64_t>(slot) * columns + column] = __float2bfloat16(my_v);
+        }
+        if (lane == my_lane) { ++cursor; }
+    }
+}
+
+// One thread per lane walks the greedy argmax chain over the lattice and
+// gathers the winning candidate token ids.
+__global__ void dflash2_selector_walk_kernel(const float* __restrict__ scores,
+                                             const std::int32_t* __restrict__ candidates,
+                                             std::int32_t top_k, std::int32_t positions,
+                                             std::int32_t lanes, std::int32_t* __restrict__ out) {
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= lanes) { return; }
+    int pred = 0;
+    for (int s = 0; s < positions; ++s) {
+        int best_i   = 0;
+        float best_v = -INFINITY;
+        for (int i = 0; i < top_k; ++i) {
+            const float v =
+                scores[((static_cast<std::int64_t>(i) * top_k + pred) * positions + s) * lanes +
+                       l];
+            if (v > best_v) {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        out[static_cast<std::int64_t>(s) * lanes + l] =
+            candidates[(static_cast<std::int64_t>(best_i) * positions + s) * lanes + l];
+        pred = best_i;
+    }
+}
