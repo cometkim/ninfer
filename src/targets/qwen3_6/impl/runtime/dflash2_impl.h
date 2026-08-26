@@ -137,7 +137,7 @@ void dflash2_append_context_impl(Context& state, const Tensor& features, const T
                     state.execution.device.stream);
         Tensor context = context_roots.normalized;
         ops::rmsnorm(projected, state.execution.model.dflash2->context_norm, Config::rms_epsilon,
-                     true, context, state.execution.device.stream);
+                     false, context, state.execution.device.stream);
 
         for (int layer = 0; layer < Config::layers; ++layer) {
             auto layer_scope = state.execution.work.scope();

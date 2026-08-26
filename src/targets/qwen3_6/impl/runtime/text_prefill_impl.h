@@ -37,10 +37,8 @@ DFlashFeatureSink make_dflash2_prefill_sink(PrefillContext& state) {
     if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
         throw std::logic_error("DFlash2 prefill controls are unavailable");
     }
-    std::fprintf(stderr, "[dflash2-debug] prefill sink created\n");
     return dflash2_feature_sink(
         state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
-            std::fprintf(stderr, "[dflash2-debug] prefill consumer fired cols=%d\n", features.ne[1]);
             auto& frame  = *state.execution.io.dflash_decode;
             Tensor count = frame.append_counts.slice(0, 0, 1);
             Tensor lane  = frame.lanes.slice(0, 0, 1);
