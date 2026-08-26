@@ -64,6 +64,21 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
     case Nvfp4Problem::Residual17408:
         launchers<Nvfp4Residual17408Geometry>()[index](x, weight, out, stream);
         return;
+    case Nvfp4Problem::DFlash2Feature:
+        launchers<Nvfp4DFlash2FeatureGeometry>()[index](x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DFlash2Qkv:
+        launchers<Nvfp4DFlash2QkvGeometry>()[index](x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DFlash2AttnOut:
+        launchers<Nvfp4DFlash2AttnOutGeometry>()[index](x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DFlash2ConvProj:
+        launchers<Nvfp4DFlash2ConvProjGeometry>()[index](x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DFlash2Selector:
+        launchers<Nvfp4DFlash2SelectorGeometry>()[index](x, weight, out, stream);
+        return;
     }
 }
 

@@ -92,6 +92,36 @@ struct DFlashConfig {
                                                                            22, 27, 32, 37};
 };
 
+// DFlash2 is the 27B's draft backend; this target never carries the module. The
+// dimensional fields exist only so the shared family layout code compiles; the
+// backend is rejected at option validation and the branches never execute.
+struct DFlash2Config {
+    static constexpr bool artifact_module = false;
+    static constexpr bool execution       = false;
+    static constexpr int layers           = 0;
+    static constexpr int block_size       = 0;
+    static constexpr int feature_layers   = 0;
+    static constexpr int feature_rows     = 0;
+    static constexpr int hidden           = 0;
+    static constexpr int intermediate     = 0;
+    static constexpr int query_heads      = 0;
+    static constexpr int kv_heads         = 0;
+    static constexpr int head_dim         = 0;
+    static constexpr int query_size       = 0;
+    static constexpr int kv_size          = 0;
+    static constexpr int local_capacity   = 0;
+    static constexpr int conv_kernel      = 0;
+    static constexpr int conv_group       = 0;
+    static constexpr int conv_outputs     = 0;
+    static constexpr int selector_rank    = 0;
+    static constexpr int selector_top_k   = 0;
+    static constexpr int mask_token       = 0;
+    static constexpr float rms_epsilon     = 1.0e-6F;
+    static constexpr float rope_theta      = 1.0e7F;
+    static constexpr float attention_scale = 0.08838834764831845F;
+    static constexpr std::array<int, feature_layers> target_feature_layers{};
+};
+
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;

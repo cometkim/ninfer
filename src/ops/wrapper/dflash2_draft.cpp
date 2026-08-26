@@ -1,4 +1,7 @@
+#include "ops/linear/nvfp4/nvfp4_format.h"
+
 #include "ninfer/ops/dflash2_dynamic_conv.h"
+#include "ninfer/ops/dflash2_selector_predecessors.h"
 #include "ninfer/ops/dflash2_selector_scores.h"
 #include "ninfer/ops/dflash2_selector_walk.h"
 #include "ninfer/ops/dflash2_topk.h"
@@ -76,21 +79,19 @@ void dflash2_dynamic_conv(const Tensor& hidden, const Tensor& dynamic, const Ten
 
 void dflash2_selector_scores(const Tensor& candidates, const Tensor& predecessor_ids,
                              const Tensor& unary, const Tensor& hidden_proj,
-                             const Tensor& successor_rows, const Tensor& predecessor_rows,
+                             const Weight& successor_rows, const Weight& predecessor_rows,
                              Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "dflash2_selector_scores";
     require_contiguous_i32(candidates, op, "candidates");
     require_contiguous_i32(predecessor_ids, op, "predecessor_ids");
     require_contiguous_f32(unary, op, "unary");
     require_contiguous_f32(hidden_proj, op, "hidden_proj");
-    require_contiguous_bf16(successor_rows, op, "successor_rows");
-    require_contiguous_bf16(predecessor_rows, op, "predecessor_rows");
     require_contiguous_f32(out, op, "out");
-    const std::int64_t top_k    = candidates.ne[0];
+    const std::int64_t top_k     = candidates.ne[0];
     const std::int64_t positions = candidates.ne[1];
     const std::int64_t lanes     = candidates.ne[2];
     const std::int64_t rank      = hidden_proj.ne[0];
-    const std::int64_t vocab     = successor_rows.ne[0];
+    const std::int64_t vocab     = successor_rows.n;
     if (candidates.ne[3] != 1 || predecessor_ids.ne[3] != 1) {
         throw std::invalid_argument(std::string(op) + ": candidate tensors must be [K, P, L]");
     }
@@ -106,20 +107,19 @@ void dflash2_selector_scores(const Tensor& candidates, const Tensor& predecessor
     if (hidden_proj.ne[1] != positions || hidden_proj.ne[2] != lanes || hidden_proj.ne[3] != 1) {
         throw std::invalid_argument(std::string(op) + ": hidden_proj must be [R, P, L]");
     }
-    if (successor_rows.ne[1] != rank || successor_rows.ne[2] != 1 || successor_rows.ne[3] != 1) {
-        throw std::invalid_argument(std::string(op) + ": successor_rows must be [vocab, R]");
-    }
-    if (predecessor_rows.ne[0] != vocab || predecessor_rows.ne[1] != rank ||
-        predecessor_rows.ne[2] != 1 || predecessor_rows.ne[3] != 1) {
-        throw std::invalid_argument(std::string(op) + ": predecessor_rows must be [vocab, R]");
-    }
     if (out.ne[0] != top_k || out.ne[1] != top_k || out.ne[2] != positions ||
         out.ne[3] != lanes) {
         throw std::invalid_argument(std::string(op) + ": out must be [K, K, P, L]");
     }
     if (top_k < 1 || top_k > 32 || rank < 16 || rank > 512 || positions < 1 || positions > 15 ||
-        lanes < 1 || lanes > 8 || vocab < 1) {
+        lanes < 1 || lanes > 8 || vocab < 1 || rank % 64 != 0 || vocab % 128 != 0) {
         throw std::invalid_argument(std::string(op) + ": supported domain violated");
+    }
+    detail::validate_nvfp4_weight(successor_rows, op);
+    detail::validate_nvfp4_weight(predecessor_rows, op);
+    if (successor_rows.k != rank || predecessor_rows.n != vocab || predecessor_rows.k != rank) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": codebooks must both be [vocab, rank] NVFP4 weights");
     }
     if (top_k * positions * lanes == 0) { return; }
     detail::dflash2_selector_scores_launch(candidates, predecessor_ids, unary, hidden_proj,
@@ -171,6 +171,30 @@ void dflash2_selector_walk(const Tensor& scores, const Tensor& candidates, Tenso
         throw std::invalid_argument(std::string(op) + ": out must be [P, L]");
     }
     detail::dflash2_selector_walk_launch(scores, candidates, out, stream);
+}
+
+void dflash2_selector_predecessors(const Tensor& candidates, const Tensor& anchors, Tensor& out,
+                                   cudaStream_t stream) {
+    constexpr const char* op = "dflash2_selector_predecessors";
+    require_contiguous_i32(candidates, op, "candidates");
+    require_contiguous_i32(anchors, op, "anchors");
+    require_contiguous_i32(out, op, "out");
+    const std::int64_t top_k     = candidates.ne[0];
+    const std::int64_t positions = candidates.ne[1];
+    const std::int64_t lanes     = candidates.ne[2];
+    if (candidates.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": candidates must be [K, P, L]");
+    }
+    if (top_k < 1 || top_k > 32 || positions < 1 || positions > 15 || lanes < 1 || lanes > 8) {
+        throw std::invalid_argument(std::string(op) + ": supported domain violated");
+    }
+    if (anchors.ne[0] != lanes || anchors.ne[1] != 1 || anchors.ne[2] != 1 || anchors.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": anchors must be [L]");
+    }
+    if (out.ne[0] != top_k || out.ne[1] != positions || out.ne[2] != lanes || out.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": out must be [K, P, L]");
+    }
+    detail::dflash2_selector_predecessors_launch(candidates, anchors, out, stream);
 }
 
 } // namespace ninfer::ops

@@ -37,6 +37,7 @@ struct Variant {
     static constexpr std::uint32_t maximum_dflash2_draft_tokens = kMaximumDFlash2DraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
+    static constexpr bool supports_dflash2                     = DFlash2Config::execution;
     static constexpr bool dflash2_artifact_module              = DFlash2Config::artifact_module;
     static constexpr std::int32_t draft_head_rows              = 131072;
 

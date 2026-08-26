@@ -19,7 +19,8 @@ struct SwaPlan {
     std::int32_t max_context;
 };
 
-[[nodiscard]] SwaPlan swa_resolve_plan(std::int32_t tokens, SwaContextExecutionEnvelope envelope);
+[[nodiscard]] SwaPlan swa_resolve_plan(std::int32_t tokens, SwaContextExecutionEnvelope envelope,
+                              std::uint32_t window);
 [[nodiscard]] const char* swa_route_name(SwaRoute route);
 
 void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,

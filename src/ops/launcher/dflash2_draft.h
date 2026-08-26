@@ -3,6 +3,7 @@
 // ninfer::ops::detail - launcher surface for the DFlash2 draft primitives.
 
 #include "core/tensor.h"
+#include "core/weight.h"
 
 #include <cuda_runtime.h>
 
@@ -22,7 +23,10 @@ void dflash2_selector_walk_launch(const Tensor& scores, const Tensor& candidates
 
 void dflash2_selector_scores_launch(const Tensor& candidates, const Tensor& predecessor_ids,
                                     const Tensor& unary, const Tensor& hidden_proj,
-                                    const Tensor& successor_rows, const Tensor& predecessor_rows,
+                                    const Weight& successor_rows, const Weight& predecessor_rows,
                                     Tensor& out, cudaStream_t stream);
+
+void dflash2_selector_predecessors_launch(const Tensor& candidates, const Tensor& anchors,
+                                          Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

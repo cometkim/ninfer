@@ -124,31 +124,32 @@ struct BindingPlan {
 
     // DFlash2 module: contract-enumerated objects appended after the Vision merger
     // rows. Validation is unconditional (one complete product image); Device
-    // materialization waits for the execution enablement (port items 3-4).
+    // materialization follows the DFlash2 startup feature. Matrices are
+    // weight-only NVFP4 (no input-divisor sites); norms and conv bases stay BF16.
     struct DFlash2ConvPlan {
         artifact::ObjectHandle base;
-        artifact::ObjectHandle projection;
+        WeightPlan projection;
     };
     struct DFlash2LayerPlan {
         artifact::ObjectHandle input_norm;
-        artifact::ObjectHandle query_key_value;
+        WeightPlan query_key_value;
         artifact::ObjectHandle query_norm;
         artifact::ObjectHandle key_norm;
-        artifact::ObjectHandle attention_output;
+        WeightPlan attention_output;
         DFlash2ConvPlan attention_conv;
         artifact::ObjectHandle post_attention_norm;
-        artifact::ObjectHandle gate_up;
-        artifact::ObjectHandle down;
+        WeightPlan gate_up;
+        WeightPlan down;
         DFlash2ConvPlan mlp_conv;
     };
     struct DFlash2Plan {
-        artifact::ObjectHandle feature_projection;
+        WeightPlan feature_projection;
         artifact::ObjectHandle context_norm;
         std::array<DFlash2LayerPlan, 5> layers;
         artifact::ObjectHandle final_norm;
-        artifact::ObjectHandle selector_hidden;
-        artifact::ObjectHandle selector_predecessor;
-        artifact::ObjectHandle selector_successor;
+        WeightPlan selector_hidden;
+        WeightPlan selector_predecessor;
+        WeightPlan selector_successor;
     };
     DFlash2Plan dflash2;
 };
@@ -217,10 +218,11 @@ struct MtpAttentionPayload {
     Weight value;
 };
 
-using RuntimeModelView =
-    qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
-                       kFullAttentionLayers, kGdnLayers>;
+using RuntimeModelView = qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload,
+                                             DensePostMixerPayload, MtpAttentionPayload,
+                                             DensePostMixerPayload, qwen3_6::DFlashWeights<5>,
+                                             qwen3_6::DFlash2Weights<5>, kFullAttentionLayers,
+                                             kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

@@ -91,7 +91,7 @@ struct DFlashConfig {
 
 struct DFlash2Config {
     static constexpr bool artifact_module = true;
-    static constexpr bool execution       = false; // draft kernels land as port items 3-4
+    static constexpr bool execution       = true;
     static constexpr int layers           = 5;
     static constexpr int block_size       = 8;   // anchor + 7 draft positions
     static constexpr int feature_layers   = 5;

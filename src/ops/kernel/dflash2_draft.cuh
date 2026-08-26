@@ -1,9 +1,12 @@
 #pragma once
 
 // ninfer::ops - DFlash2 draft primitives: the two-tap dynamic depthwise
-// convolution and the candidate-selector transition scores. Both are tiny
-// block-local computations; one elementwise kernel and one warp-reduction
-// kernel cover them without staging.
+// convolution, the candidate-selector transition scores (with inline NVFP4
+// codebook decode), the predecessor assembly, and the top-k/walk pair. All are
+// tiny block-local computations; elementwise and warp-reduction kernels cover
+// them without staging.
+
+#include "ops/linear/nvfp4/nvfp4_codec.cuh"
 
 #include <cuda_bf16.h>
 
@@ -12,6 +15,9 @@
 #include "ninfer/ops/dflash2_dynamic_conv.h"
 
 namespace ninfer::ops {
+
+using detail::decode_nvfp4_e2m1x2;
+using detail::decode_nvfp4_e4m3;
 
 // One thread per (channel, column): y[c, t] = sum_k w[k] * x[c, t - k],
 // zero-padded at the lane start. w[k] = dynamic[g + (H/G)*k + 2*(H/G)*side, t]
@@ -52,29 +58,45 @@ __global__ void dflash2_dynamic_conv_kernel(
 
 // One block per (i, j, s, l) score: warp threads stride the rank, one
 // warp-level reduction finishes the dot; the unary term is added by thread 0.
+// Codebook rows gather from the NVFP4 code/scale planes and decode inline.
 inline constexpr int kDflash2SelectorThreads = 256;
 
 __global__ void dflash2_selector_scores_kernel(
     const std::int32_t* __restrict__ candidates, const std::int32_t* __restrict__ pred_ids,
     const float* __restrict__ unary, const float* __restrict__ hidden_proj,
-    const __nv_bfloat16* __restrict__ successor_rows,
-    const __nv_bfloat16* __restrict__ predecessor_rows, std::int32_t rank, std::int32_t top_k,
-    std::int32_t positions, std::int32_t lanes, float* __restrict__ out) {
+    const std::uint8_t* __restrict__ successor_codes,
+    const std::uint8_t* __restrict__ successor_scales, float successor_inverse_divisor,
+    const std::uint8_t* __restrict__ predecessor_codes,
+    const std::uint8_t* __restrict__ predecessor_scales, float predecessor_inverse_divisor,
+    std::int32_t rank, std::int32_t top_k, std::int32_t positions, std::int32_t lanes,
+    float* __restrict__ out) {
     const int idx = blockIdx.x;  // one block per (i, j, s, l)
     const int l   = idx % lanes;
     const int s   = (idx / lanes) % positions;
     const int j   = (idx / (lanes * positions)) % top_k;
     const int i   = idx / (lanes * positions * top_k);
 
-    const std::int32_t succ_id = candidates[(static_cast<std::int64_t>(i) * positions + s) * lanes + l];
-    const std::int32_t pred_id = pred_ids[(static_cast<std::int64_t>(j) * positions + s) * lanes + l];
-    const __nv_bfloat16* succ  = successor_rows + static_cast<std::int64_t>(succ_id) * rank;
-    const __nv_bfloat16* pred  = predecessor_rows + static_cast<std::int64_t>(pred_id) * rank;
-    const float* h             = hidden_proj + (static_cast<std::int64_t>(s) * lanes + l) * rank;
+    const std::int64_t slot = static_cast<std::int64_t>(s) * lanes + l;
+    const std::int32_t succ_id = candidates[static_cast<std::int64_t>(i) + top_k * slot];
+    const std::int32_t pred_id = pred_ids[static_cast<std::int64_t>(j) + top_k * slot];
+    const std::int64_t succ_row  = static_cast<std::int64_t>(succ_id) * rank;
+    const std::int64_t pred_row  = static_cast<std::int64_t>(pred_id) * rank;
+    const float* h               = hidden_proj + (static_cast<std::int64_t>(s) * lanes + l) * rank;
 
     float local = 0.0F;
     for (int r = threadIdx.x; r < rank; r += blockDim.x) {
-        local += __bfloat162float(succ[r]) * __bfloat162float(pred[r]) * h[r];
+        const float2 succ_pair = decode_nvfp4_e2m1x2(
+            successor_codes[succ_row / 2 + r / 2]);
+        const float2 pred_pair = decode_nvfp4_e2m1x2(
+            predecessor_codes[pred_row / 2 + r / 2]);
+        const float succ = (r & 1) == 0 ? succ_pair.x : succ_pair.y;
+        const float pred = (r & 1) == 0 ? pred_pair.x : pred_pair.y;
+        const float succ_scale =
+            decode_nvfp4_e4m3(successor_scales[succ_row / 16 + r / 16]);
+        const float pred_scale =
+            decode_nvfp4_e4m3(predecessor_scales[pred_row / 16 + r / 16]);
+        local += succ * succ_scale * successor_inverse_divisor * pred * pred_scale *
+                 predecessor_inverse_divisor * h[r];
     }
     __shared__ float warp_sums[kDflash2SelectorThreads / 32];
     const int warp = threadIdx.x / 32;
@@ -89,8 +111,9 @@ __global__ void dflash2_selector_scores_kernel(
         for (int w = 0; w < blockDim.x / 32; ++w) {
             total += warp_sums[w];
         }
-        out[(((static_cast<std::int64_t>(i) * top_k + j) * positions + s) * lanes + l)] =
-            total + unary[(static_cast<std::int64_t>(i) * positions + s) * lanes + l];
+        out[static_cast<std::int64_t>(i) +
+            top_k * (static_cast<std::int64_t>(j) + top_k * slot)] =
+            total + unary[static_cast<std::int64_t>(i) + top_k * slot];
     }
 }
 
@@ -119,7 +142,8 @@ __global__ void dflash2_topk_kernel(const __nv_bfloat16* __restrict__ logits,
     int count      = 0;
     for (int row = lane; row < rows; row += 32) {
         TopkEntry e{
-            __bfloat162float(logits[static_cast<std::int64_t>(row) * columns + column]), row};
+            __bfloat162float(logits[static_cast<std::int64_t>(row) +
+                                    static_cast<std::int64_t>(rows) * column]), row};
         if (count < k) {
             int pos = count++;
             while (pos > 0 && topk_less(e, list[pos - 1])) {
@@ -161,8 +185,9 @@ __global__ void dflash2_topk_kernel(const __nv_bfloat16* __restrict__ logits,
         my_r    = __shfl_sync(0xffffffffu, my_r, 0);
         my_lane = __shfl_sync(0xffffffffu, my_lane, 0);
         if (lane == 0) {
-            ids[static_cast<std::int64_t>(slot) * columns + column] = my_r;
-            values[static_cast<std::int64_t>(slot) * columns + column] = __float2bfloat16(my_v);
+            ids[static_cast<std::int64_t>(slot) + static_cast<std::int64_t>(k) * column] = my_r;
+            values[static_cast<std::int64_t>(slot) + static_cast<std::int64_t>(k) * column] =
+                __float2bfloat16(my_v);
         }
         if (lane == my_lane) { ++cursor; }
     }
@@ -178,19 +203,40 @@ __global__ void dflash2_selector_walk_kernel(const float* __restrict__ scores,
     if (l >= lanes) { return; }
     int pred = 0;
     for (int s = 0; s < positions; ++s) {
+        const std::int64_t slot = static_cast<std::int64_t>(s) * lanes + l;
         int best_i   = 0;
         float best_v = -INFINITY;
         for (int i = 0; i < top_k; ++i) {
-            const float v =
-                scores[((static_cast<std::int64_t>(i) * top_k + pred) * positions + s) * lanes +
-                       l];
+            const float v = scores[static_cast<std::int64_t>(i) +
+                                   top_k * (static_cast<std::int64_t>(pred) + top_k * slot)];
             if (v > best_v) {
                 best_v = v;
                 best_i = i;
             }
         }
-        out[static_cast<std::int64_t>(s) * lanes + l] =
-            candidates[(static_cast<std::int64_t>(best_i) * positions + s) * lanes + l];
+        out[static_cast<std::int64_t>(s) +
+            static_cast<std::int64_t>(positions) * l] =
+            candidates[static_cast<std::int64_t>(best_i) + top_k * slot];
         pred = best_i;
     }
+}
+
+// One thread per (j, s, l): the predecessor id feeding transition slot (j, s, l)
+// is the anchor at s = 0 and candidate j from slot s-1 afterwards.
+__global__ void dflash2_selector_predecessors_kernel(const std::int32_t* __restrict__ candidates,
+                                                     const std::int32_t* __restrict__ anchors,
+                                                     std::int32_t top_k, std::int32_t positions,
+                                                     std::int32_t lanes,
+                                                     std::int32_t* __restrict__ out) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= top_k * positions * lanes) { return; }
+    const int l = idx % lanes;
+    const int s = (idx / lanes) % positions;
+    const int j = idx / (lanes * positions);
+    const std::int64_t slot = static_cast<std::int64_t>(s) * lanes + l;
+    const std::int32_t value =
+        s == 0 ? anchors[l]
+               : candidates[static_cast<std::int64_t>(j) +
+                            top_k * (slot - lanes)];
+    out[static_cast<std::int64_t>(j) + top_k * slot] = value;
 }

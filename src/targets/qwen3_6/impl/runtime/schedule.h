@@ -15,6 +15,7 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
+#include "targets/qwen3_6/impl/runtime/dflash2_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
@@ -52,6 +53,7 @@ struct PrefillContext {
     const qwen3_6::PagedKVCache& text_cache;
     const qwen3_6::PagedKVCache* mtp_cache;
     DFlashPersistentState* dflash;
+    DFlash2PersistentState* dflash2;
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
     Tensor* rewrite_checkpoint_hidden;
@@ -95,6 +97,21 @@ struct DFlashAppendContext {
     DFlashPersistentState& dflash;
 };
 
+struct DFlash2BatchContext {
+    ExecutionCore execution;
+    const qwen3_6::PagedKVCache& text_cache;
+    DFlash2PersistentState& dflash2;
+    qwen3_6::DFlashDecodeState& frame;
+    const qwen3_6::DFlashDecodeIngress& host_ingress;
+    qwen3_6::DFlashDecodeEgress& host_egress;
+    Tensor& continuation_hidden_store;
+};
+
+struct DFlash2AppendContext {
+    ExecutionCore execution;
+    DFlash2PersistentState& dflash2;
+};
+
 struct MtpGqaEnvelopes {
     ops::GqaExecutionEnvelope target_verify;
     ops::GqaExecutionEnvelope batch;
@@ -104,6 +121,11 @@ struct MtpGqaEnvelopes {
 struct DFlashEnvelopes {
     ops::SwaContextExecutionEnvelope local;
     ops::GqaContextExecutionEnvelope full;
+    ops::KVCacheAppendPrefixExecutionEnvelope append;
+};
+
+struct DFlash2Envelopes {
+    ops::SwaContextExecutionEnvelope local;
     ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 
@@ -196,5 +218,22 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
+
+[[nodiscard]] DFlashFeatureSink
+dflash2_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
+void dflash2_append_context(DFlash2AppendContext& state, const Tensor& features,
+                            const Tensor& positions, const Tensor& commit_counts, const Tensor& lanes,
+                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+void dflash2_append_context(PrefillContext& state, const Tensor& features,
+                            const Tensor& positions, const Tensor& commit_counts,
+                            const Tensor& lanes,
+                            ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+void capture_dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size,
+                                  std::uint32_t k, DFlash2Envelopes envelopes,
+                                  ops::GqaExecutionEnvelope target_envelope,
+                                  DecodeGraphDefinition& definition);
+void dflash2_decode_batch(DFlash2BatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                          DFlash2Envelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
+                          DecodeGraphExecutable* executable);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

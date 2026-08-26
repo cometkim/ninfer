@@ -16,8 +16,13 @@ namespace {
 constexpr std::int32_t kHeadDim = 128;
 constexpr std::int32_t kQHeads  = 32;
 constexpr std::int32_t kKVHeads = 8;
-constexpr std::int32_t kWindow  = 4096;
 constexpr float kExpectedScale  = 0.08838834764831844055f;
+// The workspace query carries no cyclic view, so it sizes for the widest registered window.
+constexpr std::uint32_t kSwaDefaultWindow = 4096;
+
+bool is_power_of_two_window(std::uint32_t value) {
+    return value >= 1024U && (value & (value - 1U)) == 0U;
+}
 
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* op, const char* name) {
@@ -37,7 +42,8 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 
 void validate_context(const CyclicKVCacheLayerView& context, const char* op) {
     if (context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim ||
-        context.capacity != kWindow || context.padded_capacity < context.capacity ||
+        !is_power_of_two_window(context.capacity) ||
+        context.padded_capacity < context.capacity ||
         context.lane_capacity <= 0) {
         throw std::invalid_argument(std::string(op) + ": invalid cyclic context");
     }
@@ -82,7 +88,7 @@ std::size_t swa_workspace_capacity_bytes(SwaContextExecutionEnvelope envelope,
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("swa workspace: invalid envelope or token interval");
     }
-    const auto plan = detail::swa_resolve_plan(max_tokens, envelope);
+    const auto plan = detail::swa_resolve_plan(max_tokens, envelope, kSwaDefaultWindow);
     WorkspaceLayoutBuilder layout;
     (void)allocate_workspace(layout, max_tokens, plan.split_capacity, batch_size);
     return layout.peak_bytes(1);
@@ -132,7 +138,7 @@ void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Te
     }
 
     auto scope               = workspace.scope();
-    const auto plan          = detail::swa_resolve_plan(tokens, envelope);
+    const auto plan          = detail::swa_resolve_plan(tokens, envelope, context.capacity);
     PartialWorkspace partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
     detail::swa_launch(q, query_k, query_v, positions, valid_columns, lanes, scale, context, plan,
                        partial.acc, partial.m, partial.l, out, stream);

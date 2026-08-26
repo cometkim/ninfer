@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "core/weight.h"
 
 #include <cuda_runtime.h>
 
@@ -26,17 +27,20 @@ namespace ninfer::ops {
  *
  * `candidates`, `predecessor_ids` are contiguous I32 `[K, P, L]` with ids in
  * `[0, vocab)`; `unary` and `out` are contiguous FP32 `[K, P, L]` and
- * `[K, K, P, L]`; `hidden_proj` is contiguous FP32 `[R, P, L]`; the codebooks
- * are contiguous BF16 `[vocab, R]` (rows outside the represented id domain are
- * never read). K is in [1, 32], R in [16, 512], P in [1, 15], L in [1, 8].
- * Inputs and output must not overlap. The oracle evaluates the formula naively
- * in FP64 from the represented inputs; codebook rows are decoded from BF16
- * exactly. Accumulation order and precision are implementation choices. There
- * is no workspace or persistent state effect.
+ * `[K, K, P, L]`; `hidden_proj` is contiguous FP32 `[R, P, L]`. The codebooks
+ * are NVFP4 `Weight`s with logical shape `[vocab, R]` and the registered
+ * BlockScaleK16M128x4 layout: gathered row values decode exactly as
+ * `E2M1(code) * E4M3FN(group scale) / weight_scale_divisor`. R is a positive
+ * multiple of 64 and vocab a positive multiple of 128. K is in [1, 32],
+ * R in [16, 512], P in [1, 15], L in [1, 8]. Inputs and output must not
+ * overlap. The oracle evaluates the formula naively in FP64 from the
+ * represented inputs; codebook rows are decoded from the stored codes and
+ * scales exactly. Accumulation order and precision are implementation
+ * choices. There is no workspace or persistent state effect.
  */
 void dflash2_selector_scores(const Tensor& candidates, const Tensor& predecessor_ids,
                              const Tensor& unary, const Tensor& hidden_proj,
-                             const Tensor& successor_rows, const Tensor& predecessor_rows,
+                             const Weight& successor_rows, const Weight& predecessor_rows,
                              Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

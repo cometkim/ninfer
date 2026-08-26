@@ -48,7 +48,7 @@ void dflash2_selector_walk_launch(const Tensor& scores, const Tensor& candidates
 
 void dflash2_selector_scores_launch(const Tensor& candidates, const Tensor& predecessor_ids,
                                     const Tensor& unary, const Tensor& hidden_proj,
-                                    const Tensor& successor_rows, const Tensor& predecessor_rows,
+                                    const Weight& successor_rows, const Weight& predecessor_rows,
                                     Tensor& out, cudaStream_t stream) {
     const std::int64_t scores = static_cast<std::int64_t>(out.ne[0]) * out.ne[1] * out.ne[2] *
                                 out.ne[3];
@@ -57,11 +57,28 @@ void dflash2_selector_scores_launch(const Tensor& candidates, const Tensor& pred
         static_cast<const std::int32_t*>(candidates.data),
         static_cast<const std::int32_t*>(predecessor_ids.data),
         static_cast<const float*>(unary.data), static_cast<const float*>(hidden_proj.data),
-        static_cast<const __nv_bfloat16*>(successor_rows.data),
-        static_cast<const __nv_bfloat16*>(predecessor_rows.data),
+        static_cast<const std::uint8_t*>(successor_rows.qdata),
+        static_cast<const std::uint8_t*>(successor_rows.scales),
+        1.0F / successor_rows.weight_scale_divisor,
+        static_cast<const std::uint8_t*>(predecessor_rows.qdata),
+        static_cast<const std::uint8_t*>(predecessor_rows.scales),
+        1.0F / predecessor_rows.weight_scale_divisor,
         static_cast<std::int32_t>(hidden_proj.ne[0]), static_cast<std::int32_t>(candidates.ne[0]),
         static_cast<std::int32_t>(candidates.ne[1]), static_cast<std::int32_t>(candidates.ne[2]),
         static_cast<float*>(out.data));
+}
+
+void dflash2_selector_predecessors_launch(const Tensor& candidates, const Tensor& anchors,
+                                          Tensor& out, cudaStream_t stream) {
+    const std::int64_t elements =
+        static_cast<std::int64_t>(out.ne[0]) * out.ne[1] * out.ne[2] * out.ne[3];
+    const int threads = 256;
+    const int blocks  = static_cast<int>((elements + threads - 1) / threads);
+    dflash2_selector_predecessors_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const std::int32_t*>(candidates.data),
+        static_cast<const std::int32_t*>(anchors.data), static_cast<std::int32_t>(out.ne[0]),
+        static_cast<std::int32_t>(out.ne[1]), static_cast<std::int32_t>(out.ne[2]),
+        static_cast<std::int32_t*>(out.data));
 }
 
 } // namespace ninfer::ops::detail

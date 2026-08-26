@@ -47,7 +47,8 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 
 } // namespace
 
-SwaPlan swa_resolve_plan(std::int32_t tokens, SwaContextExecutionEnvelope envelope) {
+SwaPlan swa_resolve_plan(std::int32_t tokens, SwaContextExecutionEnvelope envelope,
+                         std::uint32_t window) {
     if (tokens < 1 || tokens > 16) { throw std::invalid_argument("swa plan: T must be 1..16"); }
     if (envelope.min_context > envelope.max_context) {
         throw std::invalid_argument("swa plan: invalid envelope");
@@ -57,7 +58,7 @@ SwaPlan swa_resolve_plan(std::int32_t tokens, SwaContextExecutionEnvelope envelo
     constexpr std::uint32_t direct_context_limit = 96;
     const bool direct                            = envelope.max_context <= direct_context_limit;
     constexpr std::int32_t key_block             = 32;
-    const std::uint32_t context_rows             = std::min(envelope.max_context, 4095u);
+    const std::uint32_t context_rows             = std::min(envelope.max_context, window - 1u);
     const std::int32_t context_tiles =
         static_cast<std::int32_t>((context_rows + key_block - 1u) / key_block);
     constexpr std::int32_t split_limit = 32;
@@ -106,7 +107,8 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                     static_cast<const std::int32_t*>(lanes.data),
                     static_cast<const __nv_bfloat16*>(context.k.data),
                     static_cast<const __nv_bfloat16*>(context.v.data),
-                    static_cast<int>(context.padded_capacity), plan.max_context, 1, scale,
+                    static_cast<int>(context.padded_capacity), static_cast<int>(context.capacity),
+                    plan.max_context, 1, scale,
                     static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                     static_cast<__nv_bfloat16*>(out.data));
@@ -125,7 +127,8 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 static_cast<const std::int32_t*>(lanes.data),
                 static_cast<const __nv_bfloat16*>(context.k.data),
                 static_cast<const __nv_bfloat16*>(context.v.data),
-                static_cast<int>(context.padded_capacity), plan.max_context, plan.split_capacity,
+                static_cast<int>(context.padded_capacity), static_cast<int>(context.capacity),
+                plan.max_context, plan.split_capacity,
                 scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                 static_cast<__nv_bfloat16*>(out.data));
@@ -140,7 +143,8 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 static_cast<const float*>(partial_m.data),
                 static_cast<const float*>(partial_l.data),
                 static_cast<const std::int32_t*>(positions.data),
-                static_cast<const std::int32_t*>(valid_columns.data), plan.max_context,
+                static_cast<const std::int32_t*>(valid_columns.data),
+                static_cast<int>(context.capacity), plan.max_context,
                 plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
     });

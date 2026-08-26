@@ -35,10 +35,25 @@ struct DFlashPersistentLayout {
     }
 };
 
+// The DFlash2 drafter's whole persistent state: five all-SWA cyclic layers (no full layer, no
+// paged backend) plus the target-feature capture buffers.
+struct DFlash2PersistentLayout {
+    CyclicKVCacheLayout local;
+    CyclicKVCacheLayout rewrite_checkpoint_local;
+    TensorLayout prefill_features;
+    TensorLayout prefill_positions;
+    TensorLayout pending_features;
+
+    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
+        return local.payload_bytes() + rewrite_checkpoint_local.payload_bytes();
+    }
+};
+
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
+    std::optional<DFlash2PersistentLayout> dflash2;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
     TensorLayout token_counts;

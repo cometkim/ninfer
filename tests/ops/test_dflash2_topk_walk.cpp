@@ -32,14 +32,16 @@ int run_topk_case(const char* label, std::int32_t rows, std::int32_t columns, st
         std::vector<std::pair<float, int>> entries;
         entries.reserve(static_cast<std::size_t>(rows));
         for (int r = 0; r < rows; ++r) {
-            entries.emplace_back(logits[static_cast<std::size_t>(r) * columns + t], r);
+            entries.emplace_back(logits[static_cast<std::size_t>(r) +
+                                         static_cast<std::size_t>(rows) * t], r);
         }
         std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
             return a.first > b.first || (a.first == b.first && a.second < b.second);
         });
         for (int slot = 0; slot < k; ++slot) {
-            want_ids[static_cast<std::size_t>(slot) * columns + t]  = entries[slot].second;
-            want_values[static_cast<std::size_t>(slot) * columns + t] =
+            want_ids[static_cast<std::size_t>(slot) + static_cast<std::size_t>(k) * t] =
+                entries[slot].second;
+            want_values[static_cast<std::size_t>(slot) + static_cast<std::size_t>(k) * t] =
                 f32_to_bf16(entries[slot].first);
         }
     }
@@ -77,15 +79,21 @@ int run_walk_case(const char* label, std::int32_t top_k, std::int32_t positions,
             int best_i   = 0;
             float best_v = -1e30F;
             for (int i = 0; i < top_k; ++i) {
-                const float v = scores[(((static_cast<std::size_t>(i) * top_k + pred) *
-                                         positions + s) * lanes) + static_cast<std::size_t>(l)];
+                const float v = scores[static_cast<std::size_t>(i) +
+                                      static_cast<std::size_t>(top_k) *
+                                          (static_cast<std::size_t>(pred) +
+                                           static_cast<std::size_t>(top_k) *
+                                               (static_cast<std::size_t>(s) * lanes + l))];
                 if (v > best_v) {
                     best_v = v;
                     best_i = i;
                 }
             }
-            want[static_cast<std::size_t>(s) * lanes + l] =
-                candidates[(static_cast<std::size_t>(best_i) * positions + s) * lanes + l];
+            want[static_cast<std::size_t>(s) +
+                 static_cast<std::size_t>(positions) * l] =
+                candidates[static_cast<std::size_t>(best_i) +
+                           static_cast<std::size_t>(top_k) *
+                               (static_cast<std::size_t>(s) * lanes + l)];
             pred = best_i;
         }
     }

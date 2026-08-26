@@ -9,7 +9,6 @@ namespace ninfer::ops {
 
 inline constexpr int kKVCacheAppendPrefixHeadDim = 128;
 inline constexpr int kKVCacheAppendPrefixHeads   = 8;
-inline constexpr int kKVCacheAppendPrefixWindow  = 4096;
 inline constexpr int kKVCacheAppendPrefixPage    = 64;
 
 __device__ __forceinline__ void kv_cache_append_prefix_copy_cyclic_unit(
@@ -68,7 +67,7 @@ __global__ void kv_cache_append_prefix_cyclic_kernel(
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
     const std::int32_t* __restrict__ lanes, __nv_bfloat16* __restrict__ cache_k,
     __nv_bfloat16* __restrict__ cache_v, int min_count, int max_count, int width,
-    int padded_capacity) {
+    int padded_capacity, int window) {
     constexpr int UnitsPerToken  = kKVCacheAppendPrefixHeads * 8;
     constexpr int TokensPerBlock = 256 / UnitsPerToken;
     static_assert(TokensPerBlock * UnitsPerToken == 256);
@@ -93,7 +92,7 @@ __global__ void kv_cache_append_prefix_cyclic_kernel(
     const int token         = static_cast<int>(blockIdx.x) * TokensPerBlock + local_token;
     if (token >= count) return;
     const int position = positions[token];
-    const int slot     = position & (kKVCacheAppendPrefixWindow - 1);
+    const int slot     = position & (window - 1);
     kv_cache_append_prefix_copy_cyclic_unit(k, v, cache_k, cache_v, token, unit_in_token, slot,
                                             padded_capacity);
 }
