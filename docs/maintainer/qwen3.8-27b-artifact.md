@@ -751,3 +751,134 @@ python3 -m tools.convert.qwen3_8_27b.convert \
 The converter validates the official checkpoint, frontend resources, complete object plan, and
 numeric recipes before opening the output, then writes the sibling
 `qwen3_8_27b.ninfer.conversion.json` report.
+
+## 14. Fork artifact: `nvfp4full`
+
+This fork additionally builds a fuller-NVFP4 Qwen3.8-27B artifact with the memory profile of the
+Qwen3.6 NVFP4 recipe. It is produced and verified by the fork-local tools
+`tools.convert.qwen3_8_27b.{nvfp4_encode, calibrate_nvfp4full, convert_nvfp4full, verify_nvfp4full}`
+and binds through the same registered target as an additional weights contract.
+
+### 14.1 Identity and contents
+
+```text
+filename   = qwen3_8_27b_nvfp4full.ninfer
+model_id   = qwen3.8-27b
+weights_id = nvfp4full
+target_key = qwen3_8_27b
+recipe_id  = qwen3_8_27b_nvfp4full-v1
+converter  = tools.convert.qwen3_8_27b.convert_nvfp4full
+```
+
+The artifact contains 1253 tensors and the same six frontend resources (1259 objects). Its Text
+allocation applies the Qwen3.6-27B NVFP4 exception pattern to this checkpoint and object naming:
+
+- `attention/query_key_gate_value` is `BF16` on layers `3,7,11,15,19,23` and `NVFP4` on the other
+  ten full-attention layers;
+- `attention/output` is `BF16` on layers `3,7` and `NVFP4` on the other fourteen;
+- every GDN layer has one NVFP4 `gdn/query_key_value_z` parent; `gdn/output` is `BF16` only on
+  layer `4` and NVFP4 on the other 47;
+- every Text `mlp/gate_up` and `mlp/down` is NVFP4;
+- `text/token_embedding` and `text/output_head` use `W8G32_F16S` with `MAXABS_F16_RECIP_RNE_V1`;
+- MTP, Vision, and the optimized draft head keep the registered formats of Section 13.
+
+This yields 247 NVFP4 parents, 247 site-level FP32 input divisors, and nine BF16 exception parents.
+
+| Format | Tensors |
+|---|---:|
+| `BF16` | 543 |
+| `FP32` | 343 |
+| `I32` | 1 |
+| `Q4G64_F16S` | 55 |
+| `Q5G64_F16S` | 54 |
+| `Q6G64_F16S` | 1 |
+| `W8G32_F16S` | 9 |
+| `NVFP4` | 247 |
+
+| Layout | Tensors |
+|---|---:|
+| `contiguous-le-v1` | 887 |
+| `row-split-k128-v1` | 119 |
+| `blockscale-k16-m128x4-v1` | 247 |
+
+The generated file is 18,324,059,648 bytes (17.07 GiB).
+
+### 14.2 Sources and provenance
+
+The base source is `Qwen/Qwen3.8-27B` revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` and owns
+every locally quantized NVFP4 parent, every BF16 exception, all direct tensors, both W8 endpoints,
+and the draft head, MTP, Vision, and frontend components. The quantized Text source is
+`unsloth/Qwen3.8-27B-NVFP4`: the document-pinned revision `60e813d4dbbdc5d64cf3f5a8caf2897bedf03679`
+was force-pushed out of the upstream repository, so the converter cites the reachable `main`
+revision `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` and structurally validates the exact
+mixed-precision allocation (168 NVFP4 MLP matrices with `weight_packed`/`weight_scale`/
+`weight_global_scale`/`input_global_scale` fields and 233 row-scaled FP8 matrices) before any word
+is copied. Its only artifact inputs are the 112 MLP NVFP4 parents of layers `0..55` and their
+divisors, copied bit-exactly with the same gate/up shared-divisor equality checks as the registered
+profile. The upstream single 22.5 GiB shard is repacked into bounded shards by
+`tools.convert.qwen3_8_27b.split_quantized_shards` without touching a value, name, dtype, or shape.
+
+### 14.3 Local encoder profile and site divisors
+
+Locally quantized parents use the documented encoder profile `NVFP4_MAXABS_DIVISOR_RNE_V1`
+(`tools/convert/qwen3_8_27b/nvfp4_encode.py`): with `amax = max|W|` over the complete parent and
+`2688 = 6 x 448`,
+
+```text
+d_w = binary32(2688 / amax)            # 1 when the parent is all zero
+y   = binary32(W * d_w)
+per K-group of 16:
+    s  = E4M3FN(min(max|y| in group / 6, 448))   # RNE, +0 for an all-zero group
+    q  = E2M1(y / decode(s))                     # RNE ties-to-even, saturating at +-6
+```
+
+Codes and scales are bit-level verified against exhaustive E2M1/E4M3FN decode tables and the
+`blockscale-k16-m128x4-v1` writer is byte-for-byte validated against rdtand-sourced objects in the
+official Qwen3.6 NVFP4 artifact before production use. Against the BF16 source, locally quantized
+parents measure at most 0.0951 relative Frobenius error; the same metric on the unsloth-copied
+parents measures 0.107-0.126, so the local profile is at least as accurate per tensor.
+
+Site input divisors for the 135 locally quantized parents come from the fixed calibration
+`out/qwen3_8_27b_nvfp4full_calibration.json`: `d_x = binary32(2688 / max|site input|)` over a
+committed ten-document corpus (2,690 tokens) evaluated by streaming the official BF16 checkpoint
+layer-by-layer through the GPU. As a derivation check the same statistic measured on the 56
+unsloth-owned `mlp/gate_up` sites reproduces the amax implied by their stored `input_global_scale`
+words with median ratio 0.96 and maximum 1.00, matching the upstream per-tensor-amax derivation.
+
+### 14.4 Production and verification
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.calibrate_nvfp4full \
+  --model /path/to/Qwen3.8-27B --quantized-model /path/to/Qwen3.8-27B-NVFP4 \
+  --out out/qwen3_8_27b_nvfp4full_calibration.json
+python3 -m tools.convert.qwen3_8_27b.convert_nvfp4full \
+  --model /path/to/Qwen3.8-27B --quantized-model /path/to/Qwen3.8-27B-NVFP4 \
+  --calibration out/qwen3_8_27b_nvfp4full_calibration.json \
+  --out out/qwen3_8_27b_nvfp4full.ninfer
+python3 -m tools.convert.qwen3_8_27b.verify_nvfp4full out/qwen3_8_27b_nvfp4full.ninfer \
+  --model /path/to/Qwen3.8-27B --quantized-model /path/to/Qwen3.8-27B-NVFP4 \
+  --calibration out/qwen3_8_27b_nvfp4full_calibration.json
+```
+
+`verify_nvfp4full` revalidates the complete ordered directory, both W8 endpoints against base rows,
+all 112 source NVFP4 payloads word-for-word, all 135 local payloads against both the encoder profile
+and the independent decode oracle, all 247 input-divisor words, the nine BF16 exception parents, and
+the six resources.
+
+### 14.5 Measured results (RTX 5090)
+
+| Measurement | `nvfp4full` | official `nvfp4` |
+|---|---:|---:|
+| artifact bytes | 18,324,059,648 | 21,492,695,040 |
+| device weights | 16.03 GiB | 18.98 GiB |
+| free after startup, INT8 KV @ 262,144 | 4.91 GiB | 2.22 GiB |
+| MTP3 decode tok/s (8,192-token context, greedy) | 134.7 | 118.9 |
+| prefill tok/s (same run) | 913 | 703 |
+
+Greedy MTP3 acceptance was 156/256 tokens (positions 77/49/30) versus 152/256 (78/44/30) for the
+official artifact. On GPQA-Diamond under the registered serving profile (thinking, MTP=3, INT8 KV,
+262,144-token context; EvalScope 1.9.0, 0-shot, rule scoring, one sample, temperature 0.6, seed 42)
+the artifact scores **89.39% (177 / 198)** against the official NVFP4 artifact's currently
+published 90.40% (179 / 198) - a two-question difference on single-sample runs, within the
+~2.1% sampling error at n=198; the 198-sample run averaged 129.3 tok/s with 11,927 output
+tokens per question.
