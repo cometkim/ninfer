@@ -69,6 +69,7 @@ target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core ${NINFER_CUDART_TARGE
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
   ops/launcher/add_bias.cu
+  ops/launcher/dflash2_draft.cu
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
@@ -241,6 +242,7 @@ add_library(ninfer_ops STATIC
   ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
   ops/linear/linear.cpp
   ops/wrapper/add_bias.cpp
+  ops/wrapper/dflash2_draft.cpp
   ops/wrapper/argmax.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
