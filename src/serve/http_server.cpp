@@ -579,10 +579,6 @@ void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) c
     res.set_content(make_props_stub(options_, public_model_id_).dump(), "application/json");
 }
 
-void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_props_stub(options_, public_model_id_).dump(), "application/json");
-}
-
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
     nlohmann::json body;
     try {

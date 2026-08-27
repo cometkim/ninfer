@@ -1,6 +1,6 @@
 schema_version: 1
 
-# Long-context quality gates for qwen3.8-27b (ROADMAP-1m-context.md WI-5). Each suite runs
+# Long-context quality gates for qwen3.8-27b (the former 1m-context track, now `ROADMAP.md`). Each suite runs
 # against its own ninfer-serve launch; the required server flags are noted per suite.
 #
 # Two benchmark families:
@@ -214,6 +214,125 @@ suites:
         generation: *mcq
         backend_args:
           subset_list: [medium]
+          judge_strategy: rule
+
+  # PAIRED codec attribution cell (2026-08-25, HANDOFF item 0): the same first-40 medium
+  # samples under two servers that differ ONLY in kv-dtype. Both run yarn:2 so the rope
+  # profile is controlled; hq serves at its held 524k envelope, int8 at 393216 (its fit
+  # ceiling beside nvfp4full weights). Samples over 393216 input tokens fail by construction
+  # in the int8 cell and are excluded from the paired analysis identically. Pair on shared
+  # completed samples, n>=30 target; greedy MCQ, thinking off.
+  #   hq cell:   --kv-dtype hq-e8-2b --max-context 524288 --rope-scaling yarn:2
+  #   int8 cell: --kv-dtype int8 --max-context 393216 --rope-scaling yarn:2
+  lbv2_medium_pair:
+    jobs:
+      - id: lbv2_medium_pair
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        limit: 40
+        generation: *mcq
+        backend_args:
+          subset_list: [medium]
+          judge_strategy: rule
+
+  # 768k/yarn:3 discriminator (i) — HANDOFF item 0 owner addendum 2026-08-25: static rope
+  # factor intelligence cell. The same first-60 GPQA-diamond samples (doc profile: temp 0.6,
+  # penalty 1.0, thinking on, seed 42 - the 89-90% reference band's profile) under three
+  # servers that differ ONLY in --rope-scaling: absent (factor 1), yarn:2, yarn:3. Short
+  # prompts make the cell cheap; needles are blind to the factor-driven failure mode, GPQA
+  # reasoning is the instrument. All cells: --kv-dtype int8 --max-context 262144.
+  gpqa_rope_factor:
+    jobs:
+      - id: gpqa_factor
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: qwen38_api
+        max_concurrency: 1
+        limit: 60
+        generation:
+          temperature: 0.6
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 1.0
+          frequency_penalty: 0.0
+          max_tokens: 73728
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+        backend_args:
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+  # QUANTITATIVE RE-BASELINE (2026-08-25, owner review of the low LBv2 absolutes): the
+  # historical *mcq profile (thinking off, 1024 tokens) understates this model - without the
+  # thinking channel it still writes long visible CoT that the 1024 budget cuts before the
+  # "ANSWER:" marker, and over-envelope docs score as wrong. This profile gives the model its
+  # strongest mode (thinking on, 16k budget - the GPQA reference style) so the absolute level
+  # is comparable to the official leaderboard tier. Score on ADMITTED docs only: exclude any
+  # sample whose stored output contains "exceeding Engine max_context" (by-construction
+  # envelope rejection). Server: --kv-dtype hq-e8-2b --max-context 262144 (native).
+  lbv2_medium_quant:
+    jobs:
+      - id: lbv2_medium_quant
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        limit: 15
+        generation:
+          temperature: 0
+          max_tokens: 16384
+          seed: 42
+          extra_body:
+            enable_thinking: true
+        backend_args:
+          subset_list: [medium]
+          judge_strategy: rule
+
+  # FULL quantitative cell (2026-08-25, owner-approved): the complete medium subset (215)
+  # with the quant profile - settles the LBv2 absolute at SE ~3.5pp (~7-9 h GPU). Same
+  # admitted-only scoring rule as lbv2_medium_quant. Server: native 262144 hq.
+  lbv2_medium_quant_full:
+    jobs:
+      - id: lbv2_medium_quant_full
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        generation:
+          temperature: 0
+          max_tokens: 16384
+          seed: 42
+          extra_body:
+            enable_thinking: true
+        backend_args:
+          subset_list: [medium]
+          judge_strategy: rule
+
+  # 768k DECIDING CELL (2026-08-25): the long method with its own positive control. Two
+  # servers identical except the factor, same first-12 lbv2 LONG docs (real-document MCQ,
+  # greedy, thinking off): yarn:3 (786432 = exactly 3x native — the 768k profile) and yarn:4
+  # (the owner-perceived bad factor at the same lengths). Docs over 786432 tokens reject by
+  # construction identically. The method is validated only if yarn:4 READS WORSE than yarn:3
+  # on the shared samples; a yarn:3-clean read is then trustworthy. If both read equal, the
+  # long method is blind too and 768k stays unproven.
+  #   y3: --kv-dtype hq-e8-2b --max-context 786432 --rope-scaling yarn:3
+  #   y4: same with --rope-scaling yarn:4
+  lbv2_long_768k:
+    jobs:
+      - id: lbv2_long_768k
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        limit: 12
+        generation: *mcq
+        backend_args:
+          subset_list: [long]
           judge_strategy: rule
 
   # Server: --kv-dtype hq-e8-2b --max-context 1048576 --kv-capacity 1048576

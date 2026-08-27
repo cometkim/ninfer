@@ -42,6 +42,9 @@ tools/freq_corpus/fixtures/*
 # Local eval prerequisites (ModelScope needle corpus, extracted tokenizer trio)
 /eval/data/
 
+# Root-level build/configure log captures from wrapper runs
+/*-log.txt
+
 # Editor / OS
 .vscode/
 .idea/

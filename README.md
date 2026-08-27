@@ -23,10 +23,9 @@ Branch layout:
   absolute toolchain paths, local prompts, or agent workspaces) so any of them can become an
   upstream PR at any time. They are rewritten freely
   (`git push --force-with-lease origin feat/...`). Feature branches stack on `master`
-  directly or on `feat/windows-port` — the Windows port layer (from
-  `natpate/ninfer-windows`), which is engine work, not environment: local builds and local
-  verification require it. It is itself PR-able; when upstream takes it, the branches above
-  rebase onto `master` and the layer disappears.
+  directly or on each other; the historical `feat/windows-port` layer (from
+  `natpate/ninfer-windows`) is folded into the fork base — natpate's line is tracked no
+  further (only `feat/build-speed` still PRs there, kept mergeable against their master).
 
 The experimentation cycle:
 
@@ -73,9 +72,9 @@ tip only by fork-only files (environment and session docs) and content owned by 
 branches or upstream commits the feature lineage predates:
 
 ```
-git diff feat/1m-context cometkim/dev --name-only    # expect fork files (.gitignore,
+git diff feat/dflash2 cometkim/dev --name-only      # expect fork files (.gitignore,
                                                     # Directory.Build.props, HANDOFF.md,
-                                                    # ROADMAP-1m-context.md, build scripts,
+                                                    # ROADMAP*.md, build scripts,
                                                     # longprompt_*.json, README) plus
                                                     # sibling-branch files — never a
                                                     # feature-owned file
@@ -85,7 +84,7 @@ Machine-specific files live only in the environment commit (`Directory.Build.pro
 CUDA 13.3 toolkit path for MSBuild; `configure-ninja.ps1`/`build-ninja.ps1` are the Ninja
 fast-path build wrappers and `build-live.ps1` the live-progress Visual Studio wrapper, with
 machine-local fallbacks for `VCPKG_ROOT` and `CUDA_PATH`; `longprompt_*.json` are fixed-context
-bench inputs; `HANDOFF.md` and `ROADMAP-1m-context.md` track active work).
+bench inputs; `HANDOFF.md` and `ROADMAP.md` track active work).
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
@@ -175,7 +174,20 @@ What this fork adds on top (one squashed commit per feature branch, per
   garble: greedy needle retrieval is exact at 32k/304k/390k/592k true tokens (592k runs
   yarn:4 at 916–922 prefill / 15.2 decode tok/s; MTP3 at 390k commits 62.9 tok/s). Beyond
   ~592k the 1M cell still garbles (depth-independent; dense-YaRN-at-1M is the leading
-  suspect — see HANDOFF).
+  suspect); the 1M goal itself is dropped — 524k is the held envelope, 786k is
+  engineering-ready pending a decision.
+- **`feat/kernel-perf`** — the general kernel-performance track on the non-hq paths: f16-
+  accumulate PV with an exact range guard and key-range splitting in the prompt attention
+  kernels (pp65536 int8 +14.2%, hq +6.0%), programmatic dependent launch across the decode
+  chain with the publish-at-end rule, a fused norm+control projection for the 27B decode
+  route, the sigmoid gate folded into the attention op, a bit-exact fused q/k rmsnorm+rope
+  kernel, and a per-request error boundary in the engine.
+- **`feat/dflash2`** — the DFlash2 speculative backend: width-8 block verify on the hq route
+  with MTP K≤7 plumbing, the 2B drafter embedded in the nvfp4full artifact (module matrices
+  in NVFP4), four new draft ops (two-tap dynamic conv, selector scores/top-k/walk), and the
+  full engine integration — one parallel draft forward replaces MTP's sequential drafts and
+  commits +30% over MTP3 at 8k and +52% at the 258k native envelope at equal-or-better
+  acceptance.
 
 Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
 requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from upstream.

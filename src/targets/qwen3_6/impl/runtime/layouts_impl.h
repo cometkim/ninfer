@@ -808,12 +808,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    // Measured instantiation per big-visible class: <=262144 keys fits the
-                    // historical 82 MiB; the split-grid step past it measured 427-437 MiB at
-                    // ~304k visible keys after WI-2 banding. The 1M-envelope tier is a
-                    // conservative extrapolation, not a measurement.
+                    // Measured instantiation per big-visible class: <=262144 keys measured
+                    // ~84 MiB on driver 616.56, so the 262k tier carries headroom at 96 MiB;
+                    // the split-grid step past it measured 427-437 MiB at ~304k visible keys
+                    // after WI-2 banding. The 1M-envelope tier is a conservative extrapolation,
+                    // not a measurement.
                     const std::uint64_t tier = final_visible <= 4096        ? 12ULL
-                                               : final_visible <= 262144    ? 82ULL
+                                               : final_visible <= 262144    ? 96ULL
                                                : final_visible <= 524288    ? 512ULL
                                                                              : 1024ULL;
                     return tier * kMiB;
@@ -851,7 +852,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
                     const std::uint64_t tier = final_visible <= 4096        ? 12ULL
-                                               : final_visible <= 262144    ? 82ULL
+                                               : final_visible <= 262144    ? 96ULL
                                                : final_visible <= 524288    ? 512ULL
                                                                              : 1024ULL;
                     return tier * kMiB;

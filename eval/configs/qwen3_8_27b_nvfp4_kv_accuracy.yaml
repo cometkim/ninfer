@@ -48,14 +48,16 @@ suites:
         backend: evalscope
         dataset: aime25
         target: qwen38_api
-        max_concurrency: 2
+        max_concurrency: 1
         generation: &aime_generation
           temperature: 1.0
           top_p: 0.95
           top_k: 20
           presence_penalty: 0.0
           frequency_penalty: 0.0
-          # At C=2, two full budgets use 245,760 of the measured 255,360-token KV pool.
+          # C=1: at C=2 two rotating 122,880-token budgets leave no admission
+          # slack in the 255,360-token pool and the next request expired in the
+          # bounded ingress (503 request_queue_timeout, 2026-08-24 campaign).
           max_tokens: 122880
           seed: 42
           extra_body:
@@ -69,7 +71,7 @@ suites:
         backend: evalscope
         dataset: aime26
         target: qwen38_api
-        max_concurrency: 2
+        max_concurrency: 1
         generation: *aime_generation
         backend_args: *aime_backend
 
