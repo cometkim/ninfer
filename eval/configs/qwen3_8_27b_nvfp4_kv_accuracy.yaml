@@ -1,0 +1,118 @@
+schema_version: 1
+
+# KV-dtype accuracy campaign: same target, generation, and dataset settings as
+# qwen3_8_27b_nvfp4_reasoning.yaml (copied verbatim), with the jobs split into
+# separately invocable suites so each phase (GPQA first, then AIME, then the
+# multimodal pair) can run against its own server launch.
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 2
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  gpqa:
+    jobs:
+      - id: gpqa_diamond
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: qwen38_api
+        max_concurrency: 1
+        generation:
+          # Docs/performance.md "EvalScope reasoning accuracy" profile, shared
+          # by the 2026-08-20 int8 reference run on this box: temp 0.6,
+          # presence penalty 1.0, 73,728-token budget, thinking on, seed 42.
+          temperature: 0.6
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 1.0
+          frequency_penalty: 0.0
+          max_tokens: 73728
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+        backend_args:
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+  aime:
+    jobs:
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &aime_generation
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # At C=2, two full budgets use 245,760 of the measured 255,360-token KV pool.
+          max_tokens: 122880
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+        backend_args: &aime_backend
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *aime_generation
+        backend_args: *aime_backend
+
+  multimodal:
+    jobs:
+      - id: erqa
+        backend: evalscope
+        dataset: erqa
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &multimodal_generation
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # ERQA_75 is the largest cached prepared prompt at 12,394 tokens; the
+          # 81,920-token vision context leaves 3,990 tokens beyond it plus the
+          # 65,536-token output bound.
+          max_tokens: 65536
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+        backend_args: &multimodal_backend
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: real_world_qa
+        backend: evalscope
+        dataset: real_world_qa
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *multimodal_generation
+        backend_args: *multimodal_backend
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 900
+  samples:
+    retention: all

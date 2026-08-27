@@ -95,24 +95,28 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
     const int kt_begin = split * kTilesPerSplit;
 
     if constexpr (NormalizeInput) {
-        static_assert(SplitK == 32, "fused input normalization is tuned for split-32");
+        // Warp 0 of row tile 0 accumulates its split's full share of the hidden sum of squares:
+        // kTilesPerSplit consecutive 64-element slices (one per K-tile), reduced across splits
+        // after the cooperative handoff.
         static_assert(NormTokenCapacity > 0 && NormTokenCapacity <= 16);
         constexpr int kLocalPairs     = kBf16GdnBlockK / 2;
         const auto* x2                = reinterpret_cast<const __nv_bfloat162*>(x);
         const int token_count         = min(kBf16GdnBlockN, t - token0);
         float sums[NormTokenCapacity] = {};
-        // One warp from row tile zero contributes a 64-element norm slice. The existing post-MMA
-        // cooperative handoff reduces the 32 slices, so normalization adds no grid-wide barrier.
         if (blockIdx.y == 0 && warp == 0) {
-            for (int pair = lane; pair < kLocalPairs; pair += kWarpSize) {
 #pragma unroll
-                for (int token_local = 0; token_local < NormTokenCapacity; ++token_local) {
-                    if (token_local >= token_count) { continue; }
-                    const std::int64_t row_base =
-                        static_cast<std::int64_t>(token0 + token_local) * (kBf16GdnHidden / 2);
-                    const int global_pair = kt_begin * (kBf16GdnBlockK / 2) + pair;
-                    const float2 value    = __bfloat1622float2(x2[row_base + global_pair]);
-                    sums[token_local] += value.x * value.x + value.y * value.y;
+            for (int local_tile = 0; local_tile < kTilesPerSplit; ++local_tile) {
+                for (int pair = lane; pair < kLocalPairs; pair += kWarpSize) {
+#pragma unroll
+                    for (int token_local = 0; token_local < NormTokenCapacity; ++token_local) {
+                        if (token_local >= token_count) { continue; }
+                        const std::int64_t row_base =
+                            static_cast<std::int64_t>(token0 + token_local) * (kBf16GdnHidden / 2);
+                        const int global_pair =
+                            (kt_begin + local_tile) * (kBf16GdnBlockK / 2) + pair;
+                        const float2 value = __bfloat1622float2(x2[row_base + global_pair]);
+                        sums[token_local] += value.x * value.x + value.y * value.y;
+                    }
                 }
             }
 #pragma unroll

@@ -2,8 +2,10 @@
 
 // INT8-native GQA prompt kernel for the registered Qwen3.6 head geometries. QK stays INT8 through
 // m16n8k32.s8 Tensor Cores; V alone is dequantized with packed FP16 arithmetic while
-// producer warps execute QK. Sixteen warps split each 16-row FP16 PV output across
-// four 64-dimension slices.
+// producer warps execute QK. PV is f16-accumulated per 64-key tile (2x the f32-accumulate issue
+// rate) and promoted to the f32 running sum once per tile, with a 2^-6 range guard on the staged
+// V so a tile partial can never leave the fp16 range. Sixteen warps split each 16-row FP16 PV
+// output across four 64-dimension slices.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -60,17 +62,22 @@ __device__ __forceinline__ int gqa_prefill_i8_p_swz(int row, int col) {
     return gqa_prefill_swz(row, col);
 }
 
+// V dequantized with a 2^-6 range guard: PV below accumulates f16 over a 64-key tile, and with
+// p in [0,1] the guarded partial is bounded by (sum p)/64 * max|v| <= max|v| — representable for
+// every V the fp16 dequant itself admits. The promotion multiplies the exact power of two back;
+// scaling commutes with f16 rounding above 2^-8, so values change only in the subnormal tail.
 __device__ __forceinline__ int4 gqa_prefill_i8_dequant_f16x8(const std::int8_t* codes8,
                                                              __half scale) {
     const int2 raw       = load_vec<int2>(codes8);
     const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
     const __half2 s2     = __halves2half2(scale, scale);
+    const __half2 guard  = __float2half2_rn(0.015625f); // 2^-6
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const __half2 code2 =
             __floats2half2_rn(static_cast<float>(c[2 * i]), static_cast<float>(c[2 * i + 1]));
-        const __half2 value2 = __hmul2(code2, s2);
+        const __half2 value2 = __hmul2(__hmul2(code2, s2), guard);
         packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
@@ -212,12 +219,13 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
 }
 
 template <typename Geometry, typename Metadata>
-__global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
+__global__ __maxnreg__(128) void gqa_attention_prefill_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width) {
+    std::int32_t width, float* __restrict__ partial_acc, float* __restrict__ partial_m,
+    float* __restrict__ partial_l, std::int32_t split_count) {
     constexpr int D             = kGqaPrefillHeadDim;
     constexpr int Br            = kGqaPrefillI8Br;
     constexpr int Bc            = kGqaPrefillI8Bc;
@@ -263,8 +271,18 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const int tokens  = metadata.valid_tokens(width);
     if (q_head >= Geometry::QHeads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                               kGqaPrefillI8Threads);
+        if (split_count > 1) {
+            // Dead rows carry neutral merge state (m = -inf) so the reducer emits zeros.
+            for (int row = q0 + tid; row < min(q0 + Br, width); row += kGqaPrefillI8Threads) {
+                partial_m[gqa_prefill_partial_stat_index<Geometry>(q_head, row, blockIdx.z, width)] =
+                    -CUDART_INF_F;
+                partial_l[gqa_prefill_partial_stat_index<Geometry>(q_head, row, blockIdx.z, width)] =
+                    0.0f;
+            }
+        } else {
+            gqa_prefill_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
+                                                   kGqaPrefillI8Threads);
+        }
         return;
     }
     const int base_pos              = positions[0];
@@ -273,6 +291,14 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
     const int key_blocks    = max_query_abs / Bc + 1;
+
+    // Key-range split (ROADMAP WI-K1a): grid.z partitions the tile range into contiguous
+    // segments; each segment runs the full online-softmax pipeline over its keys and stores
+    // unnormalized (acc, m, l) partials for gqa_attention_prefill_reduce_kernel.
+    const int split        = static_cast<int>(blockIdx.z);
+    const int tiles_per    = (key_blocks + split_count - 1) / split_count;
+    const int kb_begin     = split * tiles_per;
+    const int kb_end       = min(kb_begin + tiles_per, key_blocks);
 
     // Quantize Q cooperatively. One warp owns one (row, 64-d group) at a time.
     for (int unit = warp; unit < Br * Groups; unit += kGqaPrefillI8Warps) {
@@ -333,7 +359,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         ninfer::ops::cp_commit();
     };
 
-    issue_kv_tile(0);
+    if (kb_begin < kb_end) { issue_kv_tile(kb_begin * Bc); }
     ninfer::ops::cp_wait<0>();
     __syncthreads();
 
@@ -346,8 +372,11 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    // Keeping exactly two group scales live is the spill-free 120-register point on SM120.
-    // Groups 2/3 reload per key tile; retaining all four creates an 8-byte stack frame.
+    // Keeping exactly two group scales live plus the f16 PV tile partials fits the
+    // 128-register cap (512 threads x 128 = one full SM register file, still 1 CTA/SM); at this
+    // point four of the six instantiations report zero ptxas spills and the worst retains
+    // 36/40 B (its pre-f16-PV state spilled 76/80 B at the old 120 cap). Groups 2/3 reload per
+    // key tile; retaining all four creates a stack frame.
     float q_scale_r0[Groups - 2];
     float q_scale_r1[Groups - 2];
     if (warp < ProducerWarps) {
@@ -373,7 +402,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     float running_l0     = 0.0f;
     float running_l1     = 0.0f;
     const float scale_l2 = scale * Log2E;
-    for (int kb = 0; kb < key_blocks; ++kb) {
+    for (int kb = kb_begin; kb < kb_end; ++kb) {
         const int k0 = kb * Bc;
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
@@ -530,7 +559,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         }
         __syncthreads();
 
-        const bool has_next = kb + 1 < key_blocks;
+        const bool has_next = kb + 1 < kb_end;
         if (has_next) { issue_kv_tile((kb + 1) * Bc); }
 
         const int row_tile = warp % kGqaPrefillI8RowTiles;
@@ -544,6 +573,18 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             acc[n][1] *= alpha0;
             acc[n][2] *= alpha1;
             acc[n][3] *= alpha1;
+        }
+
+        // PV runs on the f16-accumulate MMA (2x the f32-accumulate issue rate on GeForce): each
+        // 64-key tile accumulates into f16 fragments and promotes once into the f32 running sum.
+        // The staged V carries the 2^-6 dequant guard, so a tile partial stays within max|v| of
+        // the fp16 range however peaked the tile's p mass is; the promotion scales the exact 64
+        // back in the same FFMA that adds into the running sum.
+        unsigned hacc[PVNtPerWarp][2];
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            hacc[n][0] = 0u;
+            hacc[n][1] = 0u;
         }
 
 #pragma unroll
@@ -561,9 +602,19 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + gqa_prefill_swz(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                        vf[0], vf[1]);
+                mma_f16_f16acc(hacc[n][0], hacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
+        }
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const float2 h0 =
+                __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][0]));
+            const float2 h1 =
+                __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][1]));
+            acc[n][0] = fmaf(64.0f, h0.x, acc[n][0]);
+            acc[n][1] = fmaf(64.0f, h0.y, acc[n][1]);
+            acc[n][2] = fmaf(64.0f, h1.x, acc[n][2]);
+            acc[n][3] = fmaf(64.0f, h1.y, acc[n][3]);
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
@@ -576,6 +627,65 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         final_l_s[row1] = running_l1;
     }
     __syncthreads();
+
+    if (split_count > 1) {
+        // Split mode: producer warps own each row's (m, l). Rows past tile_rows are dead for
+        // this block and MUST still write their own slot (rows in [tokens, width) would
+        // otherwise leave garbage for the reducer) — but never rows past width: an unclamped
+        // row aliases a different (token, split) slot and races its real writer. Dead rows and
+        // causally-empty segments carry m = -inf / l = 0, which the reducer maps to zero rows.
+        if (warp < ProducerWarps && lid == 0) {
+            const int row0       = warp * 16 + gid;
+            const int row1       = row0 + 8;
+            const bool row0_live = row0 < tile_rows;
+            const bool row1_live = row1 < tile_rows;
+            // A dead row still owns a merge slot while q0 + row < width (the reducer must see
+            // m = -inf there); rows past width have no slot at all and must never be written.
+            if (q0 + row0 < width) {
+                partial_m[gqa_prefill_partial_stat_index<Geometry>(q_head, q0 + row0, split,
+                                                                   width)] =
+                    row0_live ? running_m0 : -CUDART_INF_F;
+                partial_l[gqa_prefill_partial_stat_index<Geometry>(q_head, q0 + row0, split,
+                                                                   width)] =
+                    row0_live ? running_l0 : 0.0f;
+            }
+            if (q0 + row1 < width) {
+                partial_m[gqa_prefill_partial_stat_index<Geometry>(q_head, q0 + row1, split,
+                                                                   width)] =
+                    row1_live ? running_m1 : -CUDART_INF_F;
+                partial_l[gqa_prefill_partial_stat_index<Geometry>(q_head, q0 + row1, split,
+                                                                   width)] =
+                    row1_live ? running_l1 : 0.0f;
+            }
+        }
+        const int row_tile = warp % kGqaPrefillI8RowTiles;
+        const int d_slice  = warp / kGqaPrefillI8RowTiles;
+        const int row_base = row_tile * 16;
+        const int row0     = row_base + gid;
+        const int row1     = row0 + 8;
+        // Store the partial ALREADY normalized by its own l (0 when l == 0): bf16 rounding then
+        // lands on O(1) values exactly like the single-pass output path, and the reducer
+        // re-weights by l*exp2((m - m*)*scale*log2e), which is algebraically the plain merge.
+        const float inv_l0 = final_l_s[row0] > 0.0f ? __frcp_rn(final_l_s[row0]) : 0.0f;
+        const float inv_l1 = final_l_s[row1] > 0.0f ? __frcp_rn(final_l_s[row1]) : 0.0f;
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const int d0 = (d_slice * PVNtPerWarp + n) * 8 + 2 * lid;
+            if (row0 < tile_rows) {
+                float2* slot = reinterpret_cast<float2*>(
+                    &partial_acc[gqa_prefill_partial_acc_index<Geometry>(q_head, d0, q0 + row0,
+                                                                         split, width)]);
+                *slot        = make_float2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+            }
+            if (row1 < tile_rows) {
+                float2* slot = reinterpret_cast<float2*>(
+                    &partial_acc[gqa_prefill_partial_acc_index<Geometry>(q_head, d0, q0 + row1,
+                                                                         split, width)]);
+                *slot        = make_float2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+            }
+        }
+        return;
+    }
 
     const int row_tile = warp % kGqaPrefillI8RowTiles;
     const int d_slice  = warp / kGqaPrefillI8RowTiles;

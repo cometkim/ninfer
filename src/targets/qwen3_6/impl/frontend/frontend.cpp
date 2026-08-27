@@ -573,7 +573,7 @@ void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& 
                                              : 1;
         if (need > 1 && state.utf8_pending.size() < need) { break; }
         state.utf8_pending.erase(0, 1);
-        text += "\xef\xbf\xbd";
+        text += "�";
     }
     if (text.empty()) { return; }
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);

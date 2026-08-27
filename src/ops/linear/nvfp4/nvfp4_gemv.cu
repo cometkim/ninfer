@@ -1,6 +1,7 @@
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 
@@ -23,10 +24,11 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
                                        Geometry::kOutputRows};
     constexpr int kBlocks              = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
-    nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream}, nvfp4_gemv_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4ContiguousOutput>,
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
-        Nvfp4IdentityEpilogue{}, output);
+        Nvfp4IdentityEpilogue{}, output));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -48,6 +50,21 @@ void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cud
         return;
     case Nvfp4Problem::Residual17408:
         launch_exact<Nvfp4Residual17408Geometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DFlash2Feature:
+        launch_exact<Nvfp4DFlash2FeatureGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DFlash2Qkv:
+        launch_exact<Nvfp4DFlash2QkvGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DFlash2AttnOut:
+        launch_exact<Nvfp4DFlash2AttnOutGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DFlash2ConvProj:
+        launch_exact<Nvfp4DFlash2ConvProjGeometry>(x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DFlash2Selector:
+        launch_exact<Nvfp4DFlash2SelectorGeometry>(x, weight, out, stream);
         return;
     }
 }

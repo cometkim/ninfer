@@ -873,6 +873,37 @@ Fixed KV state 从按 admitted sequence 管理的 fixed-state pool 获取。Engi
 `max_concurrency` 个 active sequences 提供这类固定资源。当前 retained entry 只使用原 lane 的空闲
 fixed unit；new admission 可以 claim 或先驱逐 retained entry，不能降低 active concurrency guarantee。
 
+### 12.2 hq-e8-2b residual window（sink + recent ring）
+
+U8 (hq-e8-2b) cache 的每个 (pool, layer) 额外携带两份 exact BF16 side plane，属于本节的 fixed
+KV-shaped resource（大小只随 `max_concurrency` 变化，不随 context 增长）：
+
+```text
+rows            = kGqaHqSinkKeys + kGqaHqRecentKeys   (32 + 512)
+K/V shape       = [256, Hkv, rows, table_rows * layers]   每层一个 dim-3 slice
+frame           = codec rotated frame（K 与 V 都旋转存储；消费者只反旋转输出）
+sink row(key)   = key                                  key < kGqaHqSinkKeys
+ring row(key)   = kGqaHqSinkKeys + (key & (kGqaHqRecentKeys - 1))
+```
+
+所有 hq 消费者（TC decode tile source、prompt scratch kernel）把 sink 与 recent 位置的 K/V 行
+从 side plane 精确读出；其余位置走 codec plane。Codec plane 对每个位置仍然完整编码，因此任何
+side row 都可以逐槽回退。每个 (pool, slot row) 另有 `kGqaHqRecentKeys/32` 个 U32 ring-validity
+words（所有层共享）：append dual-write 置位，full-reset admission 清零，backward trim
+（rewrite-checkpoint restore、speculative rollback 丢弃的 draft key）按位置区间清位——被清位的
+槽在对应位置被重新 append 之前回退到 codec 行。同一 chunk 内相差 ring 宽度的两个 key 映射到
+同一 ring slot，dual-write 由 chunk 末端 window 决定唯一 owner（后写 key），避免写竞争。
+
+Codec 侧同时启用 subtractive dither（见 `hq_codec.cuh`）：per-(head, position, role, word) 的
+确定性 hash dither 在 lattice 最近点之前减去、解码后加回，将 data-dependent 的 per-vector
+quantization bias 变为零均值噪声（长窗口 bias 累积是 >native envelope 上质量崩坏的机制）。
+
+Prompt 阶段（REVIEW §8 D2）：ring 只保存 chunk 末尾 W 行，chunk 前部的 query 原本看不到自身
+recent window 的精确行。A1 prompt route 因此附带 `gqa_attention_prefill_fresh_rotate_kernel`：
+当前 chunk 的 bf16 k/v 行（调用参数中现成）按 warp 旋转后直接写入各 scratch band，scratch
+kernel 跳过这些 fresh 行并把 ring 边界移到 `[positions[0] − W, positions[0])`。A3 cached
+route 无 fresh tensor，保持 sink+ring tail 覆盖。
+
 ---
 
 ## 13. Correctness invariants

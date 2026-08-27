@@ -110,6 +110,12 @@ using Nvfp4GdnInputGeometry      = Nvfp4GemvGeometry<16384, 5120>;
 using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
 using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
 using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
+// DFlash2 drafter matrices (A16 weight-only; no activation-quant sites).
+using Nvfp4DFlash2FeatureGeometry    = Nvfp4GemvGeometry<5120, 25600>;
+using Nvfp4DFlash2QkvGeometry        = Nvfp4GemvGeometry<6144, 5120>;
+using Nvfp4DFlash2AttnOutGeometry    = Nvfp4GemvGeometry<5120, 4096>;
+using Nvfp4DFlash2ConvProjGeometry   = Nvfp4GemvGeometry<1280, 5120>;
+using Nvfp4DFlash2SelectorGeometry   = Nvfp4GemvGeometry<256, 5120>;
 
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
@@ -121,6 +127,11 @@ enum class Nvfp4Problem : std::uint8_t {
     MlpGateUp,
     Residual6144,
     Residual17408,
+    DFlash2Feature,
+    DFlash2Qkv,
+    DFlash2AttnOut,
+    DFlash2ConvProj,
+    DFlash2Selector,
 };
 
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -133,7 +144,17 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
            (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
             input_rows == Nvfp4Residual6144Geometry::kInputRows) ||
            (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual17408Geometry::kInputRows);
+            input_rows == Nvfp4Residual17408Geometry::kInputRows) ||
+           (output_rows == Nvfp4DFlash2FeatureGeometry::kOutputRows &&
+            input_rows == Nvfp4DFlash2FeatureGeometry::kInputRows) ||
+           (output_rows == Nvfp4DFlash2QkvGeometry::kOutputRows &&
+            input_rows == Nvfp4DFlash2QkvGeometry::kInputRows) ||
+           (output_rows == Nvfp4DFlash2AttnOutGeometry::kOutputRows &&
+            input_rows == Nvfp4DFlash2AttnOutGeometry::kInputRows) ||
+           (output_rows == Nvfp4DFlash2ConvProjGeometry::kOutputRows &&
+            input_rows == Nvfp4DFlash2ConvProjGeometry::kInputRows) ||
+           (output_rows == Nvfp4DFlash2SelectorGeometry::kOutputRows &&
+            input_rows == Nvfp4DFlash2SelectorGeometry::kInputRows);
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {
@@ -156,6 +177,26 @@ inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t
     if (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
         input_rows == Nvfp4Residual17408Geometry::kInputRows) {
         return Nvfp4Problem::Residual17408;
+    }
+    if (output_rows == Nvfp4DFlash2FeatureGeometry::kOutputRows &&
+        input_rows == Nvfp4DFlash2FeatureGeometry::kInputRows) {
+        return Nvfp4Problem::DFlash2Feature;
+    }
+    if (output_rows == Nvfp4DFlash2QkvGeometry::kOutputRows &&
+        input_rows == Nvfp4DFlash2QkvGeometry::kInputRows) {
+        return Nvfp4Problem::DFlash2Qkv;
+    }
+    if (output_rows == Nvfp4DFlash2AttnOutGeometry::kOutputRows &&
+        input_rows == Nvfp4DFlash2AttnOutGeometry::kInputRows) {
+        return Nvfp4Problem::DFlash2AttnOut;
+    }
+    if (output_rows == Nvfp4DFlash2ConvProjGeometry::kOutputRows &&
+        input_rows == Nvfp4DFlash2ConvProjGeometry::kInputRows) {
+        return Nvfp4Problem::DFlash2ConvProj;
+    }
+    if (output_rows == Nvfp4DFlash2SelectorGeometry::kOutputRows &&
+        input_rows == Nvfp4DFlash2SelectorGeometry::kInputRows) {
+        return Nvfp4Problem::DFlash2Selector;
     }
     throw std::invalid_argument("unsupported NVFP4 problem");
 }

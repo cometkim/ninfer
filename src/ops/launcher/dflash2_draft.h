@@ -1,0 +1,32 @@
+#pragma once
+
+// ninfer::ops::detail - launcher surface for the DFlash2 draft primitives.
+
+#include "core/tensor.h"
+#include "core/weight.h"
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+
+namespace ninfer::ops::detail {
+
+void dflash2_dynamic_conv_launch(const Tensor& hidden, const Tensor& dynamic, const Tensor& base,
+                                 std::int32_t side, std::int32_t block_size, Tensor& out,
+                                 cudaStream_t stream);
+
+void dflash2_topk_launch(const Tensor& logits, std::int32_t k, Tensor& ids, Tensor& values,
+                         cudaStream_t stream);
+
+void dflash2_selector_walk_launch(const Tensor& scores, const Tensor& candidates, Tensor& out,
+                                  cudaStream_t stream);
+
+void dflash2_selector_scores_launch(const Tensor& candidates, const Tensor& predecessor_ids,
+                                    const Tensor& unary, const Tensor& hidden_proj,
+                                    const Weight& successor_rows, const Weight& predecessor_rows,
+                                    Tensor& out, cudaStream_t stream);
+
+void dflash2_selector_predecessors_launch(const Tensor& candidates, const Tensor& anchors,
+                                          Tensor& out, cudaStream_t stream);
+
+} // namespace ninfer::ops::detail

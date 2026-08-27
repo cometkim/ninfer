@@ -48,8 +48,9 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
 #ifdef _WIN32
 struct Nvfp4LinearSwiGluTmaDescriptorBlock {
     Nvfp4W4a4TmaDescriptors* device = nullptr;
+    cudaStream_t stream             = nullptr;
 
-    explicit Nvfp4LinearSwiGluTmaDescriptorBlock(cudaStream_t stream) {
+    explicit Nvfp4LinearSwiGluTmaDescriptorBlock(cudaStream_t allocation_stream) : stream(allocation_stream) {
         CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&device),
                                    sizeof(Nvfp4W4a4TmaDescriptors), stream));
     }
@@ -59,7 +60,7 @@ struct Nvfp4LinearSwiGluTmaDescriptorBlock {
 
     ~Nvfp4LinearSwiGluTmaDescriptorBlock() {
         if (device == nullptr) { return; }
-        CUDA_CHECK(cudaFreeAsync(device, nullptr));
+        CUDA_CHECK(cudaFreeAsync(device, stream));
     }
 };
 #endif

@@ -293,9 +293,6 @@ __launch_bounds__(128, 10) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
     static_assert(kFullSlabs > 0 && kStride > 0, "direct split4 requires exact positive shape");
     static_assert(!SplitOutput || SplitRow > 0,
                   "split-output Q5 split4 requires a positive compile-time seam");
-    if constexpr (TriggerPdl) {
-        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
-    }
     (void)full_slabs;
     (void)k;
     (void)t;
@@ -403,6 +400,7 @@ __launch_bounds__(128, 10) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
                                                                 s_part[0]);
         }
     }
+    if constexpr (TriggerPdl) { pdl::publish(); }
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 

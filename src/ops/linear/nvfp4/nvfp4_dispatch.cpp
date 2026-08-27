@@ -26,8 +26,8 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     if (policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear: unsupported policy");
     }
-
-    switch (resolve_nvfp4_problem(output_rows, input_rows)) {
+    const Nvfp4Problem problem = resolve_nvfp4_problem(output_rows, input_rows);
+    switch (problem) {
     case Nvfp4Problem::AttnInput:
         return tokens >= 4 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
     case Nvfp4Problem::GdnInput:
@@ -37,6 +37,13 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     case Nvfp4Problem::Residual6144:
     case Nvfp4Problem::Residual17408:
         return tokens >= 8 ? Nvfp4LinearRoute::W4A4 : Nvfp4LinearRoute::A16;
+    case Nvfp4Problem::DFlash2Feature:
+    case Nvfp4Problem::DFlash2Qkv:
+    case Nvfp4Problem::DFlash2AttnOut:
+    case Nvfp4Problem::DFlash2ConvProj:
+    case Nvfp4Problem::DFlash2Selector:
+        // Weight-only drafter matrices carry no activation-quant divisor sites.
+        throw std::invalid_argument("nvfp4 linear: DFlash2 problems admit only A16");
     }
     throw std::logic_error("unreachable NVFP4 linear problem");
 }

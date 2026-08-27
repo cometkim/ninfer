@@ -4,15 +4,16 @@
 // and defined by the CUDA launcher.
 
 #include "core/tensor.h"
+#include "ninfer/ops/rope.h"
 
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {
 
-void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-                 cudaStream_t stream);
+void rope_launch(const Tensor& positions, int rotary_dim, const RopeFrequencies& frequencies,
+                 Tensor& q, Tensor& k, cudaStream_t stream);
 
-void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-                        cudaStream_t stream);
+void rope_single_launch(const Tensor& positions, int rotary_dim, const RopeFrequencies& frequencies,
+                        Tensor& x, RopeSide side, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

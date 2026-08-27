@@ -140,9 +140,10 @@ measured recommendation rather than a semantic limit.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--kv-dtype bf16\|int8\|hq-e8-2b` | KV-cache storage | `bf16` |
+| `--rope-scaling none\|yarn:F[,t=c][,bf=n][,bs=n]` | text RoPE position scaling; `yarn:2`/`yarn:4` select YaRN with that factor (HF/vLLM semantics). Optional fields: `t` the attention temperature coefficient (attention factor = `t·ln F + 1`, default 0.1), `bf`/`bs` the ramp bounds beta_fast/beta_slow (defaults 32/1) | `none` |
+| `--spec mtp\|dflash\|dflash2` | speculative backend | off |
+| `--draft-tokens N` | MTP `1..7`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
@@ -180,10 +181,22 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 
 ## Context and memory
 
-The registered model IDs have a native context limit of 262,144 tokens. The practical
+The engine context envelope is 1,048,576 tokens with `--kv-dtype hq-e8-2b` and 524,288 tokens
+with `bf16` or `int8` (the BF16/I8 decode kernels stage a fixed number of page ids per split).
+The checkpoint's trained position capacity is 262,144 tokens: contexts past it require
+`--rope-scaling yarn:F` (use factor 2 for a 524k deployment, factor 4 for 1M; Qwen notes YaRN
+degrades short prompts, so leave it off at or below the native range). The YaRN attention
+factor is a q-side temperature — the KV cache stays factor-free — and the `t=`/`bf=`/`bs=`
+fields tune it without touching the frequency ramp's defaults. On the 35B-A3B target
+the text route honors the scaling but DFlash rejects it. A context above the native range
+without scaling, or scaling active below it, is reported as a note in the CLI summary and
+the server request log. The practical
 allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
 KV-cache type.
-Use `--kv-dtype int8` for large context allocations. The prepared prompt must fit
+Use `--kv-dtype int8` for large context allocations; `hq-e8-2b` (fixed-budget
+E8-lattice + Rice entropy coding at ~2.25 bits/scalar) cuts KV memory ~3.7x
+below int8 at comparable speed and is the only format that fits contexts beyond ~400k on one
+32 GB device. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU

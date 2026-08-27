@@ -288,4 +288,77 @@ DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
     };
 }
 
+// DFlash2 context injection: the fused qkv projection is extracted into its K/V row blocks
+// before the per-head norm and rope.
+struct DFlash2ContextLayerRoots {
+    Tensor qkv;
+    Tensor key_raw;
+    Tensor value;
+    Tensor key;
+};
+
+template <class Config, class Allocator>
+DFlash2ContextLayerRoots dflash2_context_layer(Allocator& allocator, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, Config::query_size + 2 * Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+    };
+}
+
+struct DFlash2AttentionRoots {
+    Tensor hidden;
+    Tensor dynamic;
+    Tensor conv_hidden;
+    Tensor qkv;
+    Tensor query_raw;
+    Tensor key_raw;
+    Tensor value;
+    Tensor query;
+    Tensor key;
+    Tensor attention;
+    Tensor projected;
+    Tensor conv_attention;
+};
+
+template <class Config, class Allocator>
+DFlash2AttentionRoots dflash2_attention(Allocator& allocator, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, Config::conv_outputs, tokens),
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, Config::query_size + 2 * Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::query_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::query_size, tokens),
+        matrix(allocator, DType::BF16, Config::kv_size, tokens),
+        matrix(allocator, DType::BF16, Config::query_size, tokens),
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+    };
+}
+
+struct DFlash2MlpRoots {
+    Tensor hidden;
+    Tensor dynamic;
+    Tensor conv_hidden;
+    Tensor intermediate;
+    Tensor projected;
+    Tensor conv_projected;
+};
+
+template <class Config, class Allocator>
+DFlash2MlpRoots dflash2_mlp(Allocator& allocator, std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, Config::conv_outputs, tokens),
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, Config::intermediate, tokens),
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+        matrix(allocator, DType::BF16, Config::hidden, tokens),
+    };
+}
+
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe

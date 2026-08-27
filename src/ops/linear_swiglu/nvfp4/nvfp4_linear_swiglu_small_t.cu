@@ -1,6 +1,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -29,6 +30,7 @@ __global__ __launch_bounds__(
                                                                      uint8_t* __restrict__ scales,
                                                                  float inverse_weight_divisor,
                                                                  __nv_bfloat16* __restrict__ out) {
+    pdl::sync();
     static_assert(Schedule::kWarpsPerRow == 1);
     static_assert(Schedule::kRowsPerWarp == 2);
     static_assert(Schedule::kTokenTile == ActiveTokens);
@@ -70,6 +72,7 @@ __global__ __launch_bounds__(
                 __float2bfloat16_rn(silu(gate) * up);
         }
     }
+    pdl::publish();
 }
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -86,12 +89,13 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
     constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_linear_swiglu_small_t_kernel<ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), inverse,
-            static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_linear_swiglu_small_t_kernel<ActiveTokens, Schedule>,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), inverse,
+        static_cast<__nv_bfloat16*>(out.data)));
     CUDA_CHECK(cudaGetLastError());
 }
 

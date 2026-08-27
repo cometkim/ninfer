@@ -19,12 +19,21 @@ inline constexpr std::int32_t kPagedKVPageSize = 64;
  *
  * Physical plane order is fixed by the owning homogeneous pool and validated by the consuming
  * Op. block_table is one contiguous I32 logical-block row.
+ *
+ * residual_k/residual_v/ring_valid carry the U8 (hq-e8-2b) residual window when the feature is
+ * enabled: BF16 side planes [head_dim, num_kv_heads, sink+recent rows, 1] in the codec's
+ * rotated frame (K and V both), pre-sliced to this sequence's slot row, plus the slot's
+ * kGqaHqRecentKeys/32 U32 recent-ring validity words. Empty tensors mean the feature is off (every cache dtype
+ * other than U8, and U8 callers that opt out).
  */
 struct PagedKVLayerView {
     Tensor k_pages;
     Tensor v_pages;
     Tensor k_scale_pages;
     Tensor v_scale_pages;
+    Tensor residual_k;
+    Tensor residual_v;
+    Tensor ring_valid;
     Tensor block_table;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
@@ -37,13 +46,18 @@ struct PagedKVLayerView {
  *
  * Physical planes and the complete block-table matrix are shared by every logical row in one
  * invocation. block_tables is contiguous I32 [logical_pages, table_rows]; the consuming Op
- * receives its per-row table selectors separately.
+ * receives its per-row table selectors separately. The residual planes carry every slot row
+ * ([head_dim, num_kv_heads, sink+recent rows, table_rows]) and ring_valid is U32
+ * [4, table_rows]; kernels offset both by the batch item's table row.
  */
 struct PagedKVBatchLayerView {
     Tensor k_pages;
     Tensor v_pages;
     Tensor k_scale_pages;
     Tensor v_scale_pages;
+    Tensor residual_k;
+    Tensor residual_v;
+    Tensor ring_valid;
     Tensor block_tables;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;

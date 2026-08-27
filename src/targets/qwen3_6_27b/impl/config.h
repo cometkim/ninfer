@@ -4,6 +4,7 @@
 #include <ninfer/targets/qwen3_6/hybrid_topology.h>
 #include <ninfer/targets/qwen3_6/vision.h>
 
+#include <array>
 #include <cstdint>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
@@ -33,6 +34,8 @@ struct TextConfig {
     static constexpr int full_attention_interval = qwen3_6::kHybridAttentionInterval;
     static constexpr float rms_epsilon           = 1.0e-6F;
     static constexpr float rope_theta            = 1.0e7F;
+    // The checkpoint's trained position capacity; YaRN scaling extends past it.
+    static constexpr std::uint32_t original_positions = 262144;
 
     static constexpr int key_dim               = gdn_key_heads * gdn_key_head_dim;
     static constexpr int value_dim             = gdn_value_heads * gdn_value_head_dim;
@@ -70,6 +73,9 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
     static constexpr int output_hidden = TextConfig::hidden;
 };
 
+// DFlash v1 never ships on this target; the DFlash2 module (block-diffusion drafter,
+// all-SWA-2048, local positions) is the 27B's draft backend. Execution lands with the
+// draft kernels; the artifact module, binder rows, and these facts land first.
 struct DFlashConfig {
     static constexpr bool supported     = false;
     static constexpr int local_layers   = 0;
@@ -83,11 +89,42 @@ struct DFlashConfig {
     static constexpr int kv_size        = 0;
 };
 
+struct DFlash2Config {
+    static constexpr bool artifact_module = true;
+    static constexpr bool execution       = true;
+    static constexpr int layers           = 5;
+    static constexpr int block_size       = 8;   // anchor + 7 draft positions
+    static constexpr int feature_layers   = 5;
+    static constexpr int feature_rows     = feature_layers * TextConfig::hidden; // 25600
+    static constexpr int hidden           = TextConfig::hidden;                  // 5120
+    static constexpr int intermediate     = 17408;
+    static constexpr int query_heads      = 32;
+    static constexpr int kv_heads         = 8;
+    static constexpr int head_dim         = 128;
+    static constexpr int query_size       = query_heads * head_dim; // 4096
+    static constexpr int kv_size          = kv_heads * head_dim;    // 1024
+    static constexpr int local_capacity   = 2048;                   // all five layers SWA
+    static constexpr int conv_kernel      = 2;
+    static constexpr int conv_group       = 16;
+    static constexpr int conv_outputs     = 1280; // 320 groups x 2 taps x 2
+    static constexpr int selector_rank    = 256;
+    static constexpr int selector_top_k   = 16;
+    static constexpr int mask_token       = 248070;
+    static constexpr float rms_epsilon    = 1.0e-6F;
+    static constexpr float rope_theta     = 1.0e7F;
+    static constexpr float attention_scale = 0.08838834764831845F;
+    static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
+};
+
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
-inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
-inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
-inline constexpr std::uint32_t kNativeContext            = 262144;
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 7;
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens  = 0;
+inline constexpr std::uint32_t kMaximumDFlash2DraftTokens = 7;
+// Engine envelope ceiling. The checkpoint's trained position capacity stays 262144; contexts
+// past it require YaRN rope scaling, and only the U8 (hq-e8-2b) KV cache can hold a window
+// this large on one device - the GQA op bounds BF16/I8 envelopes separately.
+inline constexpr std::uint32_t kNativeContext            = 1048576;
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

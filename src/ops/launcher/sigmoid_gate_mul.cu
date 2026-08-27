@@ -6,6 +6,7 @@
 #include "ops/common/math.h"
 #include "ops/kernel/sigmoid_gate_mul.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -17,8 +18,9 @@ void sigmoid_gate_mul_bf16x8_launch(const Tensor& gate, Tensor& x, int block, cu
     constexpr int kMaxGrid   = 4096;
     const int grid           = static_cast<int>(std::min<std::int64_t>(
         kMaxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(block)))));
-    sigmoid_gate_mul_bf16x8_kernel<<<grid, block, 0, stream>>>(
-        static_cast<const Bf16x8Pack*>(gate.data), static_cast<Bf16x8Pack*>(x.data), packs);
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(grid), dim3(block), 0, stream}, sigmoid_gate_mul_bf16x8_kernel,
+        static_cast<const Bf16x8Pack*>(gate.data), static_cast<Bf16x8Pack*>(x.data), packs));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -35,8 +37,9 @@ void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream)
     if (((gate_addr | x_addr) & (alignof(__nv_bfloat162) - 1)) != 0) {
         const int scalar_grid = static_cast<int>(
             std::min<std::int64_t>(kMaxGrid, div_up(n, static_cast<std::int64_t>(kBlock))));
-        sigmoid_gate_mul_scalar_kernel<<<scalar_grid, kBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(x.data), n);
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(scalar_grid), dim3(kBlock), 0, stream}, sigmoid_gate_mul_scalar_kernel,
+            static_cast<const __nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(x.data), n));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -46,8 +49,9 @@ void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream)
     const int grid                        = static_cast<int>(
         std::min<std::int64_t>(kMaxGrid, std::max<std::int64_t>(1, div_up(n2, kPairsPerBlock))));
 
-    sigmoid_gate_mul_bf16x2_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(x.data), n);
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(grid), dim3(kBlock), 0, stream}, sigmoid_gate_mul_bf16x2_kernel,
+        static_cast<const __nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(x.data), n));
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -264,8 +264,10 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
                 q.nb[2] = qkv.nb[1];
                 k.nb[2] = qkv.nb[1];
                 v.nb[2] = qkv.nb[1];
-                ops::rope(position_ids, VisionScheduleConfig::rotary_dim,
-                          VisionScheduleConfig::rope_theta, q, k, stream);
+                static const ops::RopeFrequencies frequencies =
+                    ops::rope_vision_frequencies(VisionScheduleConfig::rope_theta);
+                ops::rope(position_ids, VisionScheduleConfig::rotary_dim, frequencies, q, k,
+                          stream);
                 Tensor attended_heads = attended.view(
                     {VisionScheduleConfig::head_dim, VisionScheduleConfig::heads, patches});
                 const DeviceSpan attention_backing = layout.attention_workspace

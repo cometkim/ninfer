@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/pdl.cuh"
+
 // ninfer::ops - split-KV GQA small-T attention shared scaffolding. The bf16 and
 // int8 partial kernels live in gqa_attention_decode_bf16.cuh and
 // gqa_attention_decode_i8.cuh respectively; they are fully separate kernels (no
@@ -29,6 +31,30 @@ struct GqaAppendInput {
 
 struct GqaCachedInput {
     static constexpr bool writes_cache = false;
+};
+
+// KV-source policies for the tensor-core small-T partial kernel
+// (gqa_attention_decode_bf16.cuh): where each 32-key tile's bf16 rows come
+// from, and whether attention runs in the hq codec's rotated frame.
+struct GqaTcKVLinear {
+    static constexpr bool hq      = false;
+    static constexpr bool rotated = false;
+    __nv_bfloat16* k; // paged bf16 K cache (also the append write target)
+    __nv_bfloat16* v;
+};
+
+struct GqaTcKVHq {
+    static constexpr bool hq      = true;
+    static constexpr bool rotated = true;
+    std::uint8_t* codes_k; // paged hq code/meta planes (also the append targets)
+    std::uint8_t* codes_v;
+    std::uint8_t* meta_k;
+    std::uint8_t* meta_v;
+    // Residual window (optional): exact rotated-frame bf16 side planes and the
+    // per-slot ring validity words; null = feature off (codec rows everywhere).
+    __nv_bfloat16* residual_k = nullptr;
+    __nv_bfloat16* residual_v = nullptr;
+    std::uint32_t* ring_valid = nullptr;
 };
 
 template <typename Geometry>
@@ -142,13 +168,18 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
     q_head            = kv_head * Geometry::GroupSize + local_q;
 }
 
+// The gate is the op's sigmoid-gated-output input: out[i] = bf16(attn[i]) * sigmoid(gate[i]),
+// with the attention value rounded to BF16 first so the fused store is bit-identical to the
+// reducer-then-sigmoid_mul kernel chain it replaces.
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
-    const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    const std::int32_t* positions, const std::int32_t* valid_columns,
+    const __nv_bfloat16* gate, std::int32_t tokens, std::int32_t full_width,
+    std::int32_t column_begin, std::int32_t batch_size, std::int32_t split_count,
+    __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
+    pdl::sync();
 
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
@@ -255,7 +286,11 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         valid = absolute_column < valid_columns[batch];
     }
     const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    const std::int64_t output_index = gqa_q_index<Geometry>(q_head, d, output_column);
+    const __nv_bfloat16 attention   = __float2bfloat16(value);
+    out[output_index]               = __float2bfloat16_rn(
+        __bfloat162float(attention) * sigmoid(__bfloat162float(gate[output_index])));
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

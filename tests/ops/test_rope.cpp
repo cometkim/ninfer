@@ -31,7 +31,14 @@ struct Geometry {
     int axes;
     int tokens;
     float theta;
+    // Null selects the checkpoint-linear table for the geometry (vision ladder for axes 2).
+    const ops::RopeFrequencies* frequencies = nullptr;
 };
+
+ops::RopeFrequencies default_frequencies(const Geometry& geometry) {
+    if (geometry.axes == 2) { return ops::rope_vision_frequencies(geometry.theta); }
+    return ops::rope_linear_frequencies(geometry.theta, geometry.rotary_dim);
+}
 
 std::size_t dense_elements(int head_dim, int heads, int tokens) {
     return static_cast<std::size_t>(head_dim) * static_cast<std::size_t>(heads) *
@@ -75,30 +82,29 @@ std::vector<int> make_positions(int axes, int tokens, int first_position) {
 // This is the sole RoPE oracle. It consumes the exact logical BF16 values represented by the
 // public input and evaluates the documented split-half rotation naively in FP64. It does not
 // reproduce output storage rounding, production staging, coefficient tables, range reduction,
-// kernel split, or reduction order.
+// kernel split, or reduction order. q_side selects the attention-factor placement: queries
+// scale by its square, keys stay unscaled (the factor-free-K contract).
 std::vector<double> rope_oracle(const std::vector<float>& input, const std::vector<int>& positions,
-                                const Geometry& geometry, int heads) {
+                                const Geometry& geometry, int heads,
+                                const ops::RopeFrequencies& frequencies, bool q_side) {
+    const double scale = q_side ? static_cast<double>(frequencies.attention_factor) *
+                                     static_cast<double>(frequencies.attention_factor)
+                               : 1.0;
     std::vector<double> output(input.begin(), input.end());
     const int half = geometry.rotary_dim / 2;
     for (int token = 0; token < geometry.tokens; ++token) {
         for (int head = 0; head < heads; ++head) {
             for (int pair = 0; pair < half; ++pair) {
-                int axis        = 0;
-                double exponent = 0.0;
-                if (geometry.axes == 2) {
-                    axis     = pair / 18;
-                    exponent = -2.0 * static_cast<double>(pair % 18) / 36.0;
-                } else {
-                    axis     = geometry.axes == 3 ? pair % 3 : 0;
-                    exponent = -2.0 * static_cast<double>(pair) / geometry.rotary_dim;
-                }
-                const double frequency = std::pow(static_cast<double>(geometry.theta), exponent);
+                const int axis        = geometry.axes == 2 ? pair / 18
+                                        : geometry.axes == 3 ? pair % 3
+                                                             : 0;
+                const double frequency = frequencies.inv_frequency[pair];
                 const double phase =
                     static_cast<double>(
                         positions[static_cast<std::size_t>(axis) * geometry.tokens + token]) *
                     frequency;
-                const double cosine  = std::cos(phase);
-                const double sine    = std::sin(phase);
+                const double cosine  = std::cos(phase) * scale;
+                const double sine    = std::sin(phase) * scale;
                 const std::size_t lo = dense_index(geometry.head_dim, heads, token, head, pair);
                 const std::size_t hi =
                     dense_index(geometry.head_dim, heads, token, head, pair + half);
@@ -246,9 +252,12 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
         make_strided_storage(q_before, q_dense_per_token, q_stride, geometry.tokens, kPadding);
     const auto k_storage =
         make_strided_storage(k_before, k_dense_per_token, k_stride, geometry.tokens, kPadding);
-    const auto positions  = make_positions(geometry.axes, geometry.tokens, first_position);
-    const auto q_expected = rope_oracle(q, positions, geometry, q_heads);
-    const auto k_expected = rope_oracle(k, positions, geometry, k_heads);
+    const auto positions    = make_positions(geometry.axes, geometry.tokens, first_position);
+    const auto frequencies  = geometry.frequencies != nullptr
+                                 ? *geometry.frequencies
+                                 : default_frequencies(geometry);
+    const auto q_expected = rope_oracle(q, positions, geometry, q_heads, frequencies, true);
+    const auto k_expected = rope_oracle(k, positions, geometry, k_heads, frequencies, false);
 
     GuardedDeviceBuffer q_device(q_storage.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer k_device(k_storage.size() * sizeof(std::uint16_t));
@@ -263,7 +272,7 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
     q_tensor.nb[2] = static_cast<std::int64_t>(q_stride) * sizeof(std::uint16_t);
     k_tensor.nb[2] = static_cast<std::int64_t>(k_stride) * sizeof(std::uint16_t);
 
-    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor, nullptr);
+    ops::rope(position_tensor, geometry.rotary_dim, frequencies, q_tensor, k_tensor, nullptr);
     cuda_synchronize();
 
     const auto q_got        = from_device<std::uint16_t>(q_device.data(), q_storage.size());
@@ -292,7 +301,8 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
     return failures;
 }
 
-int run_single_case(const Geometry& geometry, int heads, int first_position, int padding = 0) {
+int run_single_case(const Geometry& geometry, int heads, int first_position, int padding = 0,
+                    ops::RopeSide side = ops::RopeSide::Key) {
     constexpr std::uint16_t kPadding = 0x3f81U;
     const int dense_per_token        = geometry.head_dim * heads;
     const int token_stride           = dense_per_token + padding;
@@ -301,8 +311,12 @@ int run_single_case(const Geometry& geometry, int heads, int first_position, int
     const auto before = to_bf16_bits(input);
     const auto storage =
         make_strided_storage(before, dense_per_token, token_stride, geometry.tokens, kPadding);
-    const auto positions = make_positions(geometry.axes, geometry.tokens, first_position);
-    const auto expected  = rope_oracle(input, positions, geometry, heads);
+    const auto positions   = make_positions(geometry.axes, geometry.tokens, first_position);
+    const auto frequencies = geometry.frequencies != nullptr
+                                 ? *geometry.frequencies
+                                 : default_frequencies(geometry);
+    const auto expected  = rope_oracle(input, positions, geometry, heads, frequencies,
+                                      side == ops::RopeSide::Query);
 
     GuardedDeviceBuffer device(storage.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer position_device(positions.size() * sizeof(int));
@@ -312,7 +326,7 @@ int run_single_case(const Geometry& geometry, int heads, int first_position, int
     Tensor position_tensor(position_device.data(), DType::I32, {geometry.tokens, geometry.axes});
     Tensor tensor(device.data(), DType::BF16, {geometry.head_dim, heads, geometry.tokens});
     tensor.nb[2] = static_cast<std::int64_t>(token_stride) * sizeof(std::uint16_t);
-    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, tensor, nullptr);
+    ops::rope(position_tensor, geometry.rotary_dim, frequencies, tensor, side, nullptr);
     cuda_synchronize();
 
     const auto got          = from_device<std::uint16_t>(device.data(), storage.size());
@@ -339,6 +353,7 @@ int run_vision_packed_case() {
     constexpr int kPlane   = kHeadDim * kHeads;
     constexpr int kStride  = 3 * kPlane;
     constexpr Geometry geometry{"vision packed qkv", kHeadDim, kHeadDim, 2, kTokens, kVisionTheta};
+    const ops::RopeFrequencies vision_frequencies = ops::rope_vision_frequencies(kVisionTheta);
 
     const auto q      = make_bf16_input(dense_elements(kHeadDim, kHeads, kTokens), 0x4001U);
     const auto k      = make_bf16_input(dense_elements(kHeadDim, kHeads, kTokens), 0x4002U);
@@ -359,8 +374,8 @@ int run_vision_packed_case() {
         positions[token]           = token / 4;
         positions[kTokens + token] = token % 4;
     }
-    const auto q_expected = rope_oracle(q, positions, geometry, kHeads);
-    const auto k_expected = rope_oracle(k, positions, geometry, kHeads);
+    const auto q_expected = rope_oracle(q, positions, geometry, kHeads, vision_frequencies, true);
+    const auto k_expected = rope_oracle(k, positions, geometry, kHeads, vision_frequencies, false);
 
     GuardedDeviceBuffer packed_device(packed.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer position_device(positions.size() * sizeof(int));
@@ -373,7 +388,7 @@ int run_vision_packed_case() {
     Tensor k_tensor(packed_data + kPlane, DType::BF16, {kHeadDim, kHeads, kTokens});
     q_tensor.nb[2] = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
     k_tensor.nb[2] = static_cast<std::int64_t>(kStride) * sizeof(std::uint16_t);
-    ops::rope(position_tensor, kHeadDim, kVisionTheta, q_tensor, k_tensor, nullptr);
+    ops::rope(position_tensor, kHeadDim, vision_frequencies, q_tensor, k_tensor, nullptr);
     cuda_synchronize();
 
     const auto got = from_device<std::uint16_t>(packed_device.data(), packed.size());
@@ -437,6 +452,28 @@ int main() {
     failures += run_pair_case({"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32, 8, 262'128);
     failures +=
         run_single_case({"35b dflash context k", 128, 128, 1, 128, kTextTheta}, 8, 131'072, 16);
+
+    // Scaled (YaRN-shaped) tables at the 1M envelope: the attention factor squares onto the q
+    // side while k stays factor-free, and the scaled route reduces the position*frequency angle
+    // in FP64. The tables are arbitrary valid inputs here - HF-parity of the real YaRN table
+    // lives in tests/targets/qwen3_6_27b/test_rope_scaling.cpp.
+    {
+        const ops::RopeFrequencies linear = ops::rope_linear_frequencies(kTextTheta, 64);
+        ops::RopeFrequencies scaled       = linear;
+        for (int pair = 20; pair < 32; ++pair) { scaled.inv_frequency[pair] /= 4.0; }
+        scaled.attention_factor = 1.1386294F;
+        failures += run_pair_case({"27b yarn4 decode", 256, 64, 1, 1, kTextTheta, &scaled}, 24, 4,
+                                  1'048'575);
+        failures += run_pair_case({"27b yarn4 mrope prefill", 256, 64, 3, 128, kTextTheta, &scaled},
+                                  24, 4, 1'048'448);
+        failures += run_single_case({"27b yarn4 mtp q", 256, 64, 3, 7, kTextTheta, &scaled}, 4,
+                                    1'048'570, 8, ops::RopeSide::Query);
+        ops::RopeFrequencies half = linear;
+        for (int pair = 20; pair < 32; ++pair) { half.inv_frequency[pair] /= 2.0; }
+        half.attention_factor = 1.0693147F;
+        failures +=
+            run_single_case({"27b yarn2 mtp k", 256, 64, 3, 7, kTextTheta, &half}, 4, 1'048'570, 8);
+    }
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
     return failures == 0 ? 0 : 1;

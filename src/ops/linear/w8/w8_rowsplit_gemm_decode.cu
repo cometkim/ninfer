@@ -1,6 +1,7 @@
 #include "ops/linear/w8/w8_launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -23,6 +24,7 @@ template <int RowsPerCta>
 __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_rowsplit_k16384_decode_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
+    pdl::sync();
     constexpr int kValuesPerPhase = 32 * kValuesPerLane;
     constexpr int kGroupsPerPhase = kValuesPerPhase / 32;
     constexpr int kPhases         = kHidden / kValuesPerPhase;
@@ -71,6 +73,7 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_rowsplit_k16384_decode_
 
     acc = warp_reduce_sum(acc);
     if (lane == 0) { out[row] = __float2bfloat16_rn(acc); }
+    pdl::publish();
 }
 
 template <int RowsPerCta>
@@ -80,10 +83,11 @@ void launch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
         throw std::invalid_argument("W8 decode requires [2048,16384] and T=1");
     }
     static_assert((kRows % RowsPerCta) == 0);
-    w8_rowsplit_k16384_decode_kernel<RowsPerCta>
-        <<<kRows / RowsPerCta, RowsPerCta * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kRows / RowsPerCta), dim3(RowsPerCta * 32), 0, stream},
+        w8_rowsplit_k16384_decode_kernel<RowsPerCta>,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data)));
     CUDA_CHECK(cudaGetLastError());
 }
 

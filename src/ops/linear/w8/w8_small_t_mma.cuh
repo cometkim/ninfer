@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/pdl.cuh"
+
 // Reusable W8G32 RowSplit exact-small-T MMA core.
 //
 // Geometry, active tokens, and scheduling are independent compile-time values. K-split warps
@@ -71,6 +73,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     static_assert((kHidden % kGroupK) == 0);
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols);
     static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
+    pdl::sync();
+
     constexpr int kNt        = kTileCols / 8;
     constexpr unsigned kMask = 0xffffffffu;
 
@@ -342,6 +346,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
             }
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

@@ -101,7 +101,12 @@ std::string tool_choice_name(const ToolChoice& choice) {
 }
 
 const char* kv_cache_name(ninfer::KvCacheStorage storage) {
-    return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
+    switch (storage) {
+    case ninfer::KvCacheStorage::BFloat16: return "bf16";
+    case ninfer::KvCacheStorage::Int8Group64: return "int8-group64";
+    case ninfer::KvCacheStorage::HqE8Rice2B: return "hq-e8-2b";
+    }
+    return "unknown";
 }
 
 const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
@@ -488,6 +493,11 @@ std::string format_server_start_json(
           {"prefill_chunk", options.prefill_chunk},
           {"log_stats_interval_ms", options.log_stats_interval_ms},
           {"kv_cache", kv_cache_name(options.kv_cache)},
+          {"rope_scaling_factor", memory.rope_scaling_factor},
+          {"rope_scaling_temperature", memory.rope_scaling_temperature},
+          {"rope_scaling_beta_fast", memory.rope_scaling_beta_fast},
+          {"rope_scaling_beta_slow", memory.rope_scaling_beta_slow},
+          {"rope_note", memory.rope_note ? Json(memory.rope_note) : Json(nullptr)},
           {"vision", options.enable_vision},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},

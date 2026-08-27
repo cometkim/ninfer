@@ -403,6 +403,8 @@ public:
           block_table_(static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
                                     tokens * batch_ * 2)),
+          gate_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
+                                  tokens * batch_ * 2)),
           workspace_bytes_(workspace_capacity(geometry, dtype, tokens, batch_, visible_)),
           workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
           q_tensor_(q_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens, batch_}),
@@ -412,6 +414,7 @@ public:
           valid_columns_tensor_(valid_columns_.p, DType::I32, {batch_}),
           table_rows_tensor_(table_rows_.p, DType::I32, {batch_}),
           output_tensor_(output_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens, batch_}),
+          gate_tensor_(gate_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens, batch_}),
           cache_view_(make_cache_view(cache_k_, cache_v_, cache_k_scale_, cache_v_scale_,
                                       block_table_, geometry, dtype, padded_)),
           batch_cache_view_(make_batch_cache_view(cache_k_, cache_v_, cache_k_scale_,
@@ -453,11 +456,11 @@ public:
         if (entry == Entry::Append) {
             const Tensor validity = masked_ ? valid_columns_tensor_ : Tensor{};
             ops::gqa_attention(q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity,
-                               table_rows_tensor_, kScale, batch_cache_view_, envelope_, workspace_,
-                               output_tensor_, stream);
+                               table_rows_tensor_, gate_tensor_, kScale, batch_cache_view_,
+                               envelope_, workspace_, output_tensor_, stream);
         } else {
-            ops::gqa_attention_cached(q_tensor_, positions_tensor_, kScale, cache_view_, envelope_,
-                                      workspace_, output_tensor_, stream);
+            ops::gqa_attention_cached(q_tensor_, positions_tensor_, gate_tensor_, kScale,
+                                      cache_view_, envelope_, workspace_, output_tensor_, stream);
         }
     }
 
@@ -483,6 +486,7 @@ private:
     DeviceBuffer cache_v_scale_;
     DeviceBuffer block_table_;
     DeviceBuffer output_;
+    DeviceBuffer gate_;
     std::size_t workspace_bytes_;
     WorkspaceArena workspace_;
     Tensor q_tensor_;
@@ -492,6 +496,7 @@ private:
     Tensor valid_columns_tensor_;
     Tensor table_rows_tensor_;
     Tensor output_tensor_;
+    Tensor gate_tensor_;
     PagedKVLayerView cache_view_;
     PagedKVBatchLayerView batch_cache_view_;
     ops::GqaExecutionEnvelope envelope_;

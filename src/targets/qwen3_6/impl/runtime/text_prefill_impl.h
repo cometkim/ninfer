@@ -33,6 +33,25 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
         });
 }
 
+DFlashFeatureSink make_dflash2_prefill_sink(PrefillContext& state) {
+    if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
+        throw std::logic_error("DFlash2 prefill controls are unavailable");
+    }
+    return dflash2_feature_sink(
+        state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
+            auto& frame  = *state.execution.io.dflash_decode;
+            Tensor count = frame.append_counts.slice(0, 0, 1);
+            Tensor lane  = frame.lanes.slice(0, 0, 1);
+            ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
+            const auto exact = static_cast<std::uint32_t>(features.ne[1]);
+            dflash2_append_context(state, features, positions, count, lane, {exact, exact});
+            if (rewrite_checkpoint) {
+                state.dflash2->save_rewrite_checkpoint(state.dflash_host_ingress->lanes[0],
+                                                       state.execution.device.stream);
+            }
+        });
+}
+
 } // namespace
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,
@@ -59,7 +78,8 @@ PrefillChunkResult prefill_text_chunk(
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.execution.rope_frequencies, state.mtp_kv,
+                     &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -70,6 +90,11 @@ PrefillChunkResult prefill_text_chunk(
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                                  sink);
+    }
+    if (state.dflash2 != nullptr) {
+        DFlashFeatureSink sink = make_dflash2_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
                                   sink);
     }
@@ -87,7 +112,8 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
     TextContext card(state.execution.device, state.execution.model, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
-                     state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+                     state.text_kv_base, state.execution.rope_frequencies, state.mtp_kv,
+                     &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.current_state_slot,
                         state.rewrite_checkpoint_state_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -95,6 +121,11 @@ prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt
         rewrite_checkpoint_capture_frontier
             ? static_cast<std::int64_t>(*rewrite_checkpoint_capture_frontier)
             : -1);
+    if (state.dflash2 != nullptr) {
+        DFlashFeatureSink sink = make_dflash2_prefill_sink(state);
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
+                                  finalize_at_end, sink);
+    }
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision, finalize_at_end);
 }
 

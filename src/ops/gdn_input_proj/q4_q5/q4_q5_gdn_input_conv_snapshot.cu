@@ -258,7 +258,9 @@ void launch_t1(const Tensor& x, const Weight& qk_weight, const Weight& value_z_w
                const GdnConvEpilogue<Publish>& value_epilogue, Tensor& query, Tensor& value,
                Tensor& z, cudaStream_t stream) {
     // The Q4 and Q5 sides read the same activation but write disjoint output/state rows. The
-    // dependent side therefore computes before waiting, then joins the producer at kernel exit.
+    // dependent side computes before its exit join; both sides publish at kernel exit after
+    // their stores, so downstream dependents see the pair's writes whether or not they were
+    // launched with the programmatic-serialization attribute.
     if constexpr (Order == PdlOrder::Q5ThenQ4) {
         launch_q5_t1<Publish, true, false, false>(x, value_z_weight, value_epilogue, value, z,
                                                   stream);

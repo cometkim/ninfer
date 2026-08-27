@@ -180,6 +180,7 @@ __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_small_t_inner_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
     OutputPolicy output) {
+    pdl::sync();
     static_assert(ActiveTokens >= 2 && ActiveTokens <= 32);
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
 
@@ -230,6 +231,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_small
             }
         }
     }
+    pdl::publish();
 }
 
 struct Bf16SmallTContiguousOutput {

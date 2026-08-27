@@ -26,6 +26,7 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
+    HqE8Rice2B,
 };
 
 enum class KvCapacityMode : std::uint8_t {
@@ -60,6 +61,7 @@ enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
     DFlash,
+    DFlash2,
 };
 
 struct SpeculativeOptions {
@@ -82,6 +84,14 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // 0 (default): linear rope at the checkpoint's native positions. Any value > 1 selects
+    // YaRN position scaling with that factor (HF/vLLM `yarn` semantics). The remaining YaRN
+    // knobs are the attention temperature coefficient (attention factor = t*ln(factor) + 1)
+    // and the ramp bounds beta_fast/beta_slow; their defaults match HF.
+    float rope_scaling_factor          = 0.0F;
+    float rope_scaling_temperature     = 0.1F;
+    float rope_scaling_beta_fast       = 32.0F;
+    float rope_scaling_beta_slow       = 1.0F;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -417,6 +427,13 @@ struct MemorySummary {
     std::uint32_t kv_capacity_page_groups     = 0;
     std::uint32_t kv_capacity_max_page_groups = 0;
     KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
+    float rope_scaling_factor                 = 0.0F;
+    float rope_scaling_temperature            = 0.1F;
+    float rope_scaling_beta_fast              = 32.0F;
+    float rope_scaling_beta_slow              = 1.0F;
+    // Set when the resolved configuration deserves an operator-visible caution (static rope
+    // scaling active below the checkpoint's native range, or an unscaled context past it).
+    const char* rope_note                     = nullptr;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;

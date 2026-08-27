@@ -121,6 +121,37 @@ struct BindingPlan {
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
     qwen3_6::VisionMergerNormPlan vision_merger_norm;
+
+    // DFlash2 module: contract-enumerated objects appended after the Vision merger
+    // rows. Validation is unconditional (one complete product image); Device
+    // materialization follows the DFlash2 startup feature. Matrices are
+    // weight-only NVFP4 (no input-divisor sites); norms and conv bases stay BF16.
+    struct DFlash2ConvPlan {
+        artifact::ObjectHandle base;
+        WeightPlan projection;
+    };
+    struct DFlash2LayerPlan {
+        artifact::ObjectHandle input_norm;
+        WeightPlan query_key_value;
+        artifact::ObjectHandle query_norm;
+        artifact::ObjectHandle key_norm;
+        WeightPlan attention_output;
+        DFlash2ConvPlan attention_conv;
+        artifact::ObjectHandle post_attention_norm;
+        WeightPlan gate_up;
+        WeightPlan down;
+        DFlash2ConvPlan mlp_conv;
+    };
+    struct DFlash2Plan {
+        WeightPlan feature_projection;
+        artifact::ObjectHandle context_norm;
+        std::array<DFlash2LayerPlan, 5> layers;
+        artifact::ObjectHandle final_norm;
+        WeightPlan selector_hidden;
+        WeightPlan selector_predecessor;
+        WeightPlan selector_successor;
+    };
+    DFlash2Plan dflash2;
 };
 
 struct ArtifactLoadPlan {
@@ -187,10 +218,11 @@ struct MtpAttentionPayload {
     Weight value;
 };
 
-using RuntimeModelView =
-    qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
-                       kFullAttentionLayers, kGdnLayers>;
+using RuntimeModelView = qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload,
+                                             DensePostMixerPayload, MtpAttentionPayload,
+                                             DensePostMixerPayload, qwen3_6::DFlashWeights<5>,
+                                             qwen3_6::DFlash2Weights<5>, kFullAttentionLayers,
+                                             kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

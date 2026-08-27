@@ -159,8 +159,10 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             Tensor key = layer_roots.key.view({Config::head_dim, Config::kv_heads, layer_columns});
             ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
                          state.execution.device.stream);
-            ops::rope(layer_positions.view({layer_columns}), Config::head_dim, Config::rope_theta,
-                      key, state.execution.device.stream);
+            static const ops::RopeFrequencies frequencies =
+                ops::rope_linear_frequencies(Config::rope_theta, Config::head_dim);
+            ops::rope(layer_positions.view({layer_columns}), Config::head_dim, frequencies, key,
+                      ops::RopeSide::Key, state.execution.device.stream);
             Tensor key_batch = key.view({Config::head_dim, Config::kv_heads, layer_width, batch});
             Tensor value_batch =
                 value.view({Config::head_dim, Config::kv_heads, layer_width, batch});
@@ -228,8 +230,10 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                              state.execution.device.stream);
                 ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
                              state.execution.device.stream);
-                ops::rope(positions.view({columns}), Config::head_dim, Config::rope_theta, query,
-                          key, state.execution.device.stream);
+                static const ops::RopeFrequencies frequencies =
+                    ops::rope_linear_frequencies(Config::rope_theta, Config::head_dim);
+                ops::rope(positions.view({columns}), Config::head_dim, frequencies, query, key,
+                          state.execution.device.stream);
                 Tensor query_batch =
                     query.view({Config::head_dim, Config::query_heads, width, batch_size});
                 Tensor key_batch =
@@ -358,7 +362,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
 
         TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
                          state.execution.linear_attention, state.execution.io,
-                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0,
+                         state.execution.rope_frequencies, {},
                          &state.text_cache);
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, lanes, valid_columns, width, batch_size);

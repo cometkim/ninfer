@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -229,6 +230,7 @@ template <class Geometry, class Schedule, class Output, class Epilogue = Bf16Sto
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_gemv_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
     Epilogue epilogue = {}) {
+    pdl::sync();
     static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
 
     __shared__ Bf16GemvSharedStorage<Geometry, Schedule> shared;
@@ -282,6 +284,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             }
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

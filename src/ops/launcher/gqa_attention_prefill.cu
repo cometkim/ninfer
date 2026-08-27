@@ -1,11 +1,10 @@
-// ninfer::ops - gqa_attention prompt-scale launcher: fill k/v at device
-// positions then launch causal attention over absolute cached history.
+// ninfer::ops - gqa_attention prompt-scale dispatcher: geometry, metadata, and
+// dtype route selection. The per-dtype kernels live in
+// gqa_attention_prefill_{bf16,i8,hq}.cu; this TU instantiates no fat kernels.
 #include "ops/launcher/gqa_attention.h"
 
-#include "ops/common/math.h"
-#include "ops/kernel/gqa_attention_prefill_bf16.cuh"
-#include "ops/kernel/gqa_attention_prefill_i8.cuh"
-#include "core/device.h" // CUDA_CHECK
+#include "ops/kernel/gqa_attention_prefill_common.cuh"
+#include "ops/kernel/gqa_attention_geometry.cuh"
 
 #include <cstdint>
 
@@ -13,125 +12,96 @@ namespace ninfer::ops::detail {
 namespace {
 
 template <typename Geometry, typename CacheView, typename Metadata>
-void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
-                                               float scale, const CacheView& cache,
-                                               Metadata metadata, Tensor& out,
-                                               cudaStream_t stream) {
-    const Tensor& cache_k = cache.k_pages;
-    const Tensor& cache_v = cache.v_pages;
-    // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
-    static const cudaError_t attr_bf16 =
-        cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
-    CUDA_CHECK(attr_bf16);
-    static const cudaError_t attr_i8 =
-        cudaFuncSetAttribute(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
-    CUDA_CHECK(attr_i8);
-
-    const auto tokens = static_cast<std::int32_t>(q.ne[2]);
-    if (cache.dtype == DType::I8) {
-        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillI8Br)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
-        const Tensor& cache_k_scale = cache.k_scale_pages;
-        const Tensor& cache_v_scale = cache.v_scale_pages;
-        gqa_attention_prefill_i8_kernel<Geometry, Metadata>
-            <<<attention_grid, kGqaPrefillI8Threads, kGqaPrefillI8SmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const std::int8_t*>(cache_k.data),
-                static_cast<const std::int8_t*>(cache_v.data),
-                static_cast<const __half*>(cache_k_scale.data),
-                static_cast<const __half*>(cache_v_scale.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+void gqa_prefill_append_route(const Tensor& k, const Tensor& v, const Tensor& positions,
+                              CacheView cache, Metadata metadata, cudaStream_t stream) {
+    if (cache.dtype == DType::U8) {
+        gqa_prefill_append_hq<Geometry, CacheView, Metadata>(k, v, positions, cache, metadata,
+                                                             stream);
+    } else if (cache.dtype == DType::I8) {
+        gqa_prefill_append_i8<Geometry, CacheView, Metadata>(k, v, positions, cache, metadata,
+                                                             stream);
     } else {
-        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
-        gqa_attention_prefill_bf16_kernel<Geometry, Metadata>
-            <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const __nv_bfloat16*>(cache_k.data),
-                static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+        gqa_prefill_append_bf16<Geometry, CacheView, Metadata>(k, v, positions, cache, metadata,
+                                                               stream);
     }
-    CUDA_CHECK(cudaGetLastError());
 }
 
 template <typename Geometry, typename CacheView, typename Metadata>
-void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& positions,
-                              CacheView cache, Metadata metadata, cudaStream_t stream) {
-    const auto tokens = static_cast<std::int32_t>(k.ne[2]);
-    Tensor& cache_k   = cache.k_pages;
-    Tensor& cache_v   = cache.v_pages;
-    if (cache.dtype == DType::I8) {
-        Tensor& cache_k_scale    = cache.k_scale_pages;
-        Tensor& cache_v_scale    = cache.v_scale_pages;
-        constexpr int kFillBlock = 256;
-        if (tokens >= 128 && Geometry::KVHeads == 2) {
-            constexpr int kPageBlock     = 256;
-            constexpr int kTokensPerTile = 8;
-            const int max_tiles          = div_up(tokens + kTokensPerTile - 1, kTokensPerTile);
-            const dim3 fill_grid(static_cast<unsigned>(max_tiles),
-                                 static_cast<unsigned>(Geometry::KVHeads),
-                                 static_cast<unsigned>(kGqaKvQuantGroups));
-            gqa_attention_prefill_fill_i8_page_kernel<Geometry, Metadata>
-                <<<fill_grid, kPageBlock, 0, stream>>>(
-                    static_cast<const __nv_bfloat16*>(k.data),
-                    static_cast<const __nv_bfloat16*>(v.data),
-                    static_cast<const std::int32_t*>(positions.data), metadata,
-                    static_cast<std::int8_t*>(cache_k.data),
-                    static_cast<std::int8_t*>(cache_v.data),
-                    static_cast<__half*>(cache_k_scale.data),
-                    static_cast<__half*>(cache_v_scale.data), tokens);
-        } else {
-            constexpr int kFillWarps = kFillBlock / 32;
-            const std::int64_t fill_units =
-                static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvQuantGroups;
-            const int fill_grid =
-                static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
-            gqa_attention_prefill_fill_i8_kernel<Geometry, Metadata>
-                <<<fill_grid, kFillBlock, 0, stream>>>(
-                    static_cast<const __nv_bfloat16*>(k.data),
-                    static_cast<const __nv_bfloat16*>(v.data),
-                    static_cast<const std::int32_t*>(positions.data), metadata,
-                    static_cast<std::int8_t*>(cache_k.data),
-                    static_cast<std::int8_t*>(cache_v.data),
-                    static_cast<__half*>(cache_k_scale.data),
-                    static_cast<__half*>(cache_v_scale.data), tokens);
-        }
-        CUDA_CHECK(cudaGetLastError());
+void gqa_prefill_attention_route(const Tensor& q, const Tensor& positions, float scale,
+                                 const CacheView& cache, Metadata metadata, const Tensor& new_k,
+                                 const Tensor& new_v, const Tensor& scratch_k,
+                                 const Tensor& scratch_v, const Tensor& carry_acc,
+                                 const Tensor& carry_m, const Tensor& carry_l,
+                                 std::uint32_t visible_keys, const Tensor& partial_acc,
+                                 const Tensor& partial_m, const Tensor& partial_l,
+                                 std::int32_t split_count, Tensor& out, cudaStream_t stream) {
+    if (cache.dtype == DType::U8) {
+        gqa_prefill_attention_hq<Geometry, CacheView, Metadata>(
+            q, positions, scale, cache, metadata, new_k, new_v, scratch_k, scratch_v, carry_acc,
+            carry_m, carry_l, visible_keys, partial_acc, partial_m, partial_l, split_count, out,
+            stream);
+    } else if (cache.dtype == DType::I8) {
+        gqa_prefill_attention_i8<Geometry, CacheView, Metadata>(q, positions, scale, cache,
+                                                                metadata, out, partial_acc,
+                                                                partial_m, partial_l, split_count,
+                                                                stream);
     } else {
-        constexpr int kBlock           = Geometry::KVHeads == 4 ? 128 : 96;
-        constexpr int kFillVecElems    = 8;
-        const std::int64_t kv_elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
-                                         (kGqaPrefillHeadDim / kFillVecElems);
-        const int fill_grid =
-            static_cast<int>(div_up(kv_elements, static_cast<std::int64_t>(kBlock)));
-        gqa_attention_prefill_fill_bf16_kernel<Geometry, Metadata>
-            <<<fill_grid, kBlock, 0, stream>>>(static_cast<const __nv_bfloat16*>(k.data),
-                                               static_cast<const __nv_bfloat16*>(v.data),
-                                               static_cast<const std::int32_t*>(positions.data),
-                                               metadata, static_cast<__nv_bfloat16*>(cache_k.data),
-                                               static_cast<__nv_bfloat16*>(cache_v.data), tokens);
-        CUDA_CHECK(cudaGetLastError());
+        gqa_prefill_attention_bf16<Geometry, CacheView, Metadata>(q, positions, scale, cache,
+                                                                  metadata, out, partial_acc,
+                                                                  partial_m, partial_l,
+                                                                  split_count, stream);
     }
 }
 
 } // namespace
 
+std::int32_t gqa_prefill_split_count(std::int32_t width, std::int32_t q_heads) {
+    static const int sms = [] {
+        int device = 0;
+        int count  = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) { return 1; }
+        if (cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess ||
+            count <= 0) {
+            return 1;
+        }
+        return count;
+    }();
+    const std::int64_t items = (static_cast<std::int64_t>(width) + 63) / 64 * q_heads;
+    const double ratio_s1    = static_cast<double>((items + sms - 1) / sms);
+    double best_ratio        = ratio_s1;
+    std::int32_t best        = 1;
+    for (std::int32_t s = 2; s <= 4; ++s) {
+        const double ratio = static_cast<double>((items * s + sms - 1) / sms) / s;
+        if (ratio < best_ratio) {
+            best_ratio = ratio;
+            best       = s;
+        }
+    }
+    if (best_ratio > 0.9 * ratio_s1) { return 1; }
+    return best;
+}
+
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                           const PagedKVLayerView& cache, Tensor& out,
-                                           cudaStream_t stream) {
+                                           const PagedKVLayerView& cache, const Tensor& scratch_k,
+                                           const Tensor& scratch_v, const Tensor& carry_acc,
+                                           const Tensor& carry_m, const Tensor& carry_l,
+                                           std::uint32_t visible_keys,
+                                           const Tensor& partial_acc, const Tensor& partial_m,
+                                           const Tensor& partial_l, std::int32_t split_count,
+                                           Tensor& out, cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
     if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
+        gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata, Tensor{},
+                                                   Tensor{}, scratch_k, scratch_v, carry_acc,
+                                                   carry_m, carry_l, visible_keys, partial_acc,
+                                                   partial_m, partial_l, split_count, out, stream);
         return;
     }
-    gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
-                                                             out, stream);
+    gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, Tensor{},
+                                               Tensor{}, scratch_k, scratch_v, carry_acc,
+                                               carry_m, carry_l, visible_keys, partial_acc,
+                                               partial_m, partial_l, split_count, out, stream);
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -139,16 +109,21 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
     if (k.ne[1] == Gqa27Geometry::KVHeads) {
-        gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
+        gqa_prefill_append_route<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
         return;
     }
-    gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
+    gqa_prefill_append_route<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
 }
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream) {
+                                 const Tensor& scratch_k, const Tensor& scratch_v,
+                                 const Tensor& carry_acc, const Tensor& carry_m,
+                                 const Tensor& carry_l, std::uint32_t visible_keys,
+                                 const Tensor& partial_acc, const Tensor& partial_m,
+                                 const Tensor& partial_l, std::int32_t split_count, Tensor& out,
+                                 cudaStream_t stream) {
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -158,14 +133,19 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             .table_stride = cache.block_tables.ne[0],
         };
         if (q.ne[1] == Gqa27Geometry::QHeads) {
-            gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
-            gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                     metadata, out, stream);
+            gqa_prefill_append_route<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
+            gqa_prefill_attention_route<Gqa27Geometry>(q, positions, scale, cache, metadata, k, v,
+                                                       scratch_k, scratch_v, carry_acc, carry_m,
+                                                       carry_l, visible_keys, partial_acc,
+                                                       partial_m, partial_l, split_count, out,
+                                                       stream);
             return;
         }
-        gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
-        gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
+        gqa_prefill_append_route<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
+        gqa_prefill_attention_route<Gqa35Geometry>(q, positions, scale, cache, metadata, k, v,
+                                                   scratch_k, scratch_v, carry_acc, carry_m,
+                                                   carry_l, visible_keys, partial_acc, partial_m,
+                                                   partial_l, split_count, out, stream);
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

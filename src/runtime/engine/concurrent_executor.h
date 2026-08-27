@@ -499,6 +499,18 @@ private:
         invalidate_lane_plans(lane);
     }
 
+    // Per-request failure boundary. Device-level failures never travel as exceptions
+    // (cuda_check aborts the process), so a host exception escaping one request's forward or
+    // publication work is request-scoped by construction: fail that request, discard its lane,
+    // and keep serving every other request. Only exceptions from shared-engine work (round
+    // membership, the batched decode execution itself) reach fail_all.
+    void fail_active_request(std::uint32_t lane, const std::shared_ptr<Request>& request,
+                             std::exception_ptr error) noexcept {
+        instance_.program->abort_lane(lane);
+        complete_error(request, std::move(error));
+        remove_completed_slot(lane);
+    }
+
     void consume_service_work(const std::shared_ptr<Request>& request, std::uint64_t work) {
         if (work == 0 || work > request->remaining_service_work) {
             throw std::logic_error("request service projection consumed " + std::to_string(work) +
@@ -650,9 +662,18 @@ private:
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
-        const PrefillStepResult step  = instance_.program->advance_prefill_lane(lane);
-        const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
-        resolve_prefill_step(request, step, cancel_at_boundary);
+        try {
+            const PrefillStepResult step  = instance_.program->advance_prefill_lane(lane);
+            const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
+            resolve_prefill_step(request, step, cancel_at_boundary);
+        } catch (...) {
+            if (prefill_lane_ && *prefill_lane_ == lane) {
+                instance_.request_memory.deactivate();
+                prefill_lane_.reset();
+            }
+            fail_active_request(lane, request, std::current_exception());
+            return;
+        }
         publish_runtime_stats();
     }
 
@@ -833,7 +854,9 @@ private:
             slots_[lane].reset();
             invalidate_lane_plans(lane);
             complete_error(request, error);
-            throw;
+            // The request is failed and its lane state discarded; rethrowing here would
+            // fail_all the engine over one request's host-side error (the req-3 class).
+            return AdmissionProgress::ControlProgress;
         }
         return AdmissionProgress::RanGpuUnit;
     }
@@ -1001,6 +1024,7 @@ private:
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
         std::array<std::uint8_t, kMaximumConcurrency> terminal{};
         std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
+        std::array<std::exception_ptr, kMaximumConcurrency> row_errors{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             const auto& request      = slots_[lane];
@@ -1018,8 +1042,20 @@ private:
                 finish_reasons[row] = FinishReason::Cancelled;
                 continue;
             }
-            const OutputDecision decision = request->output.preview(
-                row_tokens, request->budget->remaining(), request->budget->limit_reason());
+            OutputDecision decision;
+            try {
+                decision = request->output.preview(row_tokens, request->budget->remaining(),
+                                                   request->budget->limit_reason());
+            } catch (...) {
+                // Request-scoped output-policy failure: hand the row to the batch resolve as
+                // cancelled (discarding its licensed tokens) and fail the request below.
+                row_errors[row]     = std::current_exception();
+                cancelled[row]      = 1;
+                accepted[row]       = 0;
+                terminal[row]       = 1;
+                finish_reasons[row] = FinishReason::Cancelled;
+                continue;
+            }
             if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                 (!decision.finished() && decision.accepted_tokens != count)) {
                 throw std::logic_error("output policy returned an invalid licensed prefix");
@@ -1037,22 +1073,31 @@ private:
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             const auto& request      = slots_[lane];
-            if (!cancelled[row]) {
-                const auto row_tokens = round.tokens.subspan(
-                    row * round.row_stride, static_cast<std::size_t>(accepted[row]));
-                request->generated.insert(request->generated.end(), row_tokens.begin(),
-                                          row_tokens.end());
-                request->budget->commit(accepted[row]);
-                consume_service_work(request, accepted[row]);
+            if (row_errors[row]) {
+                fail_active_request(lane, request, std::move(row_errors[row]));
+                continue;
             }
-            auto published = request->output.commit_preview();
-            if (!request->first_token && accepted[row] != 0) {
-                request->first_token = Clock::now();
-            }
-            append_output(request, std::move(published));
-            if (terminal[row]) {
-                complete_success(request, finish_reasons[row]);
-                remove_completed_slot(lane);
+            try {
+                if (!cancelled[row]) {
+                    const auto row_tokens = round.tokens.subspan(
+                        row * round.row_stride, static_cast<std::size_t>(accepted[row]));
+                    request->generated.insert(request->generated.end(), row_tokens.begin(),
+                                              row_tokens.end());
+                    request->budget->commit(accepted[row]);
+                    consume_service_work(request, accepted[row]);
+                }
+                auto published = request->output.commit_preview();
+                if (!request->first_token && accepted[row] != 0) {
+                    request->first_token = Clock::now();
+                }
+                append_output(request, std::move(published));
+                if (terminal[row]) {
+                    complete_success(request, finish_reasons[row]);
+                    remove_completed_slot(lane);
+                }
+            } catch (...) {
+                fail_active_request(lane, request, std::current_exception());
+                cancelled[row] = 1; // keep the row out of the committed-token stats below
             }
         }
         ++cumulative_stats_.decode_rounds;

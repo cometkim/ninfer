@@ -71,6 +71,7 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
 
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
@@ -93,6 +94,8 @@ std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
 
 std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
     switch (schedule) {
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
+        return 80;
     case Bf16GdnGatingScheduleId::SmallTSplit10:
         return 10;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
@@ -149,6 +152,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
             return problem.cols == 1;
         case Bf16GdnGatingScheduleId::SmallTSplit10:
             return problem.cols >= 2 && problem.cols <= 8;
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
@@ -164,6 +168,8 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
     }
 
     switch (schedule) {
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
+        return false;
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
         return problem.cols <= 4 * 65'535;
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
@@ -207,6 +213,10 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
     if (plan.workspace_bytes != 0) { scratch = ws.alloc_bytes(plan.workspace_bytes); }
 
     switch (plan.schedule) {
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
+        // Split80 exists only as the fused norm/control schedule; the plain control op never
+        // resolves to it through k27Routes.
+        throw std::logic_error("BF16 GDN gating: split40 is the fused norm-only schedule");
     case Bf16GdnGatingScheduleId::GemvPairedRows:
         bf16_gdn_gating_proj_gemv_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
         return;
@@ -299,6 +309,8 @@ const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noex
         return "gdn_gating_proj.bf16.simt.warp_row.c4";
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
         return "gdn_gating_proj.bf16.simt.warp_row.c8";
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit40:
+        return "gdn_gating_proj.bf16.mma.cooperative_split40";
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
         return "gdn_gating_proj.bf16.mma.cooperative_split32";
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
@@ -319,6 +331,8 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
     switch (schedule) {
     case Bf16GdnNormGatingScheduleId::Composed:
         return "gdn_norm_gating_proj.bf16.composed";
+    case Bf16GdnNormGatingScheduleId::MmaCooperativeSplit40:
+        return "gdn_norm_gating_proj.bf16.mma.cooperative_split40";
     case Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32:
         return "gdn_norm_gating_proj.bf16.mma.cooperative_split32";
     }
@@ -388,6 +402,11 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
         norm_splits = 32;
+    } else if (is_27(problem) && problem.cols <= 8) {
+        control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit40,
+                                                     problem);
+        schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit40;
+        norm_splits = 80;
     }
     const std::size_t norm_partial_bytes =
         static_cast<std::size_t>(norm_splits) * problem.cols * sizeof(float);
@@ -400,6 +419,12 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t max_cols) {
     std::size_t maximum =
         bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
+    if (heads == 48 && input_rows == 5120 && min_cols <= 8) {
+        const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 8);
+        maximum                       = std::max(
+            maximum,
+            bf16_gdn_norm_gating_resolve_plan({heads, input_rows, fused_cols}).workspace_bytes);
+    }
     if (heads == 32 && input_rows == 2048 && min_cols <= 16) {
         const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 16);
         maximum                       = std::max(
@@ -455,6 +480,12 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
     auto scratch_scope = ws.scope();
     DeviceSpan scratch{};
     if (plan.workspace_bytes != 0) { scratch = ws.alloc_bytes(plan.workspace_bytes); }
+    if (plan.schedule == Bf16GdnNormGatingScheduleId::MmaCooperativeSplit40) {
+        bf16_gdn_norm_gating_proj_27_mma_split40_launch(plan.control.token_variant, x, norm_weight,
+                                                        eps, h, a_weight, b_weight, A_log, dt_bias,
+                                                        scratch.data, g, beta, stream);
+        return;
+    }
     bf16_gdn_norm_gating_proj_35_mma_split32_launch(plan.control.token_variant, x, norm_weight, eps,
                                                     h, a_weight, b_weight, A_log, dt_bias,
                                                     scratch.data, g, beta, stream);

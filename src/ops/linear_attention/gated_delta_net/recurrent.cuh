@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/common/bf16_vector.cuh"
 #include "ops/linear_attention/gated_delta_net/common.cuh"
 #include "ops/linear_attention/gated_delta_net/launch.h"
@@ -34,6 +35,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                           const float* __restrict__ v, const float* __restrict__ g,
                           const float* __restrict__ beta, float* __restrict__ ssm_state,
                           float* __restrict__ out, std::int64_t T, head_map heads, float scale) {
+    pdl::sync();
     const int lane           = threadIdx.x;
     const int warp_id        = threadIdx.y;
     const std::uint32_t h_v  = static_cast<std::uint32_t>(blockIdx.x);
@@ -107,6 +109,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         store_qk_lane(s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
                       dqk_base);
     }
+    pdl::publish();
 }
 
 inline constexpr float kQkL2NormEps = 1.0e-6f;
@@ -225,6 +228,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                  const float* __restrict__ state_read,
                                  float* __restrict__ state_write, __nv_bfloat16* __restrict__ out,
                                  std::int32_t width, head_map heads, float scale) {
+    pdl::sync();
     const int lane           = threadIdx.x;
     const int warp_id        = threadIdx.y;
     const std::uint32_t h_v  = static_cast<std::uint32_t>(blockIdx.x);
@@ -266,6 +270,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         store_qk_lane(state[r], write_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
                       dqk_base);
     }
+    pdl::publish();
 }
 
 enum class RecurrentMode {
@@ -675,25 +680,31 @@ template <bool NormalizeInputs, bool Batched, bool Masked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_snapshot_kernel(SnapshotAccess<Batched, Masked> access) {
     static_assert(!Masked || Batched);
+    pdl::sync();
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Snapshot, NormalizeInputs>(access, coord, access.width,
                                                                   access.active_columns(coord));
+    pdl::publish();
 }
 
 template <bool Masked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_record_kernel(RecordAccess<Masked> access) {
+    pdl::sync();
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Record, true>(access, coord, access.width,
                                                      access.active_columns(coord));
+    pdl::publish();
 }
 
 template <class Geometry>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
+    pdl::sync();
     const RecurrentCoordinates coord = access.coordinates();
     recurrent_bf16_body<RecurrentMode::Fold, true>(access, coord, access.width,
                                                    access.active_columns(coord));
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

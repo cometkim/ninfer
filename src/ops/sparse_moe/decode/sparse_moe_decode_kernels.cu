@@ -88,8 +88,8 @@ __global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int*
                                           float* __restrict__ alpha,
                                           float* __restrict__ shared_scale) {
     __shared__ float selected_logits[kTopK];
-    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     sparse_moe_select_top8_warp(scores, ids, alpha, shared_scale, selected_logits);
+    pdl::publish();
 }
 
 struct Q4Codec {
@@ -235,7 +235,6 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    if (tid == 0) { pdl::trigger_dependents(); }
     if (tid < 256) { store_vec(x_shared + tid * 8, load_vec<uint4>(x + tid * 8)); }
     __syncthreads();
 
@@ -254,6 +253,7 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
                                        x_shared, 0, kHidden, gate, up);
     }
     if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = silu(gate) * up; }
+    pdl::publish();
 }
 
 template <class RoutedCodec, int PathsPerBlock, bool Adaptive>

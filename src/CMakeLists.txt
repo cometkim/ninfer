@@ -24,6 +24,7 @@ add_library(ninfer_core STATIC
   core/host_worker_pool.cpp
   core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
+  core/kv_ring_bits.cu
   core/paged_kv_cache.cpp
   core/linear_attention_state.cpp
   core/layout.cpp
@@ -68,6 +69,7 @@ target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core ${NINFER_CUDART_TARGE
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
   ops/launcher/add_bias.cu
+  ops/launcher/dflash2_draft.cu
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
@@ -77,7 +79,15 @@ add_library(ninfer_ops STATIC
   ops/launcher/bidirectional_gqa_attention.cu
   ops/launcher/swa.cu
   ops/launcher/gqa_attention_decode.cu
+  ops/launcher/gqa_attention_decode_bf16.cu
+  ops/launcher/gqa_attention_decode_i8.cu
+  ops/launcher/gqa_attention_decode_hq_27.cu
+  ops/launcher/gqa_attention_decode_hq_35.cu
   ops/launcher/gqa_attention_prefill.cu
+  ops/launcher/gqa_attention_prefill_bf16.cu
+  ops/launcher/gqa_attention_prefill_i8.cu
+  ops/launcher/gqa_attention_prefill_hq_27.cu
+  ops/launcher/gqa_attention_prefill_hq_35.cu
   ops/launcher/kv_cache_append_prefix.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
@@ -89,6 +99,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/prepare_masked_block.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
+  ops/launcher/qk_norm_rope.cu
   ops/launcher/rope.cu
   ops/launcher/sampling.cu
   ops/launcher/scalar.cu
@@ -231,6 +242,7 @@ add_library(ninfer_ops STATIC
   ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
   ops/linear/linear.cpp
   ops/wrapper/add_bias.cpp
+  ops/wrapper/dflash2_draft.cpp
   ops/wrapper/argmax.cpp
   ops/wrapper/cast.cpp
   ops/wrapper/causal_conv1d_silu.cpp
@@ -257,6 +269,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/prepare_masked_block.cpp
   ops/wrapper/residual_add.cpp
   ops/wrapper/rmsnorm.cpp
+  ops/wrapper/qk_norm_rope.cpp
   ops/wrapper/rope.cpp
   ops/wrapper/sampling.cpp
   ops/wrapper/scalar.cpp

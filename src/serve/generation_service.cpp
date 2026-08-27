@@ -235,6 +235,10 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
+    engine_options.rope_scaling_factor      = options_.rope_scaling.factor;
+    engine_options.rope_scaling_temperature = options_.rope_scaling.temperature;
+    engine_options.rope_scaling_beta_fast   = options_.rope_scaling.beta_fast;
+    engine_options.rope_scaling_beta_slow   = options_.rope_scaling.beta_slow;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;

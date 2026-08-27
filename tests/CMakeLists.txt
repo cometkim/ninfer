@@ -114,6 +114,9 @@ ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
+ninfer_add_test(ninfer_qwen3_6_27b_rope_scaling_test
+  SOURCES targets/qwen3_6_27b/test_rope_scaling.cpp
+  LIBRARIES ninfer_ops)
 target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
@@ -189,6 +192,7 @@ set(ninfer_op_tests
   argmax
   gdn_gating
   gdn_gating_proj
+  qk_norm_rope
   rope
   vision_pos_embed
   vision_attention
@@ -216,6 +220,18 @@ ninfer_add_op_test(ninfer_swa_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
   SOURCES ops/test_kv_cache_append_prefix.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash2_dynamic_conv_test
+  SOURCES ops/test_dflash2_dynamic_conv.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash2_topk_walk_test
+  SOURCES ops/test_dflash2_topk_walk.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash2_selector_scores_test
+  SOURCES ops/test_dflash2_selector_scores.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_dflash2_selector_predecessors_test
+  SOURCES ops/test_dflash2_selector_predecessors.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp

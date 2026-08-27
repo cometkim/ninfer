@@ -1,3 +1,4 @@
+#include "core/pdl.cuh"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include "core/device.h"
@@ -26,11 +27,12 @@ void launch_recurrent_fp32_fixed(const Tensor& q, const Tensor& k, const Tensor&
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(kWarpSize, kNumWarps, 1);
 
-    recurrent_fp32_kernel<<<grid, block, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {grid, block, 0, stream}, recurrent_fp32_kernel,
         static_cast<const float*>(q.data), static_cast<const float*>(k.data),
         static_cast<const float*>(v.data), static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data), static_cast<float*>(ssm_state.data),
-        static_cast<float*>(out.data), T, heads, scale);
+        static_cast<float*>(out.data), T, heads, scale));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -42,12 +44,13 @@ void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tenso
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_bf16_direct_kernel<NormalizeQK><<<grid, block, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {grid, block, 0, stream}, recurrent_bf16_direct_kernel<NormalizeQK>,
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data), static_cast<const float*>(state_read.data),
         static_cast<float*>(state_write.data), static_cast<__nv_bfloat16*>(out.data), q.ne[2],
-        heads, scale);
+        heads, scale));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -80,7 +83,9 @@ void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Ten
         state_slot_stride,
         scale,
     };
-    recurrent_snapshot_kernel<NormalizeInputs, Batched, Masked><<<grid, block, 0, stream>>>(access);
+    CUDA_CHECK(pdl::launch_dependent(
+        {grid, block, 0, stream},
+        recurrent_snapshot_kernel<NormalizeInputs, Batched, Masked>, access));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -115,7 +120,8 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
     };
-    recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
+    CUDA_CHECK(pdl::launch_dependent(
+        {grid, block, 0, stream}, recurrent_record_kernel<Masked>, access));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -141,7 +147,8 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
                     static_cast<unsigned>(active_rows),
                     static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
     const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_fold_kernel<Geometry><<<grid, block, 0, stream>>>(access);
+    CUDA_CHECK(pdl::launch_dependent(
+        {grid, block, 0, stream}, recurrent_fold_kernel<Geometry>, access));
     CUDA_CHECK(cudaGetLastError());
 }
 

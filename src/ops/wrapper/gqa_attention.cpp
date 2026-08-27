@@ -2,6 +2,7 @@
 #include "ninfer/ops/gqa_attention.h"
 
 #include "core/layout.h"
+#include "ninfer/ops/sigmoid_mul.h"
 #include "ops/launcher/gqa_attention.h"
 
 #include <algorithm>
@@ -16,12 +17,18 @@ namespace {
 
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
+// hq-e8-2b planes: U8 codes [kHqCodeRowBytes, 64, Hkv, N] and U8 metadata
+// [kHqMetaRowBytes, 64, Hkv, N] carried in the *_scale_pages slots.
+constexpr std::int32_t kHqQuantGroup                 = 32;
+constexpr std::int32_t kHqCodeRowBytes               = 64;
+constexpr std::int32_t kHqMetaRowBytes               = 8;
 constexpr float kExpectedScale                       = 0.0625f;
-constexpr std::int32_t kSmallTChunkTokens            = 6;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
 constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
+constexpr std::int32_t kHqResidualRows =
+    static_cast<std::int32_t>(kGqaHqSinkKeys + kGqaHqRecentKeys);
 
 std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     if (q_heads == 24) { return 4; }
@@ -51,8 +58,46 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
     }
 }
 
+void require_gate(const Tensor& gate, std::int64_t out_elements, const char* op) {
+    if (gate.dtype != DType::BF16) {
+        throw std::invalid_argument(std::string(op) + ": gate must be BF16");
+    }
+    if (!gate.is_contiguous() || gate.data == nullptr) {
+        throw std::invalid_argument(std::string(op) + ": gate must be contiguous non-null");
+    }
+    if (gate.numel() != out_elements) {
+        throw std::invalid_argument(std::string(op) + ": gate element count must match out");
+    }
+}
+
+// The U8 residual window arrives as all-or-none: exact rotated-frame bf16 side planes
+// [head_dim, kv_heads, sink+recent rows, slots] plus U32 ring-validity words [4, slots].
+// Any other cache dtype must not carry them.
+void validate_residual(const Tensor& residual_k, const Tensor& residual_v,
+                       const Tensor& ring_valid, DType dtype, std::int32_t kv_heads,
+                       std::int32_t slots, const char* op) {
+    const bool present =
+        residual_k.data != nullptr || residual_v.data != nullptr || ring_valid.data != nullptr;
+    if (!present) { return; }
+    if (dtype != DType::U8) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": residual planes are an hq-e8-2b-only feature");
+    }
+    if (residual_k.dtype != DType::BF16 || residual_v.dtype != DType::BF16 ||
+        ring_valid.dtype != DType::I32) {
+        throw std::invalid_argument(std::string(op) + ": invalid residual plane dtypes");
+    }
+    require_shape(residual_k, kHeadDim, kv_heads, kHqResidualRows, slots, op, "residual k plane");
+    require_shape(residual_v, kHeadDim, kv_heads, kHqResidualRows, slots, op, "residual v plane");
+    require_shape(ring_valid, static_cast<std::int32_t>(kGqaHqRecentKeys / 32), slots, 1, 1, op,
+                  "residual ring validity");
+    require_contiguous_nonnull(residual_k, op, "residual k plane");
+    require_contiguous_nonnull(residual_v, op, "residual v plane");
+    require_contiguous_nonnull(ring_valid, op, "residual ring validity");
+}
+
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 && cache.dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -62,6 +107,11 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
     }
+    if (cache.dtype == DType::U8 && cache.quant_group != kHqQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": hq-e8-2b KV cache must use quant_group 32");
+    }
+    validate_residual(cache.residual_k, cache.residual_v, cache.ring_valid, cache.dtype, kv_heads,
+                      1, op);
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_table.ne[0];
@@ -71,13 +121,16 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    const DType code_dtype = cache.dtype == DType::I8   ? DType::I8
+                             : cache.dtype == DType::U8 ? DType::U8
+                                                        : DType::BF16;
+    const std::int32_t code_leading = cache.dtype == DType::U8 ? kHqCodeRowBytes : kHeadDim;
     if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_pages, code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -91,6 +144,18 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
             throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
         }
+        return static_cast<std::uint32_t>(capacity);
+    }
+    if (cache.dtype == DType::U8) {
+        if (cache.k_scale_pages.dtype != DType::U8 || cache.v_scale_pages.dtype != DType::U8) {
+            throw std::invalid_argument(std::string(op) + ": invalid hq-e8-2b metadata dtype");
+        }
+        require_shape(cache.k_scale_pages, kHqMetaRowBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache k meta pages");
+        require_shape(cache.v_scale_pages, kHqMetaRowBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache v meta pages");
+        require_contiguous_nonnull(cache.k_scale_pages, op, "cache k meta pages");
+        require_contiguous_nonnull(cache.v_scale_pages, op, "cache v meta pages");
         return static_cast<std::uint32_t>(capacity);
     }
 
@@ -109,7 +174,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 && cache.dtype != DType::U8) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -119,23 +184,31 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
     }
+    if (cache.dtype == DType::U8 && cache.quant_group != kHqQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": hq-e8-2b KV cache must use quant_group 32");
+    }
 
     const std::int32_t physical_pages = cache.k_pages.ne[3];
     const std::int32_t logical_pages  = cache.block_tables.ne[0];
     const std::int32_t table_rows     = cache.block_tables.ne[1];
+    validate_residual(cache.residual_k, cache.residual_v, cache.ring_valid, cache.dtype, kv_heads,
+                      table_rows, op);
     const std::int64_t capacity       = static_cast<std::int64_t>(logical_pages) * kPagedKVPageSize;
     if (physical_pages <= 0 || logical_pages <= 0 || table_rows <= 0 ||
         capacity > std::numeric_limits<std::int32_t>::max()) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    const DType code_dtype = cache.dtype == DType::I8   ? DType::I8
+                             : cache.dtype == DType::U8 ? DType::U8
+                                                        : DType::BF16;
+    const std::int32_t code_leading = cache.dtype == DType::U8 ? kHqCodeRowBytes : kHeadDim;
     if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    require_shape(cache.k_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_pages, code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k pages");
-    require_shape(cache.v_pages, kHeadDim, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_pages, code_leading, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v pages");
     require_contiguous_nonnull(cache.k_pages, op, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, op, "cache v pages");
@@ -149,6 +222,18 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
             throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
         }
+        return static_cast<std::uint32_t>(capacity);
+    }
+    if (cache.dtype == DType::U8) {
+        if (cache.k_scale_pages.dtype != DType::U8 || cache.v_scale_pages.dtype != DType::U8) {
+            throw std::invalid_argument(std::string(op) + ": invalid hq-e8-2b metadata dtype");
+        }
+        require_shape(cache.k_scale_pages, kHqMetaRowBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache k meta pages");
+        require_shape(cache.v_scale_pages, kHqMetaRowBytes, kPagedKVPageSize, kv_heads,
+                      physical_pages, op, "cache v meta pages");
+        require_contiguous_nonnull(cache.k_scale_pages, op, "cache k meta pages");
+        require_contiguous_nonnull(cache.v_scale_pages, op, "cache v meta pages");
         return static_cast<std::uint32_t>(capacity);
     }
 
@@ -165,11 +250,18 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     return static_cast<std::uint32_t>(capacity);
 }
 
+// U8 (hq-e8-2b) reaches the absolute envelope ceiling; the paged BF16/I8 decode kernels
+// stage a fixed number of page ids per split, so their linear envelopes stay capped.
+std::uint32_t maximum_visible_keys_for(DType cache_dtype) {
+    return cache_dtype == DType::U8 ? kGqaAttentionMaximumVisibleKeys
+                                    : kGqaAttentionMaximumLinearVisibleKeys;
+}
+
 void validate_envelope(GqaExecutionEnvelope envelope, const PagedKVLayerView& cache,
                        std::int32_t tokens, const char* op) {
     const std::uint32_t capacity = validate_cache(cache, cache.num_kv_heads, op);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > maximum_visible_keys_for(cache.dtype) ||
         envelope.max_visible_keys > capacity) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope");
     }
@@ -246,7 +338,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
     if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > maximum_visible_keys_for(cache.dtype) ||
         envelope.max_visible_keys > capacity ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(width)) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope or table");
@@ -258,6 +350,27 @@ struct SmallTWorkspace {
     Tensor m;
     Tensor l;
 };
+
+// U8 prompt scratch: banded when the envelope exceeds one band. Returns the scratch span and
+// fills the carry tensors (empty for the single-band and non-U8 cases).
+std::uint32_t allocate_hq_prompt_scratch(WorkspaceArena& workspace, std::int32_t kv_heads,
+                                         std::int32_t q_heads, std::int32_t width,
+                                         GqaExecutionEnvelope envelope, bool u8, Tensor& scratch_k,
+                                         Tensor& scratch_v, Tensor& carry_acc, Tensor& carry_m,
+                                         Tensor& carry_l) {
+    if (!u8) { return envelope.max_visible_keys; }
+    const std::uint32_t span =
+        std::min(envelope.max_visible_keys, kGqaHqPromptScratchBandKeys);
+    const auto rows = static_cast<std::int32_t>(span);
+    scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, rows, 1});
+    scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, rows, 1});
+    if (span < envelope.max_visible_keys) {
+        carry_acc = workspace.alloc(DType::BF16, {kHeadDim, q_heads, width, 1});
+        carry_m   = workspace.alloc(DType::FP32, {q_heads, width, 1, 1});
+        carry_l   = workspace.alloc(DType::FP32, {q_heads, width, 1, 1});
+    }
+    return span;
+}
 
 template <class Allocator>
 SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
@@ -271,50 +384,54 @@ SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_
 }
 
 template <typename Launch>
-void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceArena& workspace,
-                            DType cache_dtype, GqaExecutionEnvelope envelope, Tensor& out,
-                            Launch&& launch) {
-    for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
-        const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
+void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, const Tensor& gate,
+                            WorkspaceArena& workspace, DType cache_dtype,
+                            GqaExecutionEnvelope envelope, Tensor& out, Launch&& launch) {
+    const std::int32_t chunk  = detail::gqa_small_t_chunk_tokens(cache_dtype);
+    for (std::int32_t begin = 0; begin < q.ne[2]; begin += chunk) {
+        const std::int32_t count = std::min(chunk, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache_dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], count, splits);
         Tensor q_chunk          = q.slice(2, begin, count);
         Tensor position_chunk   = positions.slice(0, begin, count);
+        Tensor gate_chunk       = gate.slice(2, begin, count);
         Tensor out_chunk        = out.slice(2, begin, count);
-        launch(begin, count, q_chunk, position_chunk, partial, out_chunk);
+        launch(begin, count, q_chunk, position_chunk, gate_chunk, partial, out_chunk);
     }
 }
 
 void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
-                            const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                            GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
-                            cudaStream_t stream) {
-    for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
-        const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
+                            const Tensor& table_rows, const Tensor& gate, float scale,
+                            PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                            WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    const std::int32_t chunk  = detail::gqa_small_t_chunk_tokens(cache.dtype);
+    for (std::int32_t begin = 0; begin < q.ne[2]; begin += chunk) {
+        const std::int32_t count = std::min(chunk, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache.dtype, envelope);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
-        detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows, scale,
-                                             cache, envelope, begin, count, partial.acc, partial.m,
-                                             partial.l, out, stream);
+        detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows, gate,
+                                             scale, cache, envelope, begin, count, partial.acc,
+                                             partial.m, partial.l, out, stream);
     }
 }
 
-void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, float scale,
-                                   const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
-                                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions,
+                                   const Tensor& gate, float scale, const PagedKVLayerView& cache,
+                                   GqaExecutionEnvelope envelope, WorkspaceArena& workspace,
+                                   Tensor& out, cudaStream_t stream) {
     for_each_small_t_chunk(
-        q, positions, workspace, cache.dtype, envelope, out,
+        q, positions, gate, workspace, cache.dtype, envelope, out,
         [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
-            SmallTWorkspace& partial, Tensor& out_chunk) {
-            detail::gqa_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
-                                                        envelope, partial.acc, partial.m, partial.l,
-                                                        out_chunk, stream);
+            const Tensor& gate_chunk, SmallTWorkspace& partial, Tensor& out_chunk) {
+            detail::gqa_attention_cached_small_t_launch(q_chunk, position_chunk, gate_chunk, scale,
+                                                        cache, envelope, partial.acc, partial.m,
+                                                        partial.l, out_chunk, stream);
         });
 }
 
@@ -323,12 +440,13 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
 namespace detail {
 
 GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
-                                              std::int32_t batch_size,
+                                              std::int32_t batch_size, DType cache_dtype,
                                               GqaExecutionEnvelope envelope) {
-    if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
+    const std::int32_t chunk = gqa_small_t_chunk_tokens(cache_dtype);
+    if (width >= 1 && width <= chunk) { return GqaAttentionRoute::SmallT; }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
     const std::uint32_t prompt_visible_keys =
-        width <= 2 * kSmallTChunkTokens ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
+        width <= 2 * chunk ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
     if (q_heads == 16 && width <= kMaximumVerifyTokens &&
         envelope.max_visible_keys > prompt_visible_keys) {
         return GqaAttentionRoute::ChunkedSmallT;
@@ -355,11 +473,12 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
+    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) ||
+        batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kGqaAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > maximum_visible_keys_for(cache_dtype) ||
         envelope.max_visible_keys < static_cast<std::uint32_t>(max_width)) {
         throw std::invalid_argument("gqa_attention workspace: invalid profile or interval");
     }
@@ -373,13 +492,28 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     };
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::GqaAttentionRoute route =
-            detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope);
-        if (route == detail::GqaAttentionRoute::Prompt) { return std::size_t{0}; }
+            detail::gqa_attention_resolve_route(q_heads, width, batch_size, cache_dtype, envelope);
+        if (route == detail::GqaAttentionRoute::Prompt) {
+            // INT8/BF16 prompt routes key-split into partials (ROADMAP WI-K1a); U8 splits
+            // only its single-band launch; widths the policy keeps at S=1 need no workspace.
+            const bool dtype_splits = cache_dtype == DType::I8 || cache_dtype == DType::BF16 ||
+                                      (cache_dtype == DType::U8 && envelope.max_visible_keys <=
+                                                                       kGqaHqPromptScratchBandKeys);
+            if (!dtype_splits) { return std::size_t{0}; }
+            const std::int32_t splits = detail::gqa_prefill_split_count(width, q_heads);
+            if (splits == 1) { return std::size_t{0}; }
+            WorkspaceLayoutBuilder layout;
+            (void)layout.alloc(DType::FP32, {kHeadDim, q_heads, width, splits});
+            (void)layout.alloc(DType::FP32, {q_heads, width, splits});
+            (void)layout.alloc(DType::FP32, {q_heads, width, splits});
+            return layout.peak_bytes(1);
+        }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
-        for (std::int32_t begin = 0; begin < width; begin += kSmallTChunkTokens) {
-            maximum =
-                std::max(maximum, chunk_capacity(std::min(kSmallTChunkTokens, width - begin)));
+        for (std::int32_t begin = 0; begin < width; begin += detail::gqa_small_t_chunk_tokens(cache_dtype)) {
+            maximum = std::max(
+                maximum, chunk_capacity(
+                             std::min(detail::gqa_small_t_chunk_tokens(cache_dtype), width - begin)));
         }
         return maximum;
     };
@@ -391,16 +525,78 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
+    // The U8 prompt route materializes the visible history into rotated-frame
+    // bf16 scratch (one plane per role, [head_dim, kv_heads, envelope keys])
+    // before the shared FA2 prompt kernel runs over it.
+    if (cache_dtype == DType::U8 && batch_size == 1 &&
+        max_width > detail::gqa_small_t_chunk_tokens(DType::U8)) {
+        bool routes_prompt = max_width > kMaximumVerifyTokens;
+        for (std::int32_t width = min_width;
+             !routes_prompt && width <= std::min(max_width, kMaximumVerifyTokens); ++width) {
+            routes_prompt = detail::gqa_attention_resolve_route(q_heads, width, 1, cache_dtype,
+                                                                envelope) ==
+                            detail::GqaAttentionRoute::Prompt;
+        }
+        if (routes_prompt) {
+            const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
+            const std::size_t span      = std::min(envelope.max_visible_keys,
+                                                  kGqaHqPromptScratchBandKeys);
+            const std::size_t span_planes = 2 * span * static_cast<std::size_t>(kv_heads) *
+                                            kHeadDim * sizeof(std::uint16_t);
+            std::size_t scratch           = span_planes;
+            // The key-split partials are live alongside the span-sized scratch inside one
+            // prompt call whenever the call's own envelope fits one band - and a banded
+            // engine envelope is queried once while its runtime chunk envelopes sweep up to
+            // the band top, so both riders must be covered independently of which route the
+            // outer envelope resolves to. Carry and partials are never live together (banded
+            // launches do not split; split launches do not carry), so the max rider suffices.
+            std::size_t partial_max  = 0;
+            const std::int32_t first = std::max(min_width, kMaximumVerifyTokens + 1);
+            for (std::int32_t width = first; width <= max_width; width += 64) {
+                const std::int32_t splits = detail::gqa_prefill_split_count(width, q_heads);
+                if (splits <= 1) { continue; }
+                WorkspaceLayoutBuilder layout;
+                (void)layout.alloc(DType::FP32, {kHeadDim, q_heads, width, splits});
+                (void)layout.alloc(DType::FP32, {q_heads, width, splits});
+                (void)layout.alloc(DType::FP32, {q_heads, width, splits});
+                partial_max = std::max(partial_max, layout.peak_bytes(1));
+            }
+            if (span < envelope.max_visible_keys) {
+                // Banded carry state (acc [head_dim, q_heads, width] bf16 + m/l fp32).
+                const std::size_t carry = (2ULL * kHeadDim + 8) *
+                                          static_cast<std::size_t>(q_heads) *
+                                          static_cast<std::size_t>(max_width);
+                scratch += std::max(carry, partial_max);
+            } else {
+                scratch += partial_max;
+            }
+            maximum = std::max(maximum, scratch);
+        }
+    }
+    // The splitting prompt routes key-split into per-(head, token, split) partials (ROADMAP
+    // WI-K1a); the buffers scale with width and S(width), which only changes at 64-token
+    // q-block boundaries.
+    const bool splits_prompt_dtype = cache_dtype == DType::I8 || cache_dtype == DType::BF16 ||
+                                     (cache_dtype == DType::U8 &&
+                                      envelope.max_visible_keys <= kGqaHqPromptScratchBandKeys);
+    if (splits_prompt_dtype && batch_size == 1 && max_width > kMaximumVerifyTokens) {
+        const std::int32_t first = std::max(min_width, kMaximumVerifyTokens + 1);
+        for (std::int32_t width = first; width <= max_width; width += 64) {
+            maximum = std::max(maximum, exact_capacity(width));
+        }
+        maximum = std::max(maximum, exact_capacity(max_width));
+    }
     return maximum;
 }
 
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-                   const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
-                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                   const Tensor& valid_columns, const Tensor& kv_table_rows, const Tensor& gate,
+                   float scale, PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
+    require_gate(gate, out.numel(), op);
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
         throw std::invalid_argument("gqa_attention: k/v must be BF16");
     }
@@ -414,10 +610,10 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
 
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
-        detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
+        detail::gqa_attention_resolve_route(q.ne[1], width, batch, cache.dtype, envelope);
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
-        launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                               envelope, workspace, out, stream);
+        launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, gate, scale,
+                               cache, envelope, workspace, out, stream);
         return;
     }
     if (route == detail::GqaAttentionRoute::SmallT) {
@@ -426,12 +622,40 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
-                                             scale, cache, envelope, 0, width, partial.acc,
+                                             gate, scale, cache, envelope, 0, width, partial.acc,
                                              partial.m, partial.l, out, stream);
         return;
     }
+    Tensor scratch_k;
+    Tensor scratch_v;
+    Tensor carry_acc;
+    Tensor carry_m;
+    Tensor carry_l;
+    (void)allocate_hq_prompt_scratch(workspace, kv_heads, q.ne[1], q.ne[2], envelope,
+                                     cache.dtype == DType::U8, scratch_k, scratch_v, carry_acc,
+                                     carry_m, carry_l);
+    Tensor split_acc;
+    Tensor split_m;
+    Tensor split_l;
+    std::int32_t split_count = 1;
+    // U8 splits only the single-band prompt launch: banded runs chain carry state across
+    // bands and stay whole (the hq route enforces the same condition).
+    const bool prompt_splits =
+        cache.dtype == DType::I8 || cache.dtype == DType::BF16 ||
+        (cache.dtype == DType::U8 && envelope.max_visible_keys <= kGqaHqPromptScratchBandKeys);
+    if (prompt_splits) {
+        split_count = detail::gqa_prefill_split_count(width, q.ne[1]);
+        if (split_count > 1) {
+            split_acc = workspace.alloc(DType::FP32, {kHeadDim, q.ne[1], width, split_count});
+            split_m   = workspace.alloc(DType::FP32, {q.ne[1], width, split_count});
+            split_l   = workspace.alloc(DType::FP32, {q.ne[1], width, split_count});
+        }
+    }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, out, stream);
+                                        cache, scratch_k, scratch_v, carry_acc, carry_m, carry_l,
+                                        envelope.max_visible_keys, split_acc, split_m, split_l,
+                                        split_count, out, stream);
+    sigmoid_mul(gate, out, stream);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -460,27 +684,57 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
     detail::gqa_kv_append_launch(k, v, positions, cache, stream);
 }
 
-void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
-                          const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
-                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor& gate,
+                          float scale, const PagedKVLayerView& cache,
+                          GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
+                          cudaStream_t stream) {
     constexpr const char* op = "gqa_attention_cached";
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
+    require_gate(gate, out.numel(), op);
 
     auto scope = workspace.scope();
-    if (detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope) ==
+    if (detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, cache.dtype, envelope) ==
         detail::GqaAttentionRoute::ChunkedSmallT) {
-        launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
+        launch_cached_chunked_small_t(q, positions, gate, scale, cache, envelope, workspace, out,
+                                      stream);
         return;
     }
-    if (detail::gqa_attention_uses_small_t(q.ne[2])) {
+    if (detail::gqa_attention_uses_small_t(q.ne[2], cache.dtype)) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);
-        detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
+        detail::gqa_attention_cached_small_t_launch(q, positions, gate, scale, cache, envelope,
                                                     partial.acc, partial.m, partial.l, out, stream);
         return;
     }
-    detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+    Tensor scratch_k;
+    Tensor scratch_v;
+    Tensor carry_acc;
+    Tensor carry_m;
+    Tensor carry_l;
+    (void)allocate_hq_prompt_scratch(workspace, cache.num_kv_heads, q.ne[1], q.ne[2], envelope,
+                                     cache.dtype == DType::U8, scratch_k, scratch_v, carry_acc,
+                                     carry_m, carry_l);
+    Tensor split_acc;
+    Tensor split_m;
+    Tensor split_l;
+    std::int32_t split_count = 1;
+    const bool prompt_splits =
+        cache.dtype == DType::I8 || cache.dtype == DType::BF16 ||
+        (cache.dtype == DType::U8 && envelope.max_visible_keys <= kGqaHqPromptScratchBandKeys);
+    if (prompt_splits) {
+        split_count = detail::gqa_prefill_split_count(q.ne[2], q.ne[1]);
+        if (split_count > 1) {
+            split_acc = workspace.alloc(DType::FP32, {kHeadDim, q.ne[1], q.ne[2], split_count});
+            split_m   = workspace.alloc(DType::FP32, {q.ne[1], q.ne[2], split_count});
+            split_l   = workspace.alloc(DType::FP32, {q.ne[1], q.ne[2], split_count});
+        }
+    }
+    detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, scratch_k, scratch_v,
+                                                  carry_acc, carry_m, carry_l,
+                                                  envelope.max_visible_keys, split_acc, split_m,
+                                                  split_l, split_count, out, stream);
+    sigmoid_mul(gate, out, stream);
 }
 
 } // namespace ninfer::ops

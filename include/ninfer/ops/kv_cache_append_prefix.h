@@ -44,7 +44,8 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
  * Op: append device-selected exact K/V prefixes to lane-owned cyclic cache storage.
  *
  * k/v, positions, and counts have the same batch geometry as the paged overload; lanes[b] selects
- * the destination cache lane. Absolute position p maps to physical slot p mod 4096. The caller
+ * the destination cache lane. Absolute position p maps to physical slot p mod W, where W is the
+ * cache capacity (a power of two in [1024, 4096]). The caller
  * guarantees that each row's live interval ends immediately before positions[0,b] and that
  * advancing it by counts[b] makes every overwritten old slot dead. One row may commit at most the
  * ring capacity, so no two live writes race for one physical slot.

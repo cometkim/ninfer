@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 
 #include <cuda_bf16.h>
@@ -238,6 +239,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_smal
     const int cta_in_tile      = row_block - m_tile * kCtasPerM128;
     const int rmod_base        = cta_in_tile * (Schedule::kRowsPerCta / 4);
     stage_nvfp4_scales<Geometry, Schedule>(scales, shared.gemv, m_tile, rmod_base);
+    pdl::wait_for_dependencies();
 
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     const int warp        = static_cast<int>(threadIdx.x) >> 5;
@@ -369,6 +371,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_smal
             }
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

@@ -1,0 +1,2 @@
+tests/fixtures/frontend/*.jinja -text
+tests/fixtures/longcontext/** -text

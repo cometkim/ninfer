@@ -10,7 +10,29 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 262144;
+// Absolute execution-envelope ceiling, reachable only with the U8 (hq-e8-2b) cache: the hq
+// decode kernel computes row addresses from the global block table and the prompt route
+// materializes linear scratch, so neither stages fixed-size page tables.
+inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 1048576;
+// BF16/I8 decode kernels stage at most 128 physical page ids per split in shared memory
+// (64-token pages; the 524288-key linear envelope spans at most 98 pages in one 27B split).
+// U8 (hq) alone reaches the absolute envelope; linear caches at this ceiling are memory-bound
+// in practice (int8 fits ~430k keys beside the 16 GiB nvfp4full weights on a 32 GB board).
+inline constexpr std::uint32_t kGqaAttentionMaximumLinearVisibleKeys = 524288;
+// U8 prompt-route scratch band: the one-shot rotated planes are materialized in sequential
+// bands of at most this many keys (the FA2 kernel carries its online-softmax state between
+// bands), bounding the prompt scratch at 1 GiB regardless of the execution envelope.
+inline constexpr std::uint32_t kGqaHqPromptScratchBandKeys = 262144;
+// hq-e8-2b residual window: every sequence additionally keeps the first kGqaHqSinkKeys and the
+// last kGqaHqRecentKeys K/V rows EXACT (BF16, codec-rotated frame) in per-slot side planes, and
+// every hq consumer reads those rows from the side planes instead of the codec planes — the
+// per-vector quantization bias compounds over long windows (clean through the native envelope,
+// degrading past it), and exact sink+recent rows are the calibration-free protection. Source
+// selection is PER ROW (the ring boundary sits at an arbitrary window offset), so no tile
+// alignment is required; kGqaHqSinkKeys just equals one whole 32-key decode tile, and the
+// recent window is a power-of-two ring (slot = key & (kGqaHqRecentKeys - 1)).
+inline constexpr std::uint32_t kGqaHqSinkKeys   = 32;
+inline constexpr std::uint32_t kGqaHqRecentKeys = 512;
 
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
@@ -50,7 +72,9 @@ struct GqaExecutionEnvelope {
  * Returns the transient arena capacity required for every W in the inclusive interval at one
  * exact logical batch size. Head geometry, cache dtype, and execution envelope are the fixed
  * implementation profile. Invalid profiles or intervals throw; a legal B=1 prompt route may
- * return zero.
+ * return zero for BF16/INT8 caches. The U8 (hq-e8-2b) prompt route additionally materializes
+ * the envelope's visible history into two rotated-frame BF16 scratch planes, so its capacity
+ * covers those planes sized by the envelope's key bound.
  */
 [[nodiscard]] std::size_t
 gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
@@ -83,13 +107,17 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
  * position plus one over nonempty rows lies in the declared execution envelope. The envelope is a
  * host launch-resource promise over that batch maximum; it does not alter any row's causal mask.
  *
- * q/k/v/positions/valid_columns/kv_table_rows/out, every cache plane/table, and live workspace
- * suballocations are pairwise non-overlapping. The Op overwrites every addressed cache row but
- * owns no persistent frontier, allocation, request identity, or commit authority.
+ * The output is sigmoid-gated: out is the attention result multiplied elementwise by
+ * sigmoid(gate), with gate contiguous BF16 carrying out's flat element layout. Invalid columns
+ * gate to exact zero. The gate read is read-only.
+ *
+ * q/k/v/positions/valid_columns/kv_table_rows/gate/out, every cache plane/table, and live
+ * workspace suballocations are pairwise non-overlapping. The Op overwrites every addressed cache
+ * row but owns no persistent frontier, allocation, request identity, or commit authority.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-                   const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
-                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                   const Tensor& valid_columns, const Tensor& kv_table_rows, const Tensor& gate,
+                   float scale, PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 /**
@@ -103,11 +131,13 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 /**
  * A3: compute causal attention from an already populated cache without accepting new K/V or
  * mutating any cache plane. q/out are contiguous BF16 `[256,24|16,T]`, positions is contiguous
- * sequential I32 [T], and the mathematical formula and execution-envelope contract are identical
- * to A1. Caller workspace is reported by gqa_attention_workspace_capacity_bytes().
+ * sequential I32 [T], and the mathematical formula, sigmoid-gated output, and execution-envelope
+ * contract are identical to A1. Caller workspace is reported by
+ * gqa_attention_workspace_capacity_bytes().
  */
-void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
-                          const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
-                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor& gate,
+                          float scale, const PagedKVLayerView& cache,
+                          GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
+                          cudaStream_t stream);
 
 } // namespace ninfer::ops

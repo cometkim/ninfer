@@ -51,7 +51,8 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    throw std::invalid_argument("--kv-dtype must be bf16 or int8");
+    if (text == "hq-e8-2b") { return KvCacheStorage::HqE8Rice2B; }
+    throw std::invalid_argument("--kv-dtype must be bf16, int8 or hq-e8-2b");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -271,7 +272,7 @@ std::string usage_text(std::string_view program) {
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
         << "  --kv-dtype <bf16|int8>      KV cache storage (default: bf16)\n"
-        << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
+        << "  --mtp-draft-tokens <0..7>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"

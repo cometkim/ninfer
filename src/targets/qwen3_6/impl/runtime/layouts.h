@@ -7,6 +7,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "ninfer/ops/rope.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
@@ -34,10 +35,25 @@ struct DFlashPersistentLayout {
     }
 };
 
+// The DFlash2 drafter's whole persistent state: five all-SWA cyclic layers (no full layer, no
+// paged backend) plus the target-feature capture buffers.
+struct DFlash2PersistentLayout {
+    CyclicKVCacheLayout local;
+    CyclicKVCacheLayout rewrite_checkpoint_local;
+    TensorLayout prefill_features;
+    TensorLayout prefill_positions;
+    TensorLayout pending_features;
+
+    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
+        return local.payload_bytes() + rewrite_checkpoint_local.payload_bytes();
+    }
+};
+
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
+    std::optional<DFlash2PersistentLayout> dflash2;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
     TensorLayout token_counts;
@@ -69,6 +85,13 @@ struct SequencePlanningInputs {
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
+    // 0 (or 1): linear rope at the checkpoint's native positions. Any value > 1 selects YaRN
+    // with that factor; the sequence plan resolves it into `text_rope`. The temperature
+    // coefficient and ramp bounds parameterize the YaRN table (HF defaults).
+    float rope_scaling_factor              = 0.0F;
+    float rope_scaling_temperature         = 0.1F;
+    float rope_scaling_beta_fast           = 32.0F;
+    float rope_scaling_beta_slow           = 1.0F;
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;
@@ -91,6 +114,11 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
+    float rope_scaling_factor              = 0.0F;
+    float rope_scaling_temperature         = 0.1F;
+    float rope_scaling_beta_fast           = 32.0F;
+    float rope_scaling_beta_slow           = 1.0F;
+    ops::RopeFrequencies text_rope;
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;

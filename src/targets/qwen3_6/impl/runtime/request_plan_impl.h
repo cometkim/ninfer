@@ -193,7 +193,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =
-            speculative_backend != SpeculativeBackend::DFlash ||
+            (speculative_backend != SpeculativeBackend::DFlash &&
+             speculative_backend != SpeculativeBackend::DFlash2) ||
             sequence.dflash_context_frontier == sequence.execution_frontier;
         if (sequence.execution_frontier != 0 && dflash_append_ready &&
             qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
@@ -224,10 +225,15 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
-    if (is_rewrite_checkpoint_restore(plan->reuse) &&
-        speculative_backend == SpeculativeBackend::DFlash &&
+    if (is_rewrite_checkpoint_restore(plan->reuse) && speculative_backend == SpeculativeBackend::DFlash &&
         (!dflash || !sequence.kv || !sequence.kv->backend ||
          sequence.dflash_context_frontier < plan->reuse_base)) {
+        plan->reuse      = ReusePath::FullReset;
+        plan->reuse_base = 0;
+    }
+    if (is_rewrite_checkpoint_restore(plan->reuse) &&
+        speculative_backend == SpeculativeBackend::DFlash2 &&
+        (!dflash2 || sequence.dflash_context_frontier < plan->reuse_base)) {
         plan->reuse      = ReusePath::FullReset;
         plan->reuse_base = 0;
     }

@@ -1,6 +1,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -31,6 +32,7 @@ __global__ __launch_bounds__(
                                                                     uint8_t* __restrict__ scales,
                                                                 float inverse_weight_divisor,
                                                                 __nv_bfloat16* __restrict__ out) {
+    pdl::sync();
     __shared__ Nvfp4GemvSharedStorage<Geometry, Schedule> shared;
     constexpr int kCtasPerM128                    = 128 / Schedule::kWarpsPerCta;
     const int block                               = static_cast<int>(blockIdx.x);
@@ -59,6 +61,7 @@ __global__ __launch_bounds__(
     gate = warp_reduce_sum(gate);
     up   = warp_reduce_sum(up);
     if (lane == 0) { out[gate_row] = __float2bfloat16_rn(silu(gate) * up); }
+    pdl::publish();
 }
 
 } // namespace
@@ -67,10 +70,12 @@ void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Te
                                        cudaStream_t stream) {
     constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_linear_swiglu_decode_kernel<<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_linear_swiglu_decode_kernel,
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse,
-        static_cast<__nv_bfloat16*>(out.data));
+        static_cast<__nv_bfloat16*>(out.data)));
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -35,6 +35,7 @@ layout, or Vision tower is a different model implementation rather than a runtim
 | RMSNorm epsilon | `1e-6` |
 | RoPE theta | `1e7` |
 | checkpoint position capacity | 262144 |
+| engine context envelope | 1048576 (`hq-e8-2b` KV with YaRN past 262144; 524288 for bf16/int8) |
 | MTP layers | 1 |
 
 Layer `i` is full attention exactly when `(i + 1) % 4 == 0`; all other layers are GDN. The model
