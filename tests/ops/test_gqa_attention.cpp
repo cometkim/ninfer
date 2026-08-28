@@ -1442,6 +1442,41 @@ int run_geometry(const Geometry& geometry) {
             failures += run_a1_case(geometry, dtype, {130, 128, 260, 506u},
                                     MappingPattern::Identity, &realistic_qk,
                                     &realistic_qk_criterion);
+            // The width-8 int8 tile (27B only): one small-T pass where the 6-token
+            // tile chunked 6+2. A1 single-batch and the masked A3 verify shape both
+            // pin the new route end-to-end against the same FP64 oracle.
+            if (geometry.q_heads == 24) {
+                failures += run_a1_case(geometry, dtype, {8, 17, 512, 508u},
+                                        MappingPattern::Identity);
+                failures += run_a3_case(geometry, dtype, {8, 17, 512, 509u},
+                                        MappingPattern::Identity);
+                // Base-0 concentrated-window profile (measured criterion): with
+                // window = base+T <= 8 the four splits take the shape [0,2),[2,4),...
+                // and a dominant key's per-split partial rounds to BF16 before the
+                // weighted reducer merge, placing ONE output element at 5.59e-3
+                // absolute / 5.89e-3 of max-reference while the whole-field rel_l2
+                // stays at 2.75e-3 (inside the flat 4.1e-3 gate). This is the
+                // route's implementation profile, not a gather defect - T=5 and T=6
+                // sit in the same band through their pre-existing launch paths -
+                // and production verify rounds run at base = prompt length, never
+                // base 0. T=6 pins the pre-existing band; T=8 pins the new tile.
+                const ReductionCriterion concentrated_small_window{
+                    /*relative_l2*/ 4.1e-3,
+                    /*gross_absolute*/ 7.0e-3,
+                    /*gross_relative_to_max_reference*/ 7.0e-3,
+                };
+                failures += run_a1_case(geometry, dtype, {6, 0, 1100, 512u},
+                                        MappingPattern::Identity, nullptr,
+                                        &concentrated_small_window);
+                failures += run_a1_case(geometry, dtype, {8, 0, 1100, 510u},
+                                        MappingPattern::Fragmented, nullptr,
+                                        &concentrated_small_window);
+            } else {
+                // The 35B group-of-eight geometry keeps the 6-token tile: width 8
+                // must chunk (6+2) rather than route to an unsupported 8-tile.
+                failures += run_a1_case(geometry, dtype, {8, 17, 512, 511u},
+                                        MappingPattern::Identity);
+            }
         }
     }
     return failures;

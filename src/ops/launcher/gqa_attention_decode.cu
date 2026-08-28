@@ -101,17 +101,22 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
 
 } // namespace
 
-std::int32_t gqa_small_t_chunk_tokens(DType cache_dtype) {
-    return cache_dtype == DType::U8 ? 8 : 6;
+std::int32_t gqa_small_t_chunk_tokens(DType cache_dtype, std::int32_t q_heads) {
+    // U8 and I8-on-27B carry the 8-token tile (the width-8 verify frames: DFlash2's
+    // draft-7+bonus and MTP7); BF16 and I8 on the 35B group-of-eight geometry keep the
+    // tuned 6-token tile (an 8-tile there would need a fourth 16-row tile).
+    if (cache_dtype == DType::U8) { return 8; }
+    if (cache_dtype == DType::I8 && q_heads == Gqa27Geometry::QHeads) { return 8; }
+    return 6;
 }
 
-bool gqa_attention_uses_small_t(std::int32_t tokens, DType cache_dtype) {
-    return tokens >= 1 && tokens <= gqa_small_t_chunk_tokens(cache_dtype);
+bool gqa_attention_uses_small_t(std::int32_t tokens, std::int32_t q_heads, DType cache_dtype) {
+    return tokens >= 1 && tokens <= gqa_small_t_chunk_tokens(cache_dtype, q_heads);
 }
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > gqa_small_t_chunk_tokens(cache_dtype) ||
+    if (tokens < 1 || tokens > gqa_small_t_chunk_tokens(cache_dtype, q_heads) ||
         (cache_dtype != DType::BF16 && cache_dtype != DType::I8 && cache_dtype != DType::U8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
@@ -137,7 +142,8 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const auto splits =
         gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
 
-    if (invocation.width < 1 || invocation.width > gqa_small_t_chunk_tokens(cache.dtype)) {
+    if (invocation.width < 1 ||
+        invocation.width > gqa_small_t_chunk_tokens(cache.dtype, q.ne[1])) {
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
     }
 

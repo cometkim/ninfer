@@ -387,7 +387,7 @@ template <typename Launch>
 void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, const Tensor& gate,
                             WorkspaceArena& workspace, DType cache_dtype,
                             GqaExecutionEnvelope envelope, Tensor& out, Launch&& launch) {
-    const std::int32_t chunk  = detail::gqa_small_t_chunk_tokens(cache_dtype);
+    const std::int32_t chunk  = detail::gqa_small_t_chunk_tokens(cache_dtype, q.ne[1]);
     for (std::int32_t begin = 0; begin < q.ne[2]; begin += chunk) {
         const std::int32_t count = std::min(chunk, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
@@ -407,7 +407,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& table_rows, const Tensor& gate, float scale,
                             PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                             WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
-    const std::int32_t chunk  = detail::gqa_small_t_chunk_tokens(cache.dtype);
+    const std::int32_t chunk  = detail::gqa_small_t_chunk_tokens(cache.dtype, q.ne[1]);
     for (std::int32_t begin = 0; begin < q.ne[2]; begin += chunk) {
         const std::int32_t count = std::min(chunk, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
@@ -442,7 +442,7 @@ namespace detail {
 GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                               std::int32_t batch_size, DType cache_dtype,
                                               GqaExecutionEnvelope envelope) {
-    const std::int32_t chunk = gqa_small_t_chunk_tokens(cache_dtype);
+    const std::int32_t chunk = gqa_small_t_chunk_tokens(cache_dtype, q_heads);
     if (width >= 1 && width <= chunk) { return GqaAttentionRoute::SmallT; }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
     const std::uint32_t prompt_visible_keys =
@@ -510,10 +510,12 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
         }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
-        for (std::int32_t begin = 0; begin < width; begin += detail::gqa_small_t_chunk_tokens(cache_dtype)) {
+        for (std::int32_t begin = 0; begin < width;
+             begin += detail::gqa_small_t_chunk_tokens(cache_dtype, q_heads)) {
             maximum = std::max(
                 maximum, chunk_capacity(
-                             std::min(detail::gqa_small_t_chunk_tokens(cache_dtype), width - begin)));
+                             std::min(detail::gqa_small_t_chunk_tokens(cache_dtype, q_heads),
+                                      width - begin)));
         }
         return maximum;
     };
@@ -529,7 +531,7 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     // bf16 scratch (one plane per role, [head_dim, kv_heads, envelope keys])
     // before the shared FA2 prompt kernel runs over it.
     if (cache_dtype == DType::U8 && batch_size == 1 &&
-        max_width > detail::gqa_small_t_chunk_tokens(DType::U8)) {
+        max_width > detail::gqa_small_t_chunk_tokens(DType::U8, q_heads)) {
         bool routes_prompt = max_width > kMaximumVerifyTokens;
         for (std::int32_t width = min_width;
              !routes_prompt && width <= std::min(max_width, kMaximumVerifyTokens); ++width) {
@@ -699,7 +701,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, const Tensor
                                       stream);
         return;
     }
-    if (detail::gqa_attention_uses_small_t(q.ne[2], cache.dtype)) {
+    if (detail::gqa_attention_uses_small_t(q.ne[2], q.ne[1], cache.dtype)) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);

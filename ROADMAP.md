@@ -25,7 +25,8 @@ subtractive dither (the fix for the >262k garble). Verified: needle retrieval ex
 the 3-bps-quality risk is refuted by measurement; hq/int8 decode ratio 0.83–0.85 at 32k, parity
 at short context; LBv2 full-suite 58.6% (above the 53.7% human baseline). The homogeneous-kernel
 decode gate is CLOSED (dependent 8-lane chains at 8 warps/SM ≈ 2.1 G rows/s; warp specialization
-measured and refuted) — the only remaining decode lever is Tier-2 selection (below).
+measured and refuted). Remaining decode levers: the width-8 TC tile-source kernel's serialized
+inline decode (open-work item 3a) and Tier-2 selection (item 3b).
 
 **1M context** — DROPPED per owner decision (2026-08-26); 524k held, 768k engineering-ready
 (owner call open, gated on the KL instrument below). Landed on the way: envelope to 1,048,576
@@ -58,11 +59,28 @@ rebased once onto natpate's current head (b686696e) purely to keep natpate PR #2
    An afternoon of work on any offline stack; decides 768k and gates the learned-scaling tiers
    (per-request factor selection → searched LongRoPE table → local LoRA distillation-under-yarn;
    full detail was WI-3c, former `ROADMAP-1m-context.md`).
-3. **hq Tier-2 decode: exact V skipping / page selection.** BLASST-style softmax-threshold V
-   skipping (1.48× decode at 73% sparsity, GQA-native) is the zero-risk first step on the current
-   kernel; Locks/ParisKV-style page selection is the larger upside (2–2.8×) with a quality gate.
-   HiSparse's merged SGLang fused select/LRU/fetch kernel is the in-graph template; its
-   host-fetch half is dead on this TB4 box. Per-step slope to drive down: ~0.096 ms/1k keys.
+3. **hq decode for general use** (owner direction 2026-08-28: hq is the general-use KV lane,
+   not just the >524k capacity lane — improve it for every context). Two independent surfaces:
+   (a) the width-8 verify TC tile-source kernel (`GqaTcKVHq`) serializes its inline tile decode
+   with the MMA per 32-key block (cooperative decode → barrier → mma, no cross-tile pipeline),
+   where the i8 kernel overlaps loads via cp.async prefetch + warp split — measured idle @258k,
+   DFlash2 k=7: hq 84.6 tok/s (45.4 ms/round) vs int8 140.8 (26.2 ms/round), a +19 ms/round
+   decode-order gap against a 3.5× byte advantage; the homogeneous-kernel warp-spec refutation
+   does not close this surface (different kernel structure — the pipelining candidate here is a
+   double-buffered tile decode overlapping the MMA consumer). Attribution without nsys (its
+   report converter deterministically hangs at 48% on DFlash2/hq traces — tooling note, both
+   MTP-era profiles converted fine): hq's byte floor is 2.25 GiB ≈ 1.25 ms/round (16 µs/layer,
+   3% of its 567 µs/layer) so the round is NOT bandwidth-bound; decode ALU alone is
+   524,288 row-decodes/layer/round ÷ 2.1 G rows/s = 250 µs/layer (44%) even at the homogeneous
+   kernel's tuned full-occupancy rate, and the in-kernel rate is lower (128 threads, 2 CTAs/SM)
+   and fully serialized with the MMA — consistent with the +240 µs/layer gap vs int8 (whose own
+   327 µs/layer vs a ~58 µs byte floor shows both routes are compute/latency-dominated; the
+   lever is decode placement, not bytes). (b) Tier-2 exact V skipping /
+   page selection: BLASST-style softmax-threshold V skipping (1.48× decode at 73% sparsity,
+   GQA-native) is the zero-risk first step on the current kernel; Locks/ParisKV-style page
+   selection is the larger upside (2–2.8×) with a quality gate. HiSparse's merged SGLang fused
+   select/LRU/fetch kernel is the in-graph template; its host-fetch half is dead on this TB4
+   box. Per-step slope to drive down: ~0.096 ms/1k keys.
 4. **kernel-perf open items** (`ROADMAP-kernel-perf.md`): remaining −128-launch fusion block,
    WI-K1c softmax overlap, WI-K1(d) int8/FP4 scratch for the hq prompt route (design frozen,
    nvfp4-KV successor undecided), WI-K3 (blocked: Windows/MSVC host ABI; needs a Linux box),

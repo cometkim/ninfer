@@ -54,9 +54,12 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data)));
     };
-    if constexpr (TokenTile == 6) {
+    if constexpr (TokenTile == 6 || TokenTile == 7 || TokenTile == 8) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
         // loop iterations; dynamic smem avoids penalizing the long-context path.
+        // Tiles 7 and 8 (the DFlash2/MTP7 width-8 verify frames) share this
+        // ladder: on the 27B geometry every tile 6..8 rounds to the same Br=48
+        // three-row-tile shape, so the tuned warp/KeyBlock profiles carry over.
         if (implementation_window > 128 && implementation_window <= 160) {
             launch.template operator()<24, 1, 32, false>();
         } else if (implementation_window <= 2054) {
@@ -149,6 +152,22 @@ void gqa_small_t_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos
         break;
     case 6:
         NINFER_GQA_SMALL_T_I8_DISPATCH(6);
+        break;
+    case 7:
+        // Tiles 7/8 stay inside the three-row-tile Br=48 shape only for the 27B
+        // group of six; the 35B group of eight would need a fourth row tile.
+        if constexpr (Geometry::GroupSize == 6) {
+            NINFER_GQA_SMALL_T_I8_DISPATCH(7);
+        } else {
+            throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
+        }
+        break;
+    case 8:
+        if constexpr (Geometry::GroupSize == 6) {
+            NINFER_GQA_SMALL_T_I8_DISPATCH(8);
+        } else {
+            throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
+        }
         break;
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");

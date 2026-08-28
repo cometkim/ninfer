@@ -69,10 +69,17 @@ outside current scope, recorded.
 ## Remaining work (priority order)
 
 Mirrors `ROADMAP.md`: (1) DFlash2 stage-3 decision inputs; (2) the KL instrument for 768k;
-(3) hq Tier-2 decode selection; (4) kernel-perf open items (fusion block, K1c, K1(d)/nvfp4-KV
-decision, K3-on-Linux, K4, vLLM A/B); (5) host-kv / model-opt when scheduled. The DFlash2
-forward-distribution debugging is DONE — the one defect (context_norm `unit_offset`) is fixed;
-do not re-derive the session-27 hypothesis chain from the old diary.
+(3) hq decode for general use (owner direction 2026-08-28 — see ROADMAP item 3: width-8
+tile-decode pipelining 3a + Tier-2 selection 3b); (4) kernel-perf open items (fusion block,
+K1c, K1(d)/nvfp4-KV decision, K3-on-Linux, K4, vLLM A/B); (5) host-kv / model-opt when
+scheduled. The DFlash2 forward-distribution debugging is DONE — the one defect (context_norm
+`unit_offset`) is fixed; do not re-derive the session-27 hypothesis chain from the old diary.
+
+**Clean idle 262k record cells (2026-08-28, post width-8-int8 fix, superseding the
+contaminated evening cells in §5aj):** DFlash2-int8 **140.8 tok/s @ 3.70** (fastest measured
+lane, +84% over MTP3); MTP7-int8 131.9 @ 3.56; DFlash2-hq 84.6 @ 3.83 (45.4 ms/round vs
+int8's 26.2 — the item-3a decode gap). These three are the current spec×dtype baseline at the
+native envelope; 2k–32k cells from the morning session stand.
 
 ## Verification & measurement cautions
 
@@ -141,3 +148,52 @@ official `models/qwen3_8_27b_nvfp4.ninfer` (perf runs). Prompts:
 DFlash2 source + llama.cpp harness artifacts under `~/Workspace/llama-wi7/` (outside the repo);
 the converted artifact is self-contained (sources deletable once no re-conversion is needed).
 GPU power limit is 450 W until reboot (set for the eval campaign).
+
+### 5aj. Session 28 continued (2026-08-28): owner-reported int8 serving regression → width-8 int8 verify LANDED; pre-existing base-0 numeric band found and pinned
+
+**Owner report: DFlash2 "noticeably slower than MTP3" in real use — reproduced and root-caused.**
+Their `int8-262k-dflash2.bat` runs DFlash2 on INT8 KV, the one lane never benched (all cells
+were hq). Measured: 262k int8 DFlash2 57.6 tok/s @ 3.89 vs MTP3 (+lm-head-draft) 76.4 @ 2.79 —
+DFlash3 loses 25% committed despite +39% acceptance. Root cause: `gqa_small_t_chunk_tokens`
+gave I8 a 6-token tile, so the width-8 verify frame chunked 6+2 = TWO whole-window passes at
+262k (~2× per-round cost, 69ms vs MTP3's 37ms). The hq route's TokenTile=8 (§5aa) is why hq
+won everywhere. At 8k int8 DFlash2 still won (182 t/s) — the regression is long-context only.
+
+**Fix landed (uncommitted at owner request): the int8 small-T kernel now carries TokenTile 7/8
+on the 27B geometry.** On GroupSize 6, tiles 6..8 all round to the same Br=48 three-row-tile
+shape, so the tuned 6-tile warp ladder carries over unchanged; 35B (GroupSize 8) keeps the
+throw (an 8-tile needs a fourth row tile) and its dispatch cases are `if constexpr`-gated.
+`gqa_small_t_chunk_tokens` is now (dtype, q_heads)-aware: U8→8, I8+27B→8, else 6 — the 35B
+v1-DFlash int8 lane (verify widths up to 17) still routes wide frames to chunked/prompt paths.
+Result on the regression cell: **262k int8 DFlash2 86.9 tok/s @ 3.70** (vs 57.6 broken; MTP3
+76.4) — and that was measured UNDER ~30% desktop GPU load, so the true margin is larger.
+
+**Conformance: the new T=8 cases exposed a PRE-EXISTING numeric band, understood and pinned.**
+T=5/6 at base 0 fail the flat criterion identically through untouched launch paths (suite
+coverage gap: base 0 existed only at T=1). Mechanism: window = base+T ≤ 8 gives all of T=5..8
+the same split shapes [0,2),[2,4),...; a concentrated-softmax row's dominant per-split partial
+is BF16-rounded before the weighted reducer merge, placing ONE output element at 5.59e-3
+abs / 5.89e-3 of max-ref (rel_l2 2.75e-3, inside the flat 4.1e-3 gate). Not a gather defect
+(zero-input boundary/wrap analogs stay exact); production rounds run at base = prompt length,
+never base 0. The suite gained `concentrated_small_window` (4.1e-3 / 7e-3 / 7e-3, measured)
+cases at T=6 (pre-existing band) and T=8 (new tile), plus T=8 A1+A3 identity cases and the 35B
+width-8 chunked-routing case. Full suite PASS. Debug detour recorded: python-heredoc probe
+edits corrupted the test file twice (the known trap) — one seed-sweep ran a stale binary and
+initially looked seed-invariant; use the Edit tool for test instrumentation.
+
+**Environment note: the evening t/s cells (8k int8 111, hq-262k 52) ran under ~30% constant
+desktop GPU load (Edge/Discord) — uniformly ~37% below morning idle numbers on BOTH routes
+(acceptance unchanged), so they are load artifacts, not regressions. Re-measure the int8-262k
+fixed cell on an idle GPU for the record; the morning hq/MTP comparator table stands.**
+
+**The fix also serves MTP7-on-int8 (any width-7/8 int8 verify: draft-tokens 6/7): MTP7 int8
+@262k measured 112.7 tok/s @ 3.54 under the same desktop load where DFlash2-int8 ran 86.9 and
+hq-DFlash2 52 — MTP7-int8 is the fastest measured 262k lane under load, and DFlash2-on-int8
+beats DFlash2-on-hq at 262k (plain byte reads vs the width-8 hq codec path). Re-rank the full
+spec×dtype×context table on an idle GPU before drawing lane-assignment conclusions.**
+
+Bat starters (also uncommitted): hq-262k/524k/786k switched to `--spec dflash2 --draft-tokens 7`
+(--lm-head-draft dropped — DFlash2 requires the full head); 1m bat documents text+DFlash2@1M
+fitting without vision (MTP3 never fit); int8-262k keeps MTP3 as the accuracy-reference lane,
+and the owner's int8-dflash2 bat is now a VALID fast lane after the tile fix (86.9 > 76.4
+under load). YaRN sanity for the 524k/786k lanes: DFlash2+yarn:2 @390k 5.30 tok/round.

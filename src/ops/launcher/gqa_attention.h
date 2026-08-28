@@ -98,12 +98,14 @@ template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_prefill_append_hq(const Tensor& k, const Tensor& v, const Tensor& positions,
                            CacheView cache, Metadata metadata, cudaStream_t stream);
 
-// Largest verify width one small-T kernel pass covers for a cache dtype: the hq-e8-2b
-// instantiation tiles eight tokens (width-8 block verify); the BF16/I8 kernels keep
-// their tuned six-token tile. Wider widths chunk at this size.
-[[nodiscard]] std::int32_t gqa_small_t_chunk_tokens(DType cache_dtype);
+// Largest verify width one small-T kernel pass covers for a cache dtype and head
+// geometry: the hq-e8-2b instantiation and the 27B I8 route tile eight tokens (the
+// width-8 block verify of DFlash2's draft-7+bonus and MTP7); BF16 and the 35B I8
+// geometry keep their tuned six-token tile. Wider widths chunk at this size.
+[[nodiscard]] std::int32_t gqa_small_t_chunk_tokens(DType cache_dtype, std::int32_t q_heads);
 
-[[nodiscard]] bool gqa_attention_uses_small_t(std::int32_t tokens, DType cache_dtype);
+[[nodiscard]] bool gqa_attention_uses_small_t(std::int32_t tokens, std::int32_t q_heads,
+                                              DType cache_dtype);
 
 GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                               std::int32_t batch_size, DType cache_dtype,
