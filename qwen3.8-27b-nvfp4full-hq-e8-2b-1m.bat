@@ -2,9 +2,10 @@
 setlocal
 rem Quickstart: ninfer-serve, model id qwen3.8-27b-nvfp4full-hq-e8-2b-1m (EXPERIMENTAL:
 rem 1,048,576 via YaRN factor 4, auto KV capacity - the M2 profile). Vision serving preset
-rem WITHOUT MTP: at the full 1M pool, MTP3's graph tier + draft pool do not fit beside
-rem vision after the weights (engine rejects construction ~1.2 GiB short); text+MTP at 1M
-rem remains available by passing "--spec mtp --draft-tokens 3" only without vision.
+rem WITHOUT speculation: at the full 1M pool, MTP3's graph tier + draft pool and DFlash2's
+rem cyclic draft pools both fail to fit beside vision after the weights; text+DFlash2 at 1M
+rem DOES fit and remains available by passing "--spec dflash2 --draft-tokens 7" (and dropping
+rem --vision).
 rem Quality past ~600k true tokens is not yet verified end-to-end; see HANDOFF "1M boundary".
 rem Extra flags pass through after the preset (later duplicates override earlier ones).
 set "ROOT=%~dp0"
