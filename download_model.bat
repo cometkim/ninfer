@@ -96,7 +96,6 @@ if "%CHOICE%"=="1" (
     set "FILE=qwen3_6_35b_a3b.ninfer"
     set "EXP_BYTES=22783246080"
     set "EXP_SHA=1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2"
-)
 ) else (
     set "LABEL=Qwen3.8-27B (nvfp4full)"
     set "REPO=cometkim/Qwen3.8-27B-nvfp4full-NInfer"
