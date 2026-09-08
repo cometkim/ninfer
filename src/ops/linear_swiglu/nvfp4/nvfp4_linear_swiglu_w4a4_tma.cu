@@ -45,6 +45,30 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
     return descriptors;
 }
 
+#ifdef _WIN32
+// MSVC cannot pass an alignas(128) struct by value as a kernel parameter (C2719); keep the
+// descriptor block in a stream-ordered device buffer instead (see nvfp4_w4a4_tma.cu).
+struct Nvfp4LinearSwiGluTmaDescriptorBlock {
+    Nvfp4W4a4TmaDescriptors* device = nullptr;
+    cudaStream_t stream             = nullptr;
+
+    explicit Nvfp4LinearSwiGluTmaDescriptorBlock(cudaStream_t allocation_stream)
+        : stream(allocation_stream) {
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&device),
+                                   sizeof(Nvfp4W4a4TmaDescriptors), stream));
+    }
+
+    Nvfp4LinearSwiGluTmaDescriptorBlock(const Nvfp4LinearSwiGluTmaDescriptorBlock&)            = delete;
+    Nvfp4LinearSwiGluTmaDescriptorBlock&
+    operator=(const Nvfp4LinearSwiGluTmaDescriptorBlock&) = delete;
+
+    ~Nvfp4LinearSwiGluTmaDescriptorBlock() {
+        if (device == nullptr) { return; }
+        CUDA_CHECK(cudaFreeAsync(device, stream));
+    }
+};
+#endif
+
 } // namespace
 
 void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
@@ -71,8 +95,16 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
         activation_codes, activation_scales, weight_codes, weight_scales, tokens);
     constexpr int kPairN = M256N128S3::kBlockN / 2;
     const dim3 grid((Geometry::kOutputRows / 2) / kPairN, tokens / M256N128S3::kBlockM);
+#ifdef _WIN32
+    Nvfp4LinearSwiGluTmaDescriptorBlock block(stream);
+    CUDA_CHECK(cudaMemcpyAsync(block.device, &descriptors, sizeof(descriptors),
+                               cudaMemcpyHostToDevice, stream));
+    nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
+        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(block.device, alpha, output);
+#else
     nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
         <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(descriptors, alpha, output);
+#endif
     CUDA_CHECK(cudaGetLastError());
 }
 
