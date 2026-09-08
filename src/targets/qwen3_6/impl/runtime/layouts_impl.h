@@ -543,9 +543,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         auto mlp = layout.scope();
                         prepare();
                         matrix(layout, DType::BF16, DFlashConfig::intermediate, tokens);
-                        scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
-                                            QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
-                                            DFlashConfig::hidden, tokens, tokens));
+                        // The profile admits both module weight formats; the W8 module needs no
+                        // swiglu scratch while the NVFP4 A16 route materializes its gate/up
+                        // projection beyond the fused small-T family, so the plan covers the max.
+                        scratch(layout,
+                                std::max(ops::linear_swiglu_workspace_capacity_bytes(
+                                             QType::W8G32_F16S, 2 * DFlashConfig::intermediate,
+                                             DFlashConfig::hidden, tokens, tokens),
+                                         ops::linear_swiglu_workspace_capacity_bytes(
+                                             QType::NVFP4, 2 * DFlashConfig::intermediate,
+                                             DFlashConfig::hidden, tokens, tokens)));
                         scratch(layout,
                                 ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
                                     DFlashConfig::intermediate, width, width, batch, batch));

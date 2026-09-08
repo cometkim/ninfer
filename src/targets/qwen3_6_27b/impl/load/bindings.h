@@ -125,8 +125,8 @@ struct DFlash2LayerPlan {
 
 struct DFlash2CandidateSelectorPlan {
     WeightPlan hidden_projection;
-    artifact::ObjectHandle predecessor_codebook;
-    artifact::ObjectHandle successor_codebook;
+    WeightPlan predecessor_codebook;
+    WeightPlan successor_codebook;
 };
 
 struct DFlash2Plan {
