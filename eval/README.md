@@ -2,8 +2,8 @@
 
 `eval/` contains the repository-local capability evaluation coordinator. It can evaluate this
 project's server, another local OpenAI-compatible service, or a remote online model. The inference
-engine is only one possible target; each target and job declares the concurrency admitted by that
-particular server run instead of baking an Engine policy into the framework.
+engine is only one possible target; its single-sequence limitation is represented by
+`max_concurrency: 1`, not built into the framework.
 
 EvalScope is the first real evaluation backend. The coordinator, configuration, logging, progress,
 resume, and result contracts do not import or depend on EvalScope. The deterministic `mock` backend
@@ -29,13 +29,6 @@ See [`configs/capability-suite.yaml`](configs/capability-suite.yaml) for the ini
 AIME26, GPQA-Diamond, and BFCL-v4 suites, and [`configs/mock-suite.yaml`](configs/mock-suite.yaml)
 for a network-free example.
 
-The published Qwen3.6 reasoning runs retain their exact configurations in
-[`configs/qwen3_6_27b_reasoning.yaml`](configs/qwen3_6_27b_reasoning.yaml),
-[`configs/qwen3_6_35b_aime.yaml`](configs/qwen3_6_35b_aime.yaml), and
-[`configs/qwen3_6_35b_gpqa.yaml`](configs/qwen3_6_35b_gpqa.yaml). The Qwen3.8 groupwise-int and
-NVFP4 campaigns use their format-specific reasoning configurations and managed scripts documented
-below.
-
 [`configs/qwen3_6_35b_needle_haystack.yaml`](configs/qwen3_6_35b_needle_haystack.yaml)
 defines the 35B-A3B Needle-in-a-Haystack profiles separately: `standard` preserves EvalScope's
 1K--32K, ten-length, ten-depth English/Chinese matrix (200 samples), while `native_long` evaluates
@@ -43,6 +36,20 @@ the exact 64K, 128K, and safe 260K prompt profiles at eleven depths in both lang
 The 260K profile uses the exact local 35B tokenizer and leaves more than 2K native context tokens
 for chat framing and its bounded 512-token answer. All profiles use rule scoring and explicitly
 disable thinking so the observable answer is the retrieved needle.
+
+[`configs/qwen3_8_27b_long_context.yaml`](configs/qwen3_8_27b_long_context.yaml)
+defines the Qwen3.8-27B long-context gates for the 1M-context track: native-range int8
+and hq-e8-2b baselines (8K-128K), the scaled 524K (YaRN factor 2) and 1M (factor 4)
+profiles, and a static-YaRN short-prompt regression suite. Each suite runs against its
+own `ninfer-serve` launch; the required server flags are noted per suite in the config.
+The ModelScope needle corpus and the exact HF tokenizer directory are local
+prerequisites for the needle suites - adjust `local_path` and `tokenizer_path` before
+the first run. The config also runs LongBench v2 (`ZhipuAI/LongBench-v2`, 503
+real-document multiple-choice questions, rule-scored on the final `ANSWER: [LETTER]`
+line - no judge model) split by subset across the same launches: `short` on native
+262K, `medium` on 524K YaRN-2, `long` on 1M YaRN-4. Samples whose prompt exceeds the
+envelope fail by construction (a real slice of `medium` and most of the `long` tail),
+so read those cells as lower bounds or trim the job with `--limit`.
 
 A target defines the model service:
 
@@ -69,9 +76,8 @@ Concurrency has two levels:
 - optional job `max_concurrency` caps how many target slots one job may reserve.
 
 For EvalScope, the granted job slots become `eval_batch_size`. Multiple jobs sharing a target can
-never reserve more slots than the target capacity. For `ninfer-serve`, match the target capacity to
-the server's startup `--max-concurrency`; an individual long-output job may set a lower concurrency
-when its KV entitlement requires it.
+never reserve more slots than the target capacity. Set the local `ninfer-serve` target to one; set a
+larger explicit value for an online service that supports it.
 
 Portable generation settings live under `generation`. Evaluator-specific controls live under
 `backend_args`; unknown fields are rejected rather than silently ignored.
@@ -226,6 +232,19 @@ eval/.venv/bin/python -m ninfer_eval summarize --run eval/runs/<run-id>
 Resume rejects a changed effective configuration or backend version. Completed jobs are skipped;
 an incomplete EvalScope job reuses its own prediction cache when available.
 
+### Model-card campaigns (fork)
+
+`run_card_quality.sh <artifact> <label> [kv-dtype] [seed ...]` runs the GPQA-Diamond + AIME26
+quality rounds of the model-card tables under the registered serving profile (thinking,
+temperature 0.6, top_p 0.95, top_k 20, MTP3 full head, INT8 KV, native 262,144 context; the
+optional kv-dtype argument runs the paired hq-e8-2b codec cells); the default seeds 42 43 44
+are one independent round each. `run_card_lbv2.sh <artifact> <label> [seed ...]` runs the
+thinking-on LongBench v2 RoPE cells (short native, medium 524k YaRN-2, long 786k YaRN-3) with
+a fresh server per cell. `run_master_campaign.sh` sequences both for the fork artifacts. The
+agentic suites run through their upstream harnesses against the engine's OpenAI-compatible
+endpoint (Terminal-Bench 2.1 via Harbor/Terminus-2, SWE-Bench Pro via mini-swe-agent, both
+Docker-based); the local box-specific driver scripts for them are not part of the tracked tree.
+
 ## Progress And Logs
 
 TTY runs use a live display with dataset phase, completed/total units, elapsed time, rate, and ETA.
@@ -247,32 +266,6 @@ Every run is stored below `eval/runs/<timestamp>-<config-hash>/`:
 
 The sample-retention policy is recorded in the manifest. API keys and known secret values are
 redacted from coordinator events and task snapshots.
-
-## Historical Qwen3.6-27B reasoning profile
-
-The published Qwen3.6-27B scores and per-dataset correct/total counts are recorded in the
-[groupwise-int model card](../model-cards/Qwen3.6-27B-NInfer/README.md#evaluation) and
-[NVFP4 model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md#evaluation).
-Those runs used EvalScope 1.9.0, one sample per problem, and the sampling settings recorded on
-the cards. The current pinned evaluation environment is newer; rerunning the commands below
-reproduces the workload on the selected environment, not the historical score automatically.
-
-The NVFP4 serving command was:
-
-```bash
-build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
-  --host 127.0.0.1 --port 18080 \
-  --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft
-```
-
-Run the configured reasoning suite in a separate shell using the evaluation environment above:
-
-```bash
-PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
-  --config eval/configs/qwen3_6_27b_reasoning.yaml \
-  --suite reasoning_full
-```
 
 ## Scores
 
