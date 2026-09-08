@@ -8,6 +8,7 @@
 // optional caller epilogue may instead consume the FP32 tile.
 
 #include "ops/common/mma.cuh"
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/w8/w8_config.h"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
@@ -81,6 +82,7 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
                const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {},
                RowPolicy row_policy = {}, std::int32_t columns = ActiveCols,
                ColumnPolicy column_policy = {}) {
+    pdl::sync();
     const int column_offset = TiledColumns ? static_cast<int>(blockIdx.y) * ActiveCols : 0;
     const int live_columns  = TiledColumns ? min(ActiveCols, columns - column_offset) : ActiveCols;
     constexpr int kHidden   = Geometry::kInputRows;
@@ -373,6 +375,7 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
             }
         }
     }
+    pdl::publish();
 }
 
 // Standard projection entry. Multi-layer fused Ops call the same contraction after selecting

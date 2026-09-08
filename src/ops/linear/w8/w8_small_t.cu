@@ -1,4 +1,5 @@
 #include "ops/linear/w8/w8_launch.h"
+#include "core/pdl.cuh"
 
 #include "core/device.h"
 #include "ops/linear/w8/w8_config.h"
@@ -20,11 +21,14 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule, W8ContiguousOutput,
+                              W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, false>,
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output);
+            static_cast<const std::uint8_t*>(weight.scales), output,
+            W8SmallTMmaStoreEpilogue{}, W8SmallTMmaIdentityRows{}, ActiveTokens));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -40,13 +44,14 @@ void launch_vocabulary_tile(const Tensor& x, const Weight& weight, Tensor& out, 
     using Schedule = W8SmallTMmaSchedule<Capacity <= 32 ? 8 : 4, Capacity, 2,
                                          W8SmallTMmaScaleAccess::Shared>;
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
-    w8_small_t_mma_kernel<Geometry, Capacity, Schedule, W8ContiguousOutput,
-                          W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, true>
-        <<<Geometry::kOutputRows / 16, Schedule::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(Geometry::kOutputRows / 16), dim3(Schedule::kThreads), 0, stream},
+        w8_small_t_mma_kernel<Geometry, Capacity, Schedule, W8ContiguousOutput,
+                              W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, true>,
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaStoreEpilogue{},
-            W8SmallTMmaIdentityRows{}, x.ne[1]);
+            W8SmallTMmaIdentityRows{}, x.ne[1]));
     CUDA_CHECK(cudaGetLastError());
 }
 
