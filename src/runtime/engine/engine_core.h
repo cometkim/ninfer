@@ -910,6 +910,29 @@ private:
         request_admission_check();
     }
 
+    // Fail one active request without touching any other lane. Aborts its sequence (discarding
+    // licensed tokens and releasing its topology exactly as cancellation does), then completes
+    // it with the given error and frees the slot. Only exceptions from shared-engine work (round
+    // membership, the batched decode execution itself) reach fail_all_locked.
+    void fail_active_request(std::uint32_t lane, const std::shared_ptr<Request>& request,
+                             std::exception_ptr error) noexcept {
+        try {
+            if (request->sequence && request->lane) {
+                auto aborted =
+                    resources_.abort(*instance_.program, *request->lane, *request->sequence);
+                request->generation_timings = aborted.timings;
+                request->speculative_stats  = std::move(aborted.speculative);
+            }
+        } catch (...) {
+        }
+        if (scheduler_.prefill_lane() == lane) {
+            scheduler_.clear_prefill_lane(lane);
+            request_admission_check();
+        }
+        complete_error(request, std::move(error));
+        remove_completed_slot(lane);
+    }
+
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
         std::array<bool, kMaximumConcurrency> cancelled{};
         // An already-issued active unit may finish while another row owns the global resource
@@ -1062,6 +1085,7 @@ private:
         std::array<ContinuationAction, kMaximumConcurrency> continuations{};
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
         std::array<bool, kMaximumConcurrency> cancelled{};
+        std::array<std::exception_ptr, kMaximumConcurrency> row_errors{};
         bool generated_staged = false;
         std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
         std::array<std::uint32_t, kMaximumConcurrency> terminal_lanes{};
@@ -1109,8 +1133,23 @@ private:
                     finish_reasons[row] = FinishReason::Cancelled;
                     continue;
                 }
-                const OutputDecision decision = request->output.preview_model(
-                    row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                OutputDecision decision;
+                try {
+                    decision = request->output.preview_model(
+                        row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                } catch (...) {
+                    // Request-scoped output-policy failure: mark the row cancelled (discarding
+                    // its licensed tokens) and fail this request below; the batch keeps going.
+                    row_errors[row]  = std::current_exception();
+                    cancelled[row]   = true;
+                    decisions[row] = CommitDecision{
+                        .accepted_tokens = 0,
+                        .terminal        = true,
+                        .cancelled       = true,
+                    };
+                    finish_reasons[row] = FinishReason::Cancelled;
+                    continue;
+                }
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                     (!decision.finished() && decision.accepted_tokens != count) ||
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
@@ -1217,6 +1256,12 @@ private:
             for (std::size_t row = 0; row < row_count; ++row) {
                 const std::uint32_t lane     = lane_indices[row];
                 const auto& request          = slots_[lane];
+                if (row_errors[row]) {
+                    // The preview loop already failed this row's request; finalize it here so
+                    // the batch's other rows complete normally.
+                    fail_active_request(lane, request, std::move(row_errors[row]));
+                    continue;
+                }
                 const std::uint32_t accepted = decisions[row].accepted_tokens;
                 if (!cancelled[row]) {
                     request->budget->commit(accepted);
@@ -1391,11 +1436,24 @@ private:
             throw std::logic_error("prefill request has no sequence handle");
         }
         setup.finish();
-        ProgramCallScope program_call(*this);
-        auto progress =
-            instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
-        program_call.finish(progress.timing);
-        resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        try {
+            ProgramCallScope program_call(*this);
+            auto progress =
+                instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
+            program_call.finish(progress.timing);
+            resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        } catch (...) {
+            // A host exception scoped to this request's prefill (or its output policy) fails only
+            // this request; every other lane keeps serving. The prefill lane must be cleared
+            // first so the next worker boundary stages a fresh prefill owner.
+            const std::exception_ptr error = std::current_exception();
+            if (scheduler_.prefill_lane() == lane) {
+                scheduler_.clear_prefill_lane(lane);
+                request_admission_check();
+            }
+            fail_active_request(lane, request, error);
+            return;
+        }
         publish_runtime_stats();
     }
 
