@@ -412,6 +412,32 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
     }
 }
 
+// Weight-only NVFP4 DFlash2 matrix (the v2 module encoding): the payload divisor comes from
+// the block-scale payload itself and the input divisor is fixed at 1.0F because the A16 drafter
+// carries no activation-quant site.
+WeightPlan bind_module_nvfp4_weight(artifact::Binder& binder, std::string_view name,
+                                    std::int32_t rows, std::int32_t columns,
+                                    artifact::TensorPlacement placement) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const artifact::ObjectHandle parent      = binder.require_tensor(
+        name, NumericFormat::NVFP4, artifact::StorageLayout::BlockScaleK16M128x4V1, shape);
+    if (placement == artifact::TensorPlacement::Device) {
+        binder.materialize_on_device(parent);
+    } else {
+        binder.validate_only(parent);
+    }
+    const artifact::BlockScaleGeometry geometry =
+        artifact::block_scale_geometry(NumericFormat::NVFP4, shape);
+    const std::uint32_t weight_bits =
+        read_u32_le(binder.payload(parent).data, geometry.weight_divisor_offset, name);
+    require_positive_finite(weight_bits, name);
+    return WeightPlan{.object                    = parent,
+                      .format                    = NumericFormat::NVFP4,
+                      .weight_scale_divisor_bits = weight_bits,
+                      .input_scale_divisor_bits  = 0x3F800000U};
+}
+
 DFlash2Plan bind_dflash2(artifact::Binder& binder, artifact::TensorPlacement placement) {
     const auto bind_tensor = [&](std::string_view name, NumericFormat format,
                                  std::initializer_list<std::uint64_t> shape) {
