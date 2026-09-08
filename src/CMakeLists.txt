@@ -93,8 +93,11 @@ add_library(ninfer_ops STATIC
   ops/rmsnorm_rope/rmsnorm_rope.cpp
   ops/rmsnorm_rope/launch.cu
   ops/context_kv_materialize/context_kv_materialize.cpp
+  ops/context_kv_materialize/context_kv_key_post.cu
   ops/context_kv_materialize/materialize.cu
+  ops/context_kv_materialize/materialize_nvfp4.cu
   ops/candidate_selector/bf16/candidate_selector_path.cu
+  ops/candidate_selector/nvfp4/candidate_selector_path_nvfp4.cu
   ops/candidate_selector/bf16/candidate_selector_path_plan.cpp
   # Softmax Attention and KV-cache state transitions.
   ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
@@ -136,6 +139,7 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
+  ops/attn_input_proj/nvfp4/nvfp4_dflash2_attn_input.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
@@ -173,7 +177,9 @@ add_library(ninfer_ops STATIC
   ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
+  ops/dynamic_grouped_conv/dynamic_grouped_conv_add_finish.cu
   ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_partial.cu
+  ops/dynamic_grouped_conv/nvfp4/nvfp4_dynamic_grouped_conv_prepare.cu
   ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_reduce.cu
   ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp
   ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_materialized.cu
@@ -193,6 +199,7 @@ add_library(ninfer_ops STATIC
   ops/linear/nvfp4/nvfp4_format.cpp
   ops/linear/nvfp4/nvfp4_gemv.cu
   ops/linear/nvfp4/nvfp4_small_t.cu
+  ops/linear/nvfp4/nvfp4_small_t_dflash2.cu
   ops/linear/nvfp4/nvfp4_w4a4.cu
   ops/linear/nvfp4/nvfp4_dispatch.cpp
   ops/linear/q4/q4_small_t_mma.cu

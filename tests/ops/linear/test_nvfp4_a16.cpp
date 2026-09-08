@@ -36,6 +36,22 @@ int run_nvfp4_a16() {
                           {5120, 6144, 705U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
+    // DFlash2 drafter problems (A16 weight-only).
+    constexpr std::array dflash2_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only},
+        Invocation{33, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {5120, 25600, 711U, Comparison::Sampled, true, dflash2_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {6144, 5120, 712U, Comparison::Sampled, true, dflash2_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {5120, 4096, 713U, Comparison::Sampled, true, dflash2_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {1280, 5120, 714U, Comparison::Sampled, true, dflash2_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {256, 5120, 715U, Comparison::Sampled, true, dflash2_invocations});
     return failures;
 }
 
