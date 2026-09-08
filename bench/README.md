@@ -64,7 +64,7 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (MTP K=1..5, DFlash/DFlash2
+Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (MTP K=1..7, DFlash/DFlash2
 K=1..15); `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
 enabled by default.
 
