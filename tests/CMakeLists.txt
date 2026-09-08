@@ -295,6 +295,9 @@ ninfer_add_op_test(ninfer_kv_cache_append_test
 ninfer_add_op_test(ninfer_rmsnorm_rope_test
   SOURCES ops/test_rmsnorm_rope.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_qk_norm_rope_test
+  SOURCES ops/test_qk_norm_rope.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_context_kv_materialize_test
   SOURCES ops/test_context_kv_materialize.cpp
   LIBRARIES ninfer_ops)
