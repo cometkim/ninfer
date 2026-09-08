@@ -138,6 +138,13 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
 causes failures or interferes with the task, and briefly explain why.
 
+Heavy launcher template instantiations live in per-dtype/per-geometry instantiation TUs, never
+in their dispatcher TU: the template definition sits in a private `*_tc_launch.h` header with
+`extern template` declarations for every combination the dispatcher uses, and matching explicit
+instantiation TUs carry the kernel expansion (see the small-t attention and w8 small-T families
+for the pattern). A new KV storage family follows the same structure from its first commit:
+dispatcher TU + instantiation TU per dtype.
+
 Use the selected Python 3.11 interpreter explicitly. On this machine it is
 `/home/neroued/miniconda3/envs/py311/bin/python`; the default shell's `python3` may be a different
 version. Use `python3` only after selecting the maintainer environment or checking its version.
