@@ -6,6 +6,8 @@
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <algorithm>
+#include "ninfer/ops/sigmoid_mul.h"
+
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -306,7 +308,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                            Tensor& out, cudaStream_t stream) {
+                            Tensor& out, const Tensor* gate, cudaStream_t stream) {
     for (std::int32_t begin = 0; begin < q.ne[2];
          begin += causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage,
                                                         envelope)) {
@@ -320,22 +322,35 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows,
                                                 scale, cache, envelope, begin, count, partial.acc,
-                                                partial.m, partial.l, out, stream);
+                                                partial.m, partial.l, out, gate, stream);
     }
 }
 
 void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, float scale,
                                    const PagedKVLayerView& cache,
                                    CausalAttentionExecutionEnvelope envelope,
-                                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
-    for_each_small_t_chunk(
-        q, positions, workspace, cache.storage, envelope, out,
-        [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
-            SmallTWorkspace& partial, Tensor& out_chunk) {
-            detail::causal_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
-                                                           envelope, partial.acc, partial.m,
-                                                           partial.l, out_chunk, stream);
-        });
+                                   WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                   cudaStream_t stream) {
+    for (std::int32_t begin = 0; begin < q.ne[2];
+         begin +=
+         causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache.storage, envelope)) {
+        const std::int32_t count = std::min(
+            causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache.storage, envelope),
+            q.ne[2] - begin);
+        auto chunk_scope = workspace.scope();
+        const std::int32_t splits =
+            detail::causal_attention_split_capacity(q.ne[1], count, cache.storage, envelope);
+        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], count, splits, 1);
+        Tensor q_chunk          = q.slice(2, begin, count);
+        Tensor position_chunk   = positions.slice(0, begin, count);
+        Tensor out_chunk        = out.slice(2, begin, count);
+        Tensor gate_chunk       = gate == nullptr ? Tensor{} : gate->slice(2, begin, count);
+        detail::causal_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
+                                                       envelope, partial.acc, partial.m, partial.l,
+                                                       out_chunk,
+                                                       gate == nullptr ? nullptr : &gate_chunk,
+                                                       stream);
+    }
 }
 
 } // namespace
@@ -451,10 +466,20 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream) {
+                              Tensor& out, const Tensor* gate, cudaStream_t stream) {
     constexpr const char* op = "causal_softmax_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        geometry, envelope, scale, op);
+    if (gate != nullptr && (gate->dtype != DType::BF16 || !gate->is_contiguous() ||
+                            gate->data == nullptr ||
+                            gate->numel() != out.numel())) {
+        throw std::invalid_argument(
+            std::string(op) + ": gate must be contiguous BF16 with out's element count");
+    }
+    // The fused reducer epilogue covers the generic (BF16/INT8 KV) routes; every other
+    // route applies the gate as the separate sigmoid_mul launch it replaces.
+    const bool fused_gate_route = cache.storage == KvCacheStorage::BFloat16 ||
+                                  cache.storage == KvCacheStorage::Int8Group64;
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
         throw std::invalid_argument("causal_softmax_attention: k/v must be BF16");
     }
@@ -470,8 +495,14 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
-        launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                               envelope, workspace, out, stream);
+        if (fused_gate_route) {
+            launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
+                                   envelope, workspace, out, gate, stream);
+        } else {
+            launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
+                                   envelope, workspace, out, nullptr, stream);
+            if (gate != nullptr) sigmoid_mul(*gate, out, stream);
+        }
         return;
     }
     if (route == detail::CausalAttentionRoute::SmallT) {
@@ -481,26 +512,45 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                                 scale, cache, envelope, 0, width, partial.acc,
-                                                partial.m, partial.l, out, stream);
+                                                partial.m, partial.l, out,
+                                                fused_gate_route ? gate : nullptr, stream);
+        if (gate != nullptr && !fused_gate_route) sigmoid_mul(*gate, out, stream);
         return;
     }
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                            cache, out, stream);
+    if (gate != nullptr) sigmoid_mul(*gate, out, stream);
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
                                      const PagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
-                                     WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                                     WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                     cudaStream_t stream) {
     constexpr const char* op = "causal_softmax_attention_cached";
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
+    if (gate != nullptr && (gate->dtype != DType::BF16 || !gate->is_contiguous() ||
+                            gate->data == nullptr ||
+                            gate->numel() != out.numel())) {
+        throw std::invalid_argument(
+            std::string(op) + ": gate must be contiguous BF16 with out's element count");
+    }
+    const bool fused_gate_route = cache.storage == KvCacheStorage::BFloat16 ||
+                                  cache.storage == KvCacheStorage::Int8Group64;
 
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, cache.storage, envelope);
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
-        launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
+        if (fused_gate_route) {
+            launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out,
+                                          gate, stream);
+        } else {
+            launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out,
+                                          nullptr, stream);
+            if (gate != nullptr) sigmoid_mul(*gate, out, stream);
+        }
         return;
     }
     if (route == detail::CausalAttentionRoute::SmallT) {
@@ -509,10 +559,13 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, 1);
         detail::causal_attention_cached_small_t_launch(
-            q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out, stream);
+            q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out,
+            fused_gate_route ? gate : nullptr, stream);
+        if (gate != nullptr && !fused_gate_route) sigmoid_mul(*gate, out, stream);
         return;
     }
     detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+    if (gate != nullptr) sigmoid_mul(*gate, out, stream);
 }
 
 } // namespace ninfer::ops

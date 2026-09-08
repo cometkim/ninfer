@@ -398,13 +398,13 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
             *active_backend_kv_table_rows_, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, &gate, s);
     } else {
         ops::causal_softmax_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
                                       {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-                                      batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
+                                      batch_mtp_kv_->batch_layer_view(0), envelope, work_, a,
+                                      &gate, s);
     }
-    ops::sigmoid_mul(gate, a, s);
 
     const auto post = workspace_recipe::mtp_post_attention<TextConfig>(work_, T);
     Tensor o        = post.output;
@@ -536,8 +536,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
         ops::causal_softmax_attention_cached(qn, last_position,
                                              {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-                                             mtp_kv_.layer_view(0), envelope, work_, a, s);
-        ops::sigmoid_mul(gate, a, s);
+                                             mtp_kv_.layer_view(0), envelope, work_, a, &gate, s);
 
         Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
         ops::linear(a.view({kCfg.q_size, 1}), *mtp_.o_proj, o, s);
@@ -861,14 +860,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
                                       kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
                                       kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                      *active_causal_attention_envelope_, work_, a_batch, s);
+                                      *active_causal_attention_envelope_, work_, a_batch,
+                                      &gate, s);
     } else {
         ops::causal_softmax_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
                                       {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
                                       batch_text_kv_->batch_layer_view(fidx),
-                                      *active_causal_attention_envelope_, work_, a, s);
+                                      *active_causal_attention_envelope_, work_, a, &gate, s);
     }
-    ops::sigmoid_mul(gate, a, s);
 
     Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
 }

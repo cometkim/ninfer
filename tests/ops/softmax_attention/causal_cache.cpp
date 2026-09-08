@@ -1779,7 +1779,7 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         [&](cudaStream_t stream) {
             ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row,
                                           op_geometry(geometry), kAttentionScale,
-                                          cache.batch_view(), envelope, workspace, tout, stream);
+                                          cache.batch_view(), envelope, workspace, tout, nullptr, stream);
         },
         test_case.graph_replay);
 
@@ -1857,7 +1857,7 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     launch_attention_case(
         [&](cudaStream_t stream) {
             ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
-                                                 cache.view(), envelope, workspace, tout, stream);
+                                                 cache.view(), envelope, workspace, tout, nullptr, stream);
         },
         test_case.graph_replay);
 
@@ -1976,7 +1976,7 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
     const auto launch = [&] {
         ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
                                       op_geometry(geometry), kAttentionScale, cache.view(),
-                                      envelope, workspace, tout, device.stream);
+                                      envelope, workspace, tout, nullptr, device.stream);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
