@@ -48,6 +48,7 @@ Ongoing feature experimentation:
 
 | feat branch | stacked on | status | squashed on dev as |
 |---|---|---|---|
+| `feat/qwen3.8-nvfp4full` | `feat/dflash2` | fuller-NVFP4 weights profile + converter; upstream-PR candidate | `squash(feat/qwen3.8-nvfp4full)` |
 | `feat/dflash2` | `feat/windows-port` | fork-format NVFP4 DFlash2 draft module execution + unified binder; self-contained, also PR-able to nvfp4full-first forks | `squash(feat/dflash2)` |
 
 When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
@@ -162,6 +163,18 @@ Windows-port lineage:
 
 What this fork adds on top (one squashed commit per feature branch, per
 [About this fork](#about-this-fork)):
+
+- **`feat/qwen3.8-nvfp4full`** — the Qwen3.8-27B NVFP4 full-precision-requant artifact:
+  unified activation scale space, conversion tooling, model card, and the published gpqa
+  comparison.
+- **`feat/qwen3.8-nvfp4qat`** — the QUASAR QAT re-source profile: word-for-word NVFP4 copy
+  of the QUASAR-quantized checkpoint with its own conversion recipe and model card.
+- **`feat/kernel-perf`** — the general kernel-performance track on the non-hq paths:
+  programmatic dependent launch across the decode chain with the publish-at-end rule, the
+  per-dtype/per-geometry instantiation-TU split across the launcher families, a bit-exact
+  fused q/k rmsnorm+rope kernel, the sigmoid gate folded into the small-T reducer epilogue,
+  fp16-accumulated PV with a range guard plus key-range splitting in the i8 and BF16 prompt
+  kernels, and a per-request error boundary in the engine.
 
 - **`feat/dflash2`** — the fork-format NVFP4 DFlash2 draft module: the v2 artifacts' 66-object
   weight-only NVFP4 module executes end to end (five A16-only drafter linears, the 3-output
