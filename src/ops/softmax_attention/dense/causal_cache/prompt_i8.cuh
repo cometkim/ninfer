@@ -53,12 +53,13 @@ __device__ __forceinline__ int4 causal_prompt_i8_dequant_f16x8(const std::int8_t
     const int2 raw       = load_vec<int2>(codes8);
     const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
     const __half2 s2     = __halves2half2(scale, scale);
+    const __half2 guard  = __float2half2_rn(0.015625f); // 2^-6
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const __half2 code2 =
             __floats2half2_rn(static_cast<float>(c[2 * i]), static_cast<float>(c[2 * i + 1]));
-        const __half2 value2 = __hmul2(code2, s2);
+        const __half2 value2 = __hmul2(__hmul2(code2, s2), guard);
         packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
@@ -66,7 +67,7 @@ __device__ __forceinline__ int4 causal_prompt_i8_dequant_f16x8(const std::int8_t
 }
 
 template <typename Geometry, typename Metadata>
-__global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
+__global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
@@ -409,6 +410,17 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
             acc[n][3] *= alpha1;
         }
 
+        // PV runs on the f16-accumulate MMA (2x the f32-accumulate issue rate on
+        // GeForce): each 64-key tile accumulates into f16 fragments and promotes once into
+        // the f32 running sum. The staged V carries the 2^-6 dequant guard, so a tile partial
+        // stays within max|v| of the fp16 range however peaked the tile's p mass is; the
+        // promotion scales the exact 64 back in the same FFMA that adds into the running sum.
+        unsigned hacc[PVNtPerWarp][2];
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            hacc[n][0] = 0u;
+            hacc[n][1] = 0u;
+        }
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
             unsigned pf[4];
@@ -424,9 +436,19 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + causal_prompt_swz(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                        vf[0], vf[1]);
+                mma_f16_f16acc(hacc[n][0], hacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
+        }
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const float2 h0 =
+                __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][0]));
+            const float2 h1 =
+                __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][1]));
+            acc[n][0] = fmaf(64.0f, h0.x, acc[n][0]);
+            acc[n][1] = fmaf(64.0f, h0.y, acc[n][1]);
+            acc[n][2] = fmaf(64.0f, h1.x, acc[n][2]);
+            acc[n][3] = fmaf(64.0f, h1.y, acc[n][3]);
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
