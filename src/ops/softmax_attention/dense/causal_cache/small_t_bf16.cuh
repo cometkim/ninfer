@@ -10,6 +10,7 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 
 #include <cstdint>
@@ -24,6 +25,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     float* partial_acc, float* partial_m, float* partial_l) {
+    pdl::sync();
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -422,6 +424,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

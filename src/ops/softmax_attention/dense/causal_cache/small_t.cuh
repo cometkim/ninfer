@@ -7,6 +7,7 @@
 // only what both share: layout constants, device helpers, and the split reducer.
 
 #include "ops/common/math.cuh"
+#include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
@@ -203,6 +204,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     const __nv_bfloat16* gate, std::int32_t tokens, std::int32_t full_width,
     std::int32_t column_begin, std::int32_t batch_size, std::int32_t split_count,
     __nv_bfloat16* out) {
+    pdl::sync();
     static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -273,6 +275,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
             ? attention
             : __float2bfloat16_rn(__bfloat162float(attention) *
                                   sigmoid(__bfloat162float(gate[output_index])));
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

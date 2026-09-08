@@ -2,6 +2,8 @@
 // preparation, including their paired fixed rotation, remains private to the included kernel.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
+#include "core/pdl.cuh"
+
 #include "core/paged_kv_storage.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
@@ -103,9 +105,10 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     Tensor& cache_k = cache.k_pages;
     Tensor& cache_v = cache.v_pages;
     // bf16 kernel uses only static smem (no dynamic staging).
-    causal_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
-                                                    Masked, CacheInput>
-        <<<grid, kBlock, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {grid, dim3(kBlock), 0, stream},
+        causal_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta,
+                                                        MultiBatch, Masked, CacheInput>,
             static_cast<const __nv_bfloat16*>(q.data), input,
             static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
             static_cast<__half*>(cache_v.data),
@@ -118,7 +121,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
                 : static_cast<const std::int32_t*>(invocation.table_rows->data),
             cache.block_tables.ne[0], invocation.width, invocation.full_width,
             invocation.column_begin, logical_capacity, scale, static_cast<float*>(partial_acc.data),
-            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data)));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -144,10 +147,11 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
             CUDA_CHECK(attr);
         }
-        causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
-                                                 KeyBlock, DynamicArena, MultiBatch, Masked,
-                                                 CacheInput>
-            <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
+        CUDA_CHECK(pdl::launch_dependent(
+            {grid, dim3(WarpsPerCta * 32), kDynamicBytes, stream},
+            causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
+                                                     MinBlocksPerSm, KeyBlock, DynamicArena,
+                                                     MultiBatch, Masked, CacheInput>,
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
                 static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
@@ -161,7 +165,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                 logical_capacity, scale, static_cast<float*>(partial_acc.data),
-                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data)));
     };
     if constexpr (TokenTile >= 6) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
@@ -334,8 +338,10 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     const auto launch_reduce   = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
         const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
                           invocation.width * invocation.batch_size);
-        causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                        Offset><<<grid, kReduceBlock, 0, stream>>>(
+        CUDA_CHECK(pdl::launch_dependent(
+            {grid, dim3(kReduceBlock), 0, stream},
+            causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch,
+                                                          Masked, Offset>,
             static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
             static_cast<const float*>(partial_l.data), static_cast<const std::int32_t*>(pos.data),
             invocation.valid_columns
@@ -343,7 +349,7 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                   : nullptr,
             gate == nullptr ? nullptr : static_cast<const __nv_bfloat16*>(gate->data),
             invocation.width, invocation.full_width, invocation.column_begin, invocation.batch_size,
-            splits, static_cast<__nv_bfloat16*>(out.data));
+            splits, static_cast<__nv_bfloat16*>(out.data)));
     };
     const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {
         if (invocation.column_begin == 0)
