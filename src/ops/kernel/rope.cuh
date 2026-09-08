@@ -89,6 +89,7 @@ template <RopeKernelMode Mode, int QHeads, int KHeads>
 __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
                                   std::int32_t tokens, std::int64_t q_token_stride,
                                   std::int64_t k_token_stride) {
+    pdl::sync();
     constexpr int kHeadDim = Mode == RopeKernelMode::Vision2D       ? 72
                              : Mode == RopeKernelMode::DflashText1D ? 128
                                                                     : 256;
@@ -126,12 +127,14 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
                                              c0, c1, s0, s1);
         }
     }
+    pdl::publish();
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads, int HeadsPerBlock>
 __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bfloat16* q,
                                         __nv_bfloat16* k, std::int32_t tokens,
                                         std::int64_t q_token_stride, std::int64_t k_token_stride) {
+    pdl::sync();
     static_assert(Mode == RopeKernelMode::DflashText1D);
     constexpr int kHeadDim       = 128;
     constexpr int kHalf          = 64;
@@ -165,6 +168,7 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bflo
         apply_rope_head<kHeadDim, kHalf>(k, k_token_stride, combined_head - QHeads, token, lane, c0,
                                          c1, s0, s1);
     }
+    pdl::publish();
 }
 
 __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, int rotary_dim,
@@ -185,6 +189,7 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
                                            float theta, std::int32_t q_heads, std::int32_t k_heads,
                                            std::int32_t tokens, std::int64_t q_token_stride,
                                            std::int64_t k_token_stride) {
+    pdl::sync();
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;
@@ -228,6 +233,7 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
             data[base + pair + half] = __float2bfloat16_rn(second * c + first * s);
         }
     }
+    pdl::publish();
 }
 
 
