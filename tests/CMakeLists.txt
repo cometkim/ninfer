@@ -150,6 +150,9 @@ ninfer_add_test(ninfer_qwen3_8_27b_dflash2_real_test
   SOURCES targets/qwen3_6_27b/test_engine_dflash2_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_8_27b_dflash2_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_hq_retrieval_test
+  SOURCES ops/test_hq_retrieval.cu
+  LIBRARIES CUDA::curand)
 ninfer_add_test(ninfer_qwen3_6_27b_rope_scaling_test
   SOURCES targets/qwen3_6_27b/test_rope_scaling.cpp
   LIBRARIES ninfer_ops)
