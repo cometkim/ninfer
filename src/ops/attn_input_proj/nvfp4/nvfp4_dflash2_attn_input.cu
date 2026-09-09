@@ -1,4 +1,5 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#include "core/pdl.cuh"
 
 #include "core/device.h"
 #include "ops/common/token_slices.h"
@@ -45,12 +46,13 @@ void launch_decode(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, 
                         static_cast<__nv_bfloat16*>(v.data)};
     constexpr int kBlocks              = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
-    nvfp4_gemv_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Output>
-        <<<dim3(kBlocks), dim3(Schedule::kThreads), 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
-            Nvfp4IdentityEpilogue{}, output);
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_gemv_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Output>,
+
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
+        Nvfp4IdentityEpilogue{}, output));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -64,12 +66,14 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, T
     const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
                         static_cast<__nv_bfloat16*>(v.data)};
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
-    nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue, Output>
-        <<<dim3(kBlocks), dim3(Schedule::kThreads), 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
-            Nvfp4IdentityEpilogue{}, output);
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue, Output>,
+
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
+        Nvfp4IdentityEpilogue{}, output));
     CUDA_CHECK(cudaGetLastError());
 }
 
