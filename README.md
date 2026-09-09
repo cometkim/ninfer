@@ -50,6 +50,7 @@ Ongoing feature experimentation:
 |---|---|---|---|
 | `feat/msvc-test-constexpr` | `master` | upstream PR candidate (constexpr to const test constants) | `squash(feat/msvc-test-constexpr)` |
 | `feat/windows-port` | `master` | rebuilt clean: the Windows build layer + MSVC flags + TMA descriptor blocks + UTF8PROC_STATIC | `squash(feat/windows-port)` |
+| `feat/webui` | `feat/windows-port` | in-process llama.cpp WebUI + server dialect; upstream PR candidate | `squash(feat/webui)` (stack bottom) |
 
 When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
 its row into the upstream lineage note.
@@ -165,7 +166,12 @@ What this fork adds on top (one squashed commit per feature branch, per
 [About this fork](#about-this-fork)):
 
 
-
+- **`feat/webui`** — the stock llama.cpp WebUI in-process: `--webui` auto-syncs the prebuilt
+  UI from the [ggml-org/llama-ui](https://huggingface.co/ggml-org/llama-ui) bucket (version-
+  marker check, staged atomic swap) and mounts it at `/` with an SPA fallback; API-key auth
+  gates API paths only (llama-server parity); the OpenAI endpoints additionally accept the
+  llama.cpp server dialect (`chat_template_kwargs.enable_thinking`, negative `max_tokens`,
+  `/props` introspection, `status`/`meta.n_ctx` on the models objects).
 
 Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
 requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from upstream.

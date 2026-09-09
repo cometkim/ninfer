@@ -749,6 +749,18 @@ curl http://127.0.0.1:8080/v1/models \
 
 `--cors` adds permissive browser CORS headers. It is disabled by default.
 
+`--webui` serves the stock llama.cpp WebUI in-process: at startup the prebuilt UI is
+synced from the ggml-org/llama-ui Hugging Face bucket (version-marker check, staged
+atomic swap) into the webui directory and then mounted at `/` alongside the API, with a
+single-page-app fallback for client-side routes and API-key authentication gating only
+the API paths so the UI shell loads freely (llama-server parity). `--webui-dir DIR`
+serves an already-built static directory instead; for `--webui` it also selects the
+download location, defaulting to `<model dir>/webui`. The OpenAI-compatible endpoints
+additionally accept the llama.cpp server dialect: `chat_template_kwargs.enable_thinking`,
+an omitted or empty `model` (defaults to the loaded model), negative `max_tokens`
+(server default), `/props` introspection, and `status`/`meta.n_ctx` fields on the
+models objects.
+
 ## Server options
 
 The table lists executable defaults. The startup example selects a long-context FP8/MTP3 profile.
@@ -794,6 +806,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
+| `--webui` | auto-sync and serve the llama.cpp WebUI at `/` | off |
+| `--webui-dir DIR` | directory of an already-built WebUI to serve | unset |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
 | `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |

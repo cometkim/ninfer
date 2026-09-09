@@ -157,6 +157,9 @@ int main() {
                                            "--log-stats-interval-ms",
                                            "0",
                                            "--preserve-thinking",
+                                           "--webui",
+                                           "--webui-dir",
+                                           "webui-dir-x",
                                            "--media-cache-mib",
                                            "256",
                                            "--media-live-mib",
@@ -171,6 +174,9 @@ int main() {
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures +=
         check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
+    failures += check(configured.webui_auto, "--webui did not reach serving options");
+    failures += check(configured.webui_dir == "webui-dir-x",
+                      "--webui-dir did not reach serving options");
     failures +=
         check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
     failures += check(configured.max_context == 4096 &&
@@ -304,6 +310,8 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
+    failures += check(serve_usage_text("ninfer-serve").find("--webui") != std::string::npos,
+              "serve help omits --webui");
     failures += check(serve_usage_text("ninfer-serve").find("--default-thinking-budget") !=
                           std::string::npos,
                       "serve help omits --default-thinking-budget");

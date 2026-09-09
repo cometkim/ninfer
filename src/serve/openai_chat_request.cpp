@@ -875,8 +875,16 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
     }
     if (limit) {
         if (*limit < 0) { bad_request(std::string(param) + " must be nonnegative", param); }
-        output.generation.max_tokens  = *limit;
-        output.output_tokens_explicit = true;
+        // The llama.cpp webui sends -1 for "server default"; a non-positive value behaves
+        // exactly like an omitted field so the server default wins.
+        if (*limit >= 0) {
+            output.generation.max_tokens  = *limit;
+            output.output_tokens_explicit = true;
+        } else {
+            // The llama.cpp webui sends -1 for "server default"; negative values behave
+            // exactly like an omitted field so the server default wins.
+            output.generation.max_tokens = limits.default_max_tokens;
+        }
     } else {
         output.generation.max_tokens = limits.default_max_tokens;
     }

@@ -4,11 +4,15 @@
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
+#include "serve/webui_update.h"
 
 #include <nlohmann/json.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <chrono>
 #include <exception>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -226,6 +230,10 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     };
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
+    if (!options_.webui_dir.empty()) {
+        mount_webui(options_.webui_dir);
+        register_webui_mime();
+    }
     register_routes();
 }
 
@@ -332,8 +340,135 @@ void HttpServer::stop_stats_reporter() {
     stats_thread_.join();
 }
 
+void HttpServer::mount_webui(const std::string& webui_dir) {
+    std::ifstream index(webui_dir + "/index.html", std::ios::binary);
+    if (!index) { throw std::runtime_error("webui dir has no index.html: " + webui_dir); }
+    webui_index_html_ = std::string((std::istreambuf_iterator<char>(index)),
+                                    std::istreambuf_iterator<char>());
+    webui_serving_ = true;
+    if (!server_.set_mount_point("/", webui_dir)) {
+        throw std::runtime_error("cannot mount webui directory: " + webui_dir);
+    }
+    spdlog::info("serving webui from {}", webui_dir);
+}
+
+void HttpServer::register_webui_mime() {
+    // The vendored httplib's built-in map covers the stock webui's asset types; pin the
+    // ones the UI's runtime loading depends on.
+    server_.set_file_extension_and_mimetype_mapping("js", "text/javascript");
+    server_.set_file_extension_and_mimetype_mapping("css", "text/css");
+    server_.set_file_extension_and_mimetype_mapping("html", "text/html");
+    server_.set_file_extension_and_mimetype_mapping("json", "application/json");
+    server_.set_file_extension_and_mimetype_mapping("svg", "image/svg+xml");
+    server_.set_file_extension_and_mimetype_mapping("ico", "image/x-icon");
+}
+
+bool HttpServer::webui_spa_path(const std::string& path) const {
+    // The SPA fallback must only catch client-side routes: the static file handler already
+    // served every real asset, and API paths (/v1/...), /props, /health, and hashed bundle
+    // paths (_app/...) are never SPA routes. A missing _app file or an unknown /v1 path must
+    // keep falling through to the 404 handler.
+    if (path.size() < 2 || path[0] != '/') { return false; }
+    if (path == "/") { return false; }
+    if (path.rfind("/v1", 0) == 0 && (path.size() == 3 || path[3] == '/')) { return false; }
+    // llama.cpp server endpoints the webui probes but ninfer does not implement, plus
+    // ninfer's own status endpoints: keep them at their natural 404/405 so the UI degrades
+    // exactly as it did against a real llama-server, rather than getting the SPA shell back
+    // for an API call.
+    if (path == "/props" || path == "/health" || path == "/slots" || path == "/tools" ||
+        path == "/v1/streams/lookup") {
+        return false;
+    }
+    if (path.rfind("/_app/", 0) == 0) { return false; }
+    if (path.find_first_of('.') != std::string::npos) { return false; }
+    return true;
+}
+
+bool HttpServer::is_api_path(const std::string& path) const {
+    // The endpoints that require an API key. Deliberately dot-free: static assets
+    // (favicon.ico, app.js) and the UI shell (/, index.html, SPA routes) are never API
+    // paths, so the UI loads freely even when --api-key is set, exactly like
+    // llama-server. The webui supplies the key itself on API calls.
+    if (path.rfind("/v1", 0) == 0 && (path.size() == 3 || path[3] == '/')) { return true; }
+    if (path == "/props" || path == "/slots" || path == "/tools") { return true; }
+    if (path.rfind("/v1/streams/lookup", 0) == 0) { return true; }
+    if (path.rfind("/_app/", 0) == 0) { return false; } // served by the static mount
+    return false;
+}
+
+namespace {
+
+// llama.cpp webui dialect: /props is the client's server introspection endpoint (role
+// detection, context size, default params, thinking-capability probe, api key validation).
+// NInfer has no llama.cpp server behind it, so serve a faithful stub derived from the
+// process configuration. Only process-level overrides are reported as parameter values;
+// everything else stays at neutral zeros so client-side defaults never swallow a user-set
+// request parameter.
+nlohmann::json make_props_stub(const ServeOptions& options) {
+    const auto& ov = options.sampling_overrides;
+    nlohmann::json params = nlohmann::json::object();
+    params["n_predict"] = options.default_max_tokens;
+    params["seed"] = ov.seed ? static_cast<double>(*ov.seed) : 0;
+    params["temperature"] = ov.temperature ? static_cast<double>(*ov.temperature) : 0;
+    params["top_k"] = ov.top_k ? *ov.top_k : 0;
+    params["top_p"] = ov.top_p ? static_cast<double>(*ov.top_p) : 0;
+    params["min_p"] = ov.min_p ? static_cast<double>(*ov.min_p) : 0;
+    params["presence_penalty"] = ov.presence_penalty ? static_cast<double>(*ov.presence_penalty) : 0;
+    params["frequency_penalty"] =
+        ov.frequency_penalty ? static_cast<double>(*ov.frequency_penalty) : 0;
+    params["max_tokens"] = options.default_max_tokens;
+    params["stop"] = nlohmann::json::array();
+
+    nlohmann::json props = nlohmann::json::object();
+    props["default_generation_settings"] = {
+        {"id", 0},
+        {"id_task", 0},
+        {"n_ctx", static_cast<int>(options.max_context)},
+        {"speculative", options.speculative.backend != SpeculativeBackend::None},
+        {"is_processing", false},
+        {"params", params},
+        {"prompt", ""},
+        {"next_token",
+         {{"has_next_token", false},
+          {"has_new_line", false},
+          {"n_remain", 0},
+          {"n_decoded", 0},
+          {"stopping_word", ""}}},
+    };
+    props["total_slots"] = 1;
+    props["model_path"] = options.artifact_path;
+    props["role"] = "model";
+    props["modalities"] = {{"vision", options.enable_vision}, {"audio", false}, {"video", false}};
+    // Capability marker only: clients that probe the chat template (e.g. the webui's
+    // thinking-support heuristic) need `enable_thinking` to appear; the real template is
+    // embedded in the loaded artifact.
+    props["chat_template"] =
+        "{# ninfer-serve: capability marker; the real chat template is embedded in "
+        "the loaded artifact #}\n"
+        "{%- if enable_thinking is defined %}\n"
+        "  {%- set thinking = enable_thinking %}\n"
+        "{% endif %}";
+    props["bos_token"] = "";
+    props["eos_token"] = "";
+    props["build_info"] = "ninfer-serve";
+    return props;
+}
+
+} // namespace
+
 void HttpServer::register_routes() {
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
+        // SPA fallback: the file handler already served every real asset and every
+        // registered API route has already been tried, so an unmatched GET/HEAD is a
+        // client-side route (e.g. /chat/123). Hand it the SPA shell after the standard
+        // error rendering declined it; leave every other error untouched.
+        if (webui_serving_ && response.status == 404 &&
+            (request.method == "GET" || request.method == "HEAD") &&
+            webui_spa_path(request.path)) {
+            response.status = 200;
+            response.set_content(webui_index_html_, "text/html");
+            return httplib::Server::HandlerResponse::Handled;
+        }
         return handle_unrendered_http_error(options_, request, response);
     });
     if (options_.enable_cors) {
@@ -346,13 +481,25 @@ void HttpServer::register_routes() {
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
-        server_.Options(R"(.*)",
-                        [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
+        server_.Options(R"(.*)", [](const httplib::Request& req, httplib::Response& res) {
+            res.status = 204;
+            // Echo the preflight's requested headers (Access-Control-Request-Headers) so
+            // clients using custom headers (e.g. the llama.cpp webui's x-conversation-id)
+            // pass the browser's CORS check; the static default remains the floor.
+            const std::string requested = req.get_header_value("Access-Control-Request-Headers");
+            if (!requested.empty()) {
+                res.set_header("Access-Control-Allow-Headers", requested);
+            }
+        });
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_openai_request_id(req, res);
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        // Only API endpoints require a key. The UI shell and every static asset load
+        // freely so the webui can prompt for and send the key on API calls (the same
+        // policy as llama-server). /health stays open and OPTIONS is a CORS preflight.
+        if (options_.api_key.empty() || req.method == "OPTIONS" || req.path == "/health" ||
+            (!webui_serving_ || is_api_path(req.path))) {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -430,6 +577,10 @@ void HttpServer::register_routes() {
         res.status           = available ? 200 : 503;
         res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                         "application/json");
+    });
+    server_.Get("/props", [this](const httplib::Request&, httplib::Response& res) {
+        // llama.cpp webui dialect introspection endpoint; see make_props_stub above.
+        res.set_content(make_props_stub(options_).dump(), "application/json");
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
