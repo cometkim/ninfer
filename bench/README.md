@@ -38,6 +38,15 @@ keeps the requested token count exact without adding another generation path. Wh
 enabled and the matrix contains decode work, one ordinary public generation request primes the
 decode graph before warmups and measured repetitions.
 
+For same-binary decode attribution, set process environment variables before constructing an
+Engine: `NINFER_BENCH_PDL=0` removes programmatic serialization from dependent launches;
+`NINFER_BENCH_FUSIONS=0` uses separate Q/K RMSNorm and RoPE and separate attention sigmoid
+gating. Unset variables (or values other than `0`) retain the production routes. These private
+measurement controls are fixed for the process and apply when graphs are captured. They do not
+change artifact formats or sampling settings. Record both controls with each result and alternate
+paired processes on an idle GPU. The fusion control covers those two fusions, not upstream GDN
+fusion or unrelated operators.
+
 ## CLI
 
 ```text

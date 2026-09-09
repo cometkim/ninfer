@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <utility>
+#include "core/measurement_controls.h"
 
 namespace ninfer::pdl {
 
@@ -30,7 +31,7 @@ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), Call
     config.dynamicSmemBytes = launch.dynamic_smem_bytes;
     config.stream           = launch.stream;
     config.attrs            = &attribute;
-    config.numAttrs         = 1;
+    config.numAttrs         = measurement::pdl_enabled() ? 1 : 0;
 
     return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
 }

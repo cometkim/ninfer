@@ -2,6 +2,7 @@
 #include "ninfer/ops/softmax_attention.h"
 
 #include "core/layout.h"
+#include "core/measurement_controls.h"
 #include "core/paged_kv_storage.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
@@ -537,8 +538,9 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
     // The fused reducer epilogue covers the generic (BF16/INT8 KV) routes; every other
     // route applies the gate as the separate sigmoid_mul launch it replaces.
-    const bool fused_gate_route = cache.storage == KvCacheStorage::BFloat16 ||
-                                  cache.storage == KvCacheStorage::Int8Group64;
+    const bool fused_gate_route = measurement::decode_fusions_enabled() &&
+                                 (cache.storage == KvCacheStorage::BFloat16 ||
+                                  cache.storage == KvCacheStorage::Int8Group64);
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
         throw std::invalid_argument("causal_softmax_attention: k/v must be BF16");
     }
@@ -612,8 +614,9 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         throw std::invalid_argument(
             std::string(op) + ": gate must be contiguous BF16 with out's element count");
     }
-    const bool fused_gate_route = cache.storage == KvCacheStorage::BFloat16 ||
-                                  cache.storage == KvCacheStorage::Int8Group64;
+    const bool fused_gate_route = measurement::decode_fusions_enabled() &&
+                                 (cache.storage == KvCacheStorage::BFloat16 ||
+                                  cache.storage == KvCacheStorage::Int8Group64);
 
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =

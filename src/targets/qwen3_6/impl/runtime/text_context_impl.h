@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/nvtx.h"
+#include "core/measurement_controls.h"
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
@@ -382,8 +383,14 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::qk_norm_rope(q, k, *mtp_.q_norm, *mtp_.k_norm, kCfg.rms_eps, rope_for_op,
-                      rope_frequencies_, qn, kn, s);
+    if (measurement::decode_fusions_enabled()) {
+        ops::qk_norm_rope(q, k, *mtp_.q_norm, *mtp_.k_norm, kCfg.rms_eps, rope_for_op,
+                          rope_frequencies_, qn, kn, s);
+    } else {
+        ops::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
+        ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
+        ops::rope(rope_for_op, kCfg.rotary_dim, rope_frequencies_, qn, kn, s);
+    }
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     if (active_sequence_batch_ != 0) {
@@ -844,8 +851,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::qk_norm_rope(q, k, *w.q_norm, *w.k_norm, kCfg.rms_eps, rope_for_op,
-                      rope_frequencies_, qn, kn, s);
+    if (measurement::decode_fusions_enabled()) {
+        ops::qk_norm_rope(q, k, *w.q_norm, *w.k_norm, kCfg.rms_eps, rope_for_op,
+                          rope_frequencies_, qn, kn, s);
+    } else {
+        ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
+        ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
+        ops::rope(rope_for_op, kCfg.rotary_dim, rope_frequencies_, qn, kn, s);
+    }
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
