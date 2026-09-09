@@ -286,8 +286,29 @@ nearest 2*E8 lattice and bounded Rice coding are defined in `kv_cache_append.h` 
 `src/ops/kv_cache/hq_e8_rice_codec.cuh`. Small-T decodes directly into tensor-core tiles and
 writes inverse-rotated FP32 partials. Prompt attention decodes the visible history once into
 caller-owned BF16 scratch (two planes of `max_visible_keys * Hkv * 256` elements).
-The current context limit remains 262144; dither, residual windows and larger YaRN lanes are
-the separate 1M-context port.
+
+The codec also carries two long-window quality levers:
+
+- **Half-cell subtractive dither.** A deterministic counter hash of (kv_head, position, role,
+  word) derives a per-word dither in [-0.5, 0.5)^8, subtracted before the E8 nearest point and
+  added back at every decode site (absolute across escalation attempts, never stored). The
+  per-vector quantization bias is thereby made zero-mean, so it no longer compounds across
+  hundreds of thousands of distractor rows.
+- **Residual window (sink + recent ring).** Every hq cache additionally allocates BF16 side
+  planes `[256, Hkv, 544, layers * table_rows]` for K and V plus per-slot validity words
+  `[17, table_rows]`, all in the codec's rotated frame. Appends dual-write the row exactly
+  (single bf16 rounding) for the first 32 (sink) and last 512 (ring) positions of the owning
+  history and mark the slot's bit; every hq consumer (small-T tile fetch, prompt scratch) reads
+  those keys from the side planes instead of the codec planes. Ring ownership is per execution
+  row with a handover epoch in `KVAddressSpaceStore`: backward trims revalidate the surviving
+  bits, rejected speculative drafts invalidate theirs, and a prefix fork inherits the source
+  row's planes when still coherent (otherwise the fork falls back to codec rows for the
+  inherited window and its own appends repopulate the ring). The prompt route additionally
+  stages the current chunk's bf16 rows into the scratch exact, so every prefill query sees its
+  full in-chunk recent window exact.
+
+The codec planes stay complete — any side row can fall back to the codec path. The current
+context limit remains 262144; larger YaRN lanes are the separate 1M-context port.
 
 K/V 的 code 和 scale planes 具有各自的 dtype、leading extent 和 group size；它们仍共享 page-group
 identity、frontier 和 lifetime。Capacity curve、Device/Host replica、continuation transfer 和 memory

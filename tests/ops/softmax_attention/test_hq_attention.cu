@@ -15,6 +15,7 @@
 #include "core/device.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ops/softmax_attention/dense/causal_cache/launch.h"
 using namespace ninfer;
 using namespace ninfer::ops;
 
@@ -68,8 +69,36 @@ void hadamard(double* v) {
 }
 
 // MSB-first stream within little-endian stored 32-bit words. Recover coset and mod-4 parity
-// from the stripped symbols, then multiply the signed lattice coordinates by the stored norm.
-void decode(const std::uint8_t* codes, const std::uint8_t* meta, double* out) {
+// from the stripped symbols, then multiply the signed lattice coordinates by the stored norm and
+// add back the subtractive dither (host mirror of the codec's counter hash).
+std::uint64_t dither_row_seed(int kv_head, std::int64_t position, bool role_v) {
+    std::uint64_t x = 0x5DEECE66Dull ^
+                      (static_cast<std::uint64_t>(kv_head) * 0x2545F4914F6CDD1Dull) ^
+                      (static_cast<std::uint64_t>(position) * 0x9E3779B97F4A7C15ull) ^
+                      (role_v ? 0xA5A5A5A5A5A5A5A5ull : 0x1B873593B5244C61ull);
+    x ^= x >> 33;
+    x *= 0xFF51AFD7ED558CCDull;
+    x ^= x >> 33;
+    return x;
+}
+
+std::uint64_t dither_word_seed(std::uint64_t row_seed, int word) {
+    std::uint64_t x = row_seed ^ (0x9E3779B97F4A7C15ull * (static_cast<std::uint64_t>(word) + 1u));
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    return x;
+}
+
+double dither(std::uint64_t word_seed, int j) {
+    const std::uint32_t bits = static_cast<std::uint32_t>((word_seed >> (8 * j)) & 0xFFull);
+    return static_cast<double>(bits) * (1.0 / 255.0) - 0.5;
+}
+
+void decode(const std::uint8_t* codes, const std::uint8_t* meta, int kv_head, int position,
+            bool role_v, double* out) {
     const unsigned used = meta[3] | ((meta[4] & 3u) << 8);
     if (!used) {
         std::fill(out, out + D, 0.0);
@@ -81,6 +110,7 @@ void decode(const std::uint8_t* codes, const std::uint8_t* meta, double* out) {
     std::memcpy(&norm, &bits, sizeof(bits));
     const double scale =
         double(__half2float(norm)) * (1 << ((meta[2] >> 4) & 3)) / (double(1.45f) * 16.0);
+    const std::uint64_t row_seed = dither_row_seed(kv_head, position, role_v);
     int cursor = 0;
     auto bit   = [&]() {
         if (cursor >= int(used)) throw std::runtime_error("truncated HQ row");
@@ -89,6 +119,7 @@ void decode(const std::uint8_t* codes, const std::uint8_t* meta, double* out) {
     };
     auto signed_code = [](unsigned z) { return (z & 1) ? -int(z / 2) - 1 : int(z / 2); };
     for (int w = 0; w < D / 8; ++w) {
+        const std::uint64_t wseed = dither_word_seed(row_seed, w);
         unsigned z[8];
         for (auto& value : z) {
             unsigned quotient = 0, remainder = 0;
@@ -101,9 +132,10 @@ void decode(const std::uint8_t* codes, const std::uint8_t* meta, double* out) {
         for (int j = 0; j < 7; ++j) {
             const int s = signed_code(z[j]);
             sum += s;
-            out[w * 8 + j] = (2 * s + coset) * scale;
+            out[w * 8 + j] = (2 * s + coset + dither(wseed, j)) * scale;
         }
-        out[w * 8 + 7] = (4 * signed_code(z[7] / 2) + 2 * (sum & 1) + coset) * scale;
+        out[w * 8 + 7] = (4 * signed_code(z[7] / 2) + 2 * (sum & 1) + coset + dither(wseed, 7)) *
+                         scale;
     }
     if (cursor != int(used)) throw std::runtime_error("HQ used-bit mismatch");
 }
@@ -112,6 +144,9 @@ struct Scenario {
     const char* name;
     int heads, batch, width, window;
     bool masked = false, cached = false, graph = false;
+    // Run with the residual window: side planes + validity words threaded through every view;
+    // the oracle reads sink/recent keys from the exact rotated rows instead of codec rows.
+    bool residual = false;
 };
 
 void run(const Scenario& sc, unsigned seed) {
@@ -159,10 +194,29 @@ void run(const Scenario& sc, unsigned seed) {
     rows.put(hr);
     pos.put(hp);
     valid.put(valid_count);
+    constexpr int kSideRows = 32 + 512;
+    constexpr int kSideWords = 512 / 32 + 1;
+    DeviceArray<__nv_bfloat16> residual_k(sc.residual ? D * KV * kSideRows * B : 0);
+    DeviceArray<__nv_bfloat16> residual_v(sc.residual ? D * KV * kSideRows * B : 0);
+    DeviceArray<std::uint32_t> side_words(sc.residual ? kSideWords * B : 0);
+    if (sc.residual) {
+        CUDA_CHECK(cudaMemset(residual_k.data, 0, residual_k.count * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMemset(residual_v.data, 0, residual_v.count * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMemset(side_words.data, 0, side_words.count * sizeof(std::uint32_t)));
+    }
+    Tensor residual_k_view, residual_v_view, words_view;
+    if (sc.residual) {
+        residual_k_view = Tensor(residual_k.data, DType::BF16, {D, KV, kSideRows, B});
+        residual_v_view = Tensor(residual_v.data, DType::BF16, {D, KV, kSideRows, B});
+        words_view      = Tensor(side_words.data, DType::I32, {kSideWords, B});
+    }
     PagedKVBatchLayerView cache{Tensor(ck.data, DType::U8, {64, Page, KV, pages}),
                                 Tensor(cv.data, DType::U8, {64, Page, KV, pages}),
                                 Tensor(mk.data, DType::U8, {8, Page, KV, pages}),
                                 Tensor(mv.data, DType::U8, {8, Page, KV, pages}),
+                                residual_k_view,
+                                residual_v_view,
+                                words_view,
                                 Tensor(tables.data, DType::I32, {pages_per_batch, B}),
                                 D,
                                 KV,
@@ -173,6 +227,10 @@ void run(const Scenario& sc, unsigned seed) {
             cache.v_pages,
             cache.k_scale_pages,
             cache.v_scale_pages,
+            residual_k_view,
+            residual_v_view,
+            words_view,
+            hr[b],
             Tensor(tables.data + hr[b] * pages_per_batch, DType::I32, {pages_per_batch}),
             D,
             KV,
@@ -242,16 +300,60 @@ void run(const Scenario& sc, unsigned seed) {
             "cache differs from standalone append (or cached read mutated it)");
     const auto got   = output.get();
     double worst_cos = 1, worst_rel = 0;
+    // Residual-window oracle convention (mirrors the pre-rebase gate): a side-selected key's
+    // expected value is the side-plane SLOT ROW as it stands at attention time - whatever the
+    // last dual-write left there - not the key's input row. The current chunk's fill rewrites
+    // the ring slots congruent to its own keys, and consumers read those rows by design; the
+    // scratch/fresh staging writes identical rotated values, so the plane is self-consistent
+    // for both roles. Fresh (prompt) coverage extends the side selection to the whole current
+    // chunk; the ring serves the W keys before it. Cached and small-T reads use the window
+    // tail [total - 512, total).
+    const bool prompt_route =
+        !sc.cached && W > (H == 24 ? 8 : 6) &&
+        detail::causal_attention_resolve_route(H, W, B, Storage, envelope) ==
+            detail::CausalAttentionRoute::Prompt;
+    std::vector<__nv_bfloat16> plane_k, plane_v;
+    if (sc.residual) {
+        plane_k.resize(residual_k.count);
+        plane_v.resize(residual_v.count);
+        CUDA_CHECK(cudaMemcpy(plane_k.data(), residual_k.data, plane_k.size() * 2,
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(plane_v.data(), residual_v.data, plane_v.size() * 2,
+                              cudaMemcpyDeviceToHost));
+    }
+    const auto side_value = [&](int b, int h, int p, bool role_v, double* out_row) {
+        const std::vector<__nv_bfloat16>& plane = role_v ? plane_v : plane_k;
+        const int row = p < 32 ? p : 32 + (p & 511);
+        const __nv_bfloat16* src =
+            plane.data() +
+            (static_cast<std::size_t>(hr[b]) * (32 + 512) + row) * KV * D + std::size_t(h) * D;
+        for (int d = 0; d < D; ++d) out_row[d] = double(__bfloat162float(src[d]));
+    };
+    const auto side_selected = [&](int total, int p) {
+        return p < 32 ||
+               (prompt_route ? p >= history - 512 && p < total : p >= total - 512 && p < total);
+    };
+    std::vector<double> side_row(D);
     for (int b = 0; b < B; ++b) {
         std::vector<double> decoded_k(input_rows * D), decoded_v(input_rows * D);
-        for (int p = 0; p < history + valid_count[b]; ++p) {
-            const int page = ht[hr[b] * pages_per_batch + p / Page];
+        const int total = history + valid_count[b];
+        for (int p = 0; p < total; ++p) {
+            const bool side = sc.residual && side_selected(total, p);
             for (int h = 0; h < KV; ++h) {
+                double* dk = decoded_k.data() + (p * KV + h) * D;
+                double* dv = decoded_v.data() + (p * KV + h) * D;
+                const int page = ht[hr[b] * pages_per_batch + p / Page];
                 const auto row = std::size_t(page * KV + h) * Page + p % Page;
-                decode(expected_ck.data() + row * 64, expected_mk.data() + row * 8,
-                       decoded_k.data() + (p * KV + h) * D);
-                decode(expected_cv.data() + row * 64, expected_mv.data() + row * 8,
-                       decoded_v.data() + (p * KV + h) * D);
+                decode(expected_ck.data() + row * 64, expected_mk.data() + row * 8, h, p, false,
+                       dk);
+                decode(expected_cv.data() + row * 64, expected_mv.data() + row * 8, h, p, true,
+                       dv);
+                if (side) {
+                    side_value(b, h, p, false, side_row.data());
+                    std::copy(side_row.begin(), side_row.end(), dk);
+                    side_value(b, h, p, true, side_row.data());
+                    std::copy(side_row.begin(), side_row.end(), dv);
+                }
             }
         }
         for (int t = 0; t < W; ++t)
@@ -332,6 +434,15 @@ int main() {
             {"prompt t6 short window", 24, 1, 6, 96},
             {"H16 prompt t96", 16, 1, 96, 300},
             {"cached prompt t96", 24, 1, 96, 300, false, true},
+            // Residual-window scenarios: side planes + validity words through every route.
+            {"residual w2560 t8", 24, 1, 8, 2560, false, false, false, true},
+            {"residual ring 700 t6", 24, 1, 6, 700, false, false, false, true},
+            {"residual b3 masked graph", 24, 3, 13, 200, true, false, true, true},
+            {"H16 residual chunks", 16, 2, 13, 400, false, false, false, true},
+            {"residual cached t6", 24, 1, 6, 2560, false, true, false, true},
+            {"residual prompt t96", 24, 1, 96, 300, false, false, false, true},
+            {"residual prompt graph", 24, 1, 96, 300, false, false, true, true},
+            {"H16 residual prompt 1k", 16, 1, 96, 1024, false, false, false, true},
         };
         unsigned seed = 7;
         for (const auto& sc : scenarios) {

@@ -13,10 +13,13 @@ static_assert(kPagedKVPageSize == (1 << kPagedKVPageShift));
 
 struct PagedKVDirectMetadata {
     const std::int32_t* table;
+    std::int32_t slot = 0;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
 
     __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
+
+    __device__ __forceinline__ std::int32_t residual_slot() const { return slot; }
 };
 
 template <bool Masked>
@@ -37,6 +40,8 @@ struct PagedKVBatchMetadata {
     __device__ __forceinline__ const std::int32_t* block_table() const {
         return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
     }
+
+    __device__ __forceinline__ std::int32_t residual_slot() const { return table_rows[0]; }
 };
 
 __device__ __forceinline__ std::int32_t paged_kv_physical_page(const std::int32_t* block_table,

@@ -38,6 +38,9 @@ void launch_hq_partial(const Tensor& q, CacheInput input, const Tensor& pos, flo
         static_cast<std::uint8_t*>(cache.v_pages.data),
         static_cast<std::uint8_t*>(cache.k_scale_pages.data),
         static_cast<std::uint8_t*>(cache.v_scale_pages.data),
+        static_cast<__nv_bfloat16*>(cache.residual_k.data),
+        static_cast<__nv_bfloat16*>(cache.residual_v.data),
+        static_cast<std::uint32_t*>(cache.side_words.data),
         static_cast<const std::int32_t*>(cache.block_tables.data),
         invocation.valid_columns ? static_cast<const std::int32_t*>(invocation.valid_columns->data)
                                  : nullptr,

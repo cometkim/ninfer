@@ -838,6 +838,7 @@ public:
         : pages_(&pages), tables_(&tables), page_capacity_(page_capacity),
           addresses_(address_capacity), free_(address_capacity),
           memberships_(checked_membership_cells(address_capacity, page_capacity)),
+          side_row_epoch_(static_cast<std::size_t>(tables.row_count()), 0),
           free_count_(address_capacity) {
         if (address_capacity == 0 || page_capacity == 0 ||
             page_capacity != tables.logical_page_capacity()) {
@@ -1493,7 +1494,10 @@ public:
                 pages_->commit_coverage(membership(address, page), columns);
             }
         }
-        address.committed_frontier = frontier;
+        address.committed_frontier     = frontier;
+        // Side-plane population follows the last COMMITTED append level; speculative drafts that
+        // write beyond it are accounted by the rejection-time invalidation hook.
+        address.side_written_frontier = frontier;
     }
 
     void destructive_truncate(KVAddressSpaceHandle handle, std::uint32_t frontier) {
@@ -1639,9 +1643,50 @@ public:
         return require(handle).committed_frontier;
     }
 
+    // The frontier through which this address populated its side-plane words (>= committed).
+    [[nodiscard]] std::uint32_t side_written_frontier(KVAddressSpaceHandle handle) const {
+        return require(handle).side_written_frontier;
+    }
+
     [[nodiscard]] std::int32_t bound_row(KVAddressSpaceHandle handle) const noexcept {
         if (!valid(handle) || !addresses_[handle.index_].row) { return -1; }
         return addresses_[handle.index_].row->row_index();
+    }
+
+    // ---- hq residual-window side-plane ownership -------------------------------
+    //
+    // Side planes and validity words are keyed by execution row, but their CONTENT belongs to the
+    // address space that last appended on that row. Every row carries a handover epoch; an
+    // address's rows stay coherent while no other address has acquired the row since its last
+    // acquisition. `acquire_side_rows` returns true when a handover happened (the caller must
+    // clear or repopulate the row's validity words); re-acquisition by the same coherent owner is
+    // a no-op.
+
+    [[nodiscard]] bool side_rows_coherent(KVAddressSpaceHandle handle) const noexcept {
+        return valid(handle) && addresses_[handle.index_].side_row >= 0 &&
+               addresses_[handle.index_].side_row < static_cast<std::int32_t>(side_row_epoch_.size()) &&
+               side_row_epoch_[static_cast<std::size_t>(addresses_[handle.index_].side_row)] ==
+                   addresses_[handle.index_].side_epoch;
+    }
+
+    // The row whose side planes still hold this address's appends, or -1 when incoherent.
+    [[nodiscard]] std::int32_t side_source_row(KVAddressSpaceHandle handle) const noexcept {
+        return side_rows_coherent(handle) ? addresses_[handle.index_].side_row : -1;
+    }
+
+    bool acquire_side_rows(KVAddressSpaceHandle handle) {
+        Address& address = require_active(handle);
+        if (!address.row) { throw std::logic_error("KV address space has no execution row"); }
+        const std::int32_t row = address.row->row_index();
+        if (address.side_row == row &&
+            side_row_epoch_[static_cast<std::size_t>(row)] == address.side_epoch) {
+            return false;
+        }
+        std::uint64_t& epoch = side_row_epoch_[static_cast<std::size_t>(row)];
+        epoch                = epoch == std::numeric_limits<std::uint64_t>::max() ? 1 : epoch + 1;
+        address.side_row     = row;
+        address.side_epoch   = epoch;
+        return true;
     }
 
     [[nodiscard]] bool active(KVAddressSpaceHandle handle) const noexcept {
@@ -1741,8 +1786,13 @@ private:
         std::uint32_t page_count          = 0;
         std::uint32_t committed_frontier  = 0;
         std::uint32_t checkpoint_frontier = 0;
+        // How far this address's appends populated its side-plane words (>= committed_frontier;
+        // rejected speculative drafts write past the last commit and are invalidated explicitly).
+        std::uint32_t side_written_frontier = 0;
         DeviceKVPageReservation reservation;
         std::optional<KVExecutionRowLease> row;
+        std::int32_t side_row    = -1;
+        std::uint64_t side_epoch = 0;
         bool occupied = false;
         bool active   = false;
     };
@@ -1858,6 +1908,7 @@ private:
     std::vector<Address> addresses_;
     std::vector<std::uint32_t> free_;
     std::vector<LogicalKVPageHandle> memberships_;
+    std::vector<std::uint64_t> side_row_epoch_;
     std::vector<DeviceKVPageHandle> publish_scratch_;
     std::uint32_t free_count_ = 0;
 };

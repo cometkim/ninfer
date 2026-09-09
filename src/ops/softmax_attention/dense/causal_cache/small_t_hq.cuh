@@ -26,6 +26,7 @@ template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bo
 __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::uint8_t* codes_k,
     std::uint8_t* codes_v, std::uint8_t* meta_k, std::uint8_t* meta_v,
+    __nv_bfloat16* residual_k, __nv_bfloat16* residual_v, std::uint32_t* side_words,
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
@@ -158,11 +159,21 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
     hq_engine_signs_fill(signs_s);
     __syncthreads();
 
+    // Per-(batch) residual-window state: the side planes and validity words are slot-row indexed
+    // (the batch view carries the full layer slice; the kernel offsets by this row's index).
+    const std::uint32_t* words_row = nullptr;
+    if (residual_k != nullptr) {
+        words_row = side_words + static_cast<std::int64_t>(table_row) * kHqSideWords;
+    }
+
     if constexpr (CacheInput::writes_cache) {
         // Fused append: every split encodes the new K/V rows whose positions fall in its own key
         // range before any block reads them (each key row belongs to exactly one split, so the
         // writer block is also the only reader). (token, role) units flatten over the warps and
-        // the per-warp encoder scratch aliases the qkv tile, unused until q staging below.
+        // the per-warp encoder scratch aliases the qkv tile, unused until q staging below. With
+        // the residual window on, the same rows are dual-written exactly (rotated bf16) into the
+        // side planes and the validity bit is set; the codec planes stay complete so any side row
+        // can fall back to the codec path.
         float* append_scratch = reinterpret_cast<float*>(qkv_s);
         for (int unit = warp; unit < valid_tokens * 2; unit += Wc) {
             const int t          = unit >> 1;
@@ -177,7 +188,15 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
                                kv_cache_hq_row_codes_mut<Geometry>(role_v ? codes_v : codes_k,
                                                                    block_table, kv_head, p),
                                kv_cache_hq_row_meta_mut<Geometry>(role_v ? meta_v : meta_k,
-                                                                  block_table, kv_head, p));
+                                                                  block_table, kv_head, p),
+                               hq_dither_row_seed(kv_head, p, role_v));
+            if (residual_k != nullptr) {
+                hq_store_rotated_row_warp(
+                    src, signs_s,
+                    hq_residual_row<Geometry::KVHeads>(role_v ? residual_v : residual_k, table_row,
+                                                       kv_head, p));
+                hq_ring_mark_valid(const_cast<std::uint32_t*>(words_row), p);
+            }
         }
         __syncthreads();
     }
@@ -253,6 +272,9 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
         // Under the XOR swizzle each lattice word's 8 outputs stay contiguous, so the decoder
         // only remaps the word base (chunk ^ (key row & 7)). Rows outside this split's key
         // range are zeroed so stale shared memory (possibly NaN) never reaches the MMA path.
+        // Sink and recent-ring rows come EXACT from the residual side planes when the feature
+        // is on (one 16 B copy per lane chunk, same swizzle); ring slots whose validity bit was
+        // cleared (rollback / prefix-restore trims) fall back to the codec path.
 #pragma unroll 1
         for (int slot = tid; slot < 2 * Bc * 8; slot += Threads) {
             const bool role_v      = slot >= Bc * 8;
@@ -261,11 +283,27 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
             __nv_bfloat16* row_dst = (role_v ? v_s : k_s) + key_l * D;
             const int key          = k0 + key_l;
             if (key >= split_start && key < split_end) {
-                hq_decode_row_group(kv_cache_hq_row_codes<Geometry>(role_v ? codes_v : codes_k,
-                                                                    block_table, kv_head, key),
-                                    kv_cache_hq_row_meta<Geometry>(role_v ? meta_v : meta_k,
-                                                                   block_table, kv_head, key),
-                                    row_dst, lane8, key_l & 7);
+                const bool side_row =
+                    residual_k != nullptr &&
+                    ((key < static_cast<int>(kCausalHqSinkKeys) && hq_sink_rows_valid(words_row)) ||
+                     (key >= window - static_cast<int>(kCausalHqRecentKeys) &&
+                      hq_ring_slot_valid(words_row, key)));
+                if (side_row) {
+                    const __nv_bfloat16* side = hq_residual_row<Geometry::KVHeads>(
+                        role_v ? residual_v : residual_k, table_row, kv_head, key);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const int chunk = ((lane8 * 4 + j) ^ (key_l & 7)) << 3;
+                        store_vec(row_dst + chunk, load_vec<int4>(side + lane8 * 32 + j * 8));
+                    }
+                } else {
+                    hq_decode_row_group(
+                        kv_cache_hq_row_codes<Geometry>(role_v ? codes_v : codes_k, block_table,
+                                                        kv_head, key),
+                        kv_cache_hq_row_meta<Geometry>(role_v ? meta_v : meta_k, block_table,
+                                                       kv_head, key),
+                        row_dst, lane8, key_l & 7, hq_dither_row_seed(kv_head, key, role_v));
+                }
             } else {
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {

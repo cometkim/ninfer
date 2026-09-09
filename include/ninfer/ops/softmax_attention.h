@@ -15,6 +15,17 @@ namespace ninfer::ops {
 
 inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
 
+// hq-e8-2b residual window: every sequence additionally keeps the first kCausalHqSinkKeys and the
+// last kCausalHqRecentKeys K/V rows EXACT (BF16, codec-rotated frame) in per-slot side planes, and
+// every hq consumer reads those rows from the side planes instead of the codec planes - the
+// per-vector quantization bias compounds over long windows (clean through the native envelope,
+// degrading past it), and exact sink+recent rows are the calibration-free protection. Source
+// selection is PER ROW (the ring boundary sits at an arbitrary window offset), so no tile
+// alignment is required; kCausalHqSinkKeys equals one whole 32-key small-T tile, and the recent
+// window is a power-of-two ring (slot = key & (kCausalHqRecentKeys - 1)).
+inline constexpr std::uint32_t kCausalHqSinkKeys   = 32;
+inline constexpr std::uint32_t kCausalHqRecentKeys = 512;
+
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
@@ -49,9 +60,12 @@ struct ContextAttentionExecutionEnvelope {
  * It does not quantize or round q, probabilities, partial sums or decoded vectors to copy a
  * kernel's private arithmetic. Newly appended rows cross their specified persistent codec
  * boundary before attention observes them.
- * HQ-E8-Rice-2B uses the same formula with R=H256*diag(signs)/16, signed lattice coordinates
- * and exact stored FP16 norms. Its BF16 QK/PV implementation is qualified per output row with
- * cosine > 0.999 and relative L2 < 0.02 against the independent FP64 oracle at both geometries.
+ * HQ-E8-Rice-2B uses the same formula with R=H256*diag(signs)/16, signed lattice coordinates and
+ * exact stored FP16 norms, with the codec's hash-derived half-cell dither added back at decode.
+ * Its BF16 QK/PV implementation is qualified per output row with cosine > 0.999 and relative
+ * L2 < 0.02 against the independent FP64 oracle at both geometries. When the cache view carries
+ * the residual window's side planes, sink and ring-valid recent keys enter the oracle through
+ * their exact rotated bf16 side rows instead of codec-decoded values.
  *
  * Kernels may select native BF16/FP16/INT8/FP8 operands, internal reductions, staging precision
  * and decomposition. These are qualified implementation profiles, not extra public tensor

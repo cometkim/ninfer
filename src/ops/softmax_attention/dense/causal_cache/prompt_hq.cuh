@@ -25,15 +25,21 @@ inline constexpr int kCausalPromptHqScratchThreads = 256;
 // and both roles into contiguous bf16 scratch rows in the ROTATED frame:
 // scratch[role][kv_head][position][256]. EIGHT LANES per row (the cooperative group decoder);
 // every query tile of the FA2 prompt kernel then reads decoded bf16 rows instead of each
-// re-walking the serial Rice stream over its causal prefix. `span` is the scratch row count per
-// head (the execution envelope's key bound); the grid is sized for that bound and threads beyond
-// the device-computed history length return immediately.
+// re-walking the serial Rice stream over its causal prefix. Sink and recent-ring rows come EXACT
+// from the residual side planes when the feature is on (one 16 B copy per lane quarter-row);
+// cleared ring slots fall back to the codec path. Rows of the CURRENT chunk are staged exact by
+// causal_attention_prompt_hq_fresh_rotate_kernel (launched before this kernel on the same
+// stream), so every prefill query sees its full in-chunk recent window exact and the ring serves
+// the W keys before the chunk. `span` is the scratch row count per head (the execution envelope's
+// key bound); the grid is sized for that bound and threads beyond the device-computed history
+// length return immediately.
 template <typename Geometry, typename Metadata>
 __global__ void causal_attention_prompt_hq_scratch_kernel(
     const std::uint8_t* codes_k, const std::uint8_t* codes_v, const std::uint8_t* meta_k,
     const std::uint8_t* meta_v, Metadata metadata, const std::int32_t* __restrict__ positions,
     std::int32_t width, std::int32_t span, __nv_bfloat16* __restrict__ scratch_k,
-    __nv_bfloat16* __restrict__ scratch_v) {
+    __nv_bfloat16* __restrict__ scratch_v, const __nv_bfloat16* residual_k,
+    const __nv_bfloat16* residual_v, const std::uint32_t* side_words, bool has_fresh) {
     const std::int32_t tid =
         static_cast<std::int32_t>(blockIdx.x) * static_cast<std::int32_t>(blockDim.x) +
         static_cast<std::int32_t>(threadIdx.x);
@@ -49,9 +55,67 @@ __global__ void causal_attention_prompt_hq_scratch_kernel(
     const std::int32_t* table = metadata.block_table();
     __nv_bfloat16* dst        = (role_v ? scratch_v : scratch_k) +
                                 (static_cast<std::int64_t>(head) * span + pos) * kHqHeadDim;
-    hq_decode_row_group(
-        kv_cache_hq_row_codes<Geometry>(role_v ? codes_v : codes_k, table, head, pos),
-        kv_cache_hq_row_meta<Geometry>(role_v ? meta_v : meta_k, table, head, pos), dst, lane8);
+    if (has_fresh && pos >= positions[0]) {
+        // Fresh-chunk rows were staged exact by the fresh-rotate pass.
+        return;
+    }
+    const std::int32_t slot = metadata.residual_slot();
+    // With fresh coverage the ring serves the W keys BEFORE the chunk instead of the window tail.
+    const std::int32_t ring_from =
+        has_fresh ? positions[0] - static_cast<std::int32_t>(kCausalHqRecentKeys)
+                  : keys_total - static_cast<std::int32_t>(kCausalHqRecentKeys);
+    const std::uint32_t* words_row =
+        residual_k != nullptr ? side_words + static_cast<std::int64_t>(slot) * kHqSideWords
+                              : nullptr;
+    const bool side_row =
+        residual_k != nullptr &&
+        ((pos < static_cast<std::int32_t>(kCausalHqSinkKeys) && hq_sink_rows_valid(words_row)) ||
+         (pos >= ring_from && pos < keys_total && hq_ring_slot_valid(words_row, pos)));
+    if (side_row) {
+        const __nv_bfloat16* side =
+            hq_residual_row<Geometry::KVHeads>(role_v ? residual_v : residual_k, slot, head, pos);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            store_vec(dst + lane8 * 32 + j * 8, load_vec<int4>(side + lane8 * 32 + j * 8));
+        }
+    } else {
+        hq_decode_row_group(
+            kv_cache_hq_row_codes<Geometry>(role_v ? codes_v : codes_k, table, head, pos),
+            kv_cache_hq_row_meta<Geometry>(role_v ? meta_v : meta_k, table, head, pos), dst,
+            lane8, 0, hq_dither_row_seed(head, pos, role_v));
+    }
+}
+
+// Fresh-chunk rotate: prompt-phase exactness needs the chunk being prefilled, not just the ring.
+// The ring holds the chunk's LAST W rows, so a query early in a wide chunk would otherwise see
+// none of its own recent window exact. This companion pass rotates the CURRENT call's bf16 k/v
+// rows (the tensors are in hand at the prompt route) straight into the scratch - one warp per
+// (token, kv_head, role), the same single FWHT rounding as the dual-write - so every prefill
+// query has its full in-chunk recent window exact, plus the ring for the W keys before the
+// chunk. Warps beyond the valid chunk prefix return immediately.
+template <typename Geometry, typename Metadata>
+__global__ void causal_attention_prompt_hq_fresh_rotate_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, Metadata metadata, std::int32_t width,
+    std::int32_t span, __nv_bfloat16* __restrict__ scratch_k, __nv_bfloat16* __restrict__ scratch_v) {
+    extern __shared__ std::int8_t signs_raw[];
+    hq_engine_signs_fill(reinterpret_cast<std::int8_t*>(signs_raw));
+    __syncthreads();
+    const std::int32_t valid = metadata.valid_tokens(width);
+    const int warp = static_cast<int>(blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5));
+    const std::int64_t units = static_cast<std::int64_t>(valid) * Geometry::KVHeads * 2;
+    if (warp >= units) { return; }
+    const int token   = static_cast<int>(warp % valid);
+    const int unit    = static_cast<int>(warp / valid);
+    const int head    = unit % Geometry::KVHeads;
+    const bool role_v = unit / Geometry::KVHeads != 0;
+    const std::int32_t pos = positions[0] + token;
+    if (pos >= span) { return; }
+    const __nv_bfloat16* src =
+        (role_v ? v : k) + kv_cache_hq_src_index<Geometry>(head, 0, token);
+    __nv_bfloat16* dst = (role_v ? scratch_v : scratch_k) +
+                         (static_cast<std::int64_t>(head) * span + pos) * kHqHeadDim;
+    hq_store_rotated_row_warp(src, reinterpret_cast<std::int8_t*>(signs_raw), dst);
 }
 
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous rotated scratch into the
