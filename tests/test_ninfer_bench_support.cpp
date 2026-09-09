@@ -151,7 +151,7 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
-                                  "--draft-tokens", "6"});
+                                  "--draft-tokens", "8"});
         },
         "unsupported MTP window");
     failures += expect_throws<std::invalid_argument>(
@@ -169,6 +169,8 @@ int test_cli_contract() {
     const qb::BenchOptions k8v4 =
         parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "k8v4"});
     failures += expect(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value, "K8V4 KV");
+    const auto hq = parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "hq-e8-2b"});
+    failures += expect(hq.kv_cache == ninfer::KvCacheStorage::HqE8Rice2B, "HQ KV");
     failures += expect(qb::usage_text("ninfer_bench").find("nvfp4|k8v4") != std::string::npos,
                        "benchmark help omits new KV modes");
     failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Nvfp4Group16), "nvfp4",

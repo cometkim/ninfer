@@ -87,6 +87,12 @@ struct PagedKVStorageLayout {
                     {DType::U8, 128, DType::U8, 16}};
         }
         break;
+    case KvCacheStorage::HqE8Rice2B:
+        // hq-e8-2b: E8-lattice + Rice entropy codec at a fixed 2 bits/dim. The 64-byte code rows
+        // ride the data planes; the 8-byte per-row metadata (FP16 norm, Rice k, escalation,
+        // segment offsets) rides the scale planes as U8.
+        if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::U8, 64, DType::U8, 8}); }
+        break;
     }
     throw std::invalid_argument("unsupported paged KV-cache storage geometry");
 }

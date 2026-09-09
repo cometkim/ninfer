@@ -391,6 +391,12 @@ void causal_attention_small_t_launch(
                                               partial_l, out, stream);
         return;
     }
+    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        causal_attention_small_t_hq_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
+                                           envelope, column_begin, width, partial_acc, partial_m,
+                                           partial_l, out, stream);
+        return;
+    }
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                   static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
@@ -430,6 +436,11 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         causal_attention_cached_small_t_nvfp4_launch(q, pos, scale, cache, envelope, partial_acc,
                                                      partial_m, partial_l, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        causal_attention_cached_small_t_hq_launch(q, pos, scale, cache, envelope, partial_acc,
+                                                  partial_m, partial_l, out, stream);
         return;
     }
     const CausalCachedInput input{};

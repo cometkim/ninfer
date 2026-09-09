@@ -362,6 +362,7 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
                 prompt_limit = width <= 8 ? 0 : 256;
                 break;
             case KvCacheStorage::Fp8KeyNvfp4Value:
+            case KvCacheStorage::HqE8Rice2B:
                 prompt_limit = width <= 4 ? 0 : width <= 8 ? 128 : 320;
                 break;
             }
@@ -421,7 +422,15 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::CausalAttentionRoute route = detail::causal_attention_resolve_route(
             q_heads, width, batch_size, cache_storage, envelope);
-        if (route == detail::CausalAttentionRoute::Prompt) { return std::size_t{0}; }
+        if (route == detail::CausalAttentionRoute::Prompt) {
+            if (cache_storage == KvCacheStorage::HqE8Rice2B && batch_size == 1) {
+                // The rotated-frame scratch planes cover the visible history once per call.
+                const std::int32_t kv_heads = q_heads == 24 ? 4 : 2;
+                return 2ULL * static_cast<std::size_t>(envelope.max_visible_keys) *
+                       static_cast<std::size_t>(kv_heads) * kHeadDim * sizeof(std::uint16_t);
+            }
+            return std::size_t{0};
+        }
         if (route == detail::CausalAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
         for (std::int32_t begin = 0; begin < width;
@@ -442,6 +451,9 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         for (std::int32_t width = min_width; width <= last; ++width) {
             maximum = std::max(maximum, exact_capacity(width));
         }
+    }
+    if (max_width > kMaximumVerifyTokens && cache_storage == KvCacheStorage::HqE8Rice2B) {
+        maximum = std::max(maximum, exact_capacity(max_width));
     }
     return maximum;
 }
@@ -484,8 +496,16 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                                                 partial.m, partial.l, out, stream);
         return;
     }
+    Tensor scratch_k;
+    Tensor scratch_v;
+    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        const auto span = static_cast<std::int32_t>(envelope.max_visible_keys);
+        const auto kv_heads = geometry.kv_heads;
+        scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, span});
+        scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, span});
+    }
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                           cache, out, stream);
+                                           cache, scratch_k, scratch_v, out, stream);
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
@@ -512,7 +532,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
             q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out, stream);
         return;
     }
-    detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+    Tensor scratch_k;
+    Tensor scratch_v;
+    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        const auto span = static_cast<std::int32_t>(envelope.max_visible_keys);
+        scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, geometry.kv_heads, span});
+        scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, geometry.kv_heads, span});
+    }
+    detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, scratch_k,
+                                                     scratch_v, out, stream);
 }
 
 } // namespace ninfer::ops
