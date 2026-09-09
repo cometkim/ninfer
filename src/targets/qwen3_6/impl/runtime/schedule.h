@@ -41,7 +41,7 @@ struct ExecutionCore {
     ProposalHead proposal_head;
     // The Text rope table for this run: the checkpoint-linear table, or the YaRN table when
     // rope scaling is active. Vision and DFlash domains keep their own fixed tables.
-    ops::RopeFrequencies rope_frequencies{};
+    const ops::RopeFrequencies& rope_frequencies;
 };
 
 struct PrefillContext {
