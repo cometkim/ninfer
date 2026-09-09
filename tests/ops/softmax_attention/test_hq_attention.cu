@@ -149,6 +149,108 @@ struct Scenario {
     bool residual = false;
 };
 
+// Sparse represented V rows and zero Q make attention the uniform mean over the logical
+// history. This checks long-cache bounds and carry bands against the exact codec oracle
+// without allocating or evaluating a quadratic CPU reference.
+void run_long_cache(int keys, int width, bool cached, int H = 24) {
+    const int KV = H == 24 ? 4 : 2;
+    const int pages = (keys + Page - 1) / Page;
+    const std::size_t plane_rows = std::size_t(pages) * Page * KV;
+    DeviceArray<std::uint8_t> ck(plane_rows * 64), cv(plane_rows * 64), mk(plane_rows * 8),
+        mv(plane_rows * 8);
+    DeviceArray<std::int32_t> tables(pages), positions(width), rows(1);
+    std::vector<std::int32_t> ht(pages), hp(width);
+    for (int p = 0; p < pages; ++p) ht[p] = pages - 1 - p;
+    for (int t = 0; t < width; ++t) hp[t] = keys - width + t;
+    tables.put(ht);
+    positions.put(hp);
+    DeviceArray<__nv_bfloat16> q(D * H * width), k(D * KV * width), v(D * KV * width),
+        output(D * H * width);
+    PagedKVBatchLayerView cache{Tensor(ck.data, DType::U8, {64, Page, KV, pages}),
+                               Tensor(cv.data, DType::U8, {64, Page, KV, pages}),
+                               Tensor(mk.data, DType::U8, {8, Page, KV, pages}),
+                               Tensor(mv.data, DType::U8, {8, Page, KV, pages}),
+                               {}, {}, {}, Tensor(tables.data, DType::I32, {pages, 1}),
+                               D, KV, Storage};
+    PagedKVLayerView single{cache.k_pages, cache.v_pages, cache.k_scale_pages,
+                           cache.v_scale_pages, {}, {}, {}, 0,
+                           Tensor(tables.data, DType::I32, {pages}), D, KV, Storage};
+    Tensor tq(q.data, DType::BF16, {D, H, width}), tk(k.data, DType::BF16, {D, KV, width}),
+        tv(v.data, DType::BF16, {D, KV, width}), tp(positions.data, DType::I32, {width}),
+        tr(rows.data, DType::I32, {1}), out(output.data, DType::BF16, {D, H, width});
+    const int probe_positions[]{0, std::min(262145, keys - width - 2), keys - width - 1};
+    DeviceArray<__nv_bfloat16> probe_k(D * KV), probe_v(D * KV);
+    DeviceArray<std::int32_t> probe_pos(1);
+    std::vector<double> expected_sum(KV * D, 0.0);
+    for (int probe = 0; probe < 3; ++probe) {
+        const int p = probe_positions[probe];
+        std::vector<__nv_bfloat16> values(D * KV);
+        for (int h = 0; h < KV; ++h)
+            for (int d = 0; d < D; ++d)
+                values[h * D + d] = __float2bfloat16(float((d % 7 - 3) * (probe + 1) + h));
+        probe_v.put(values);
+        probe_pos.put({p});
+        kv_cache_append(Tensor(probe_k.data, DType::BF16, {D, KV, 1}),
+                        Tensor(probe_v.data, DType::BF16, {D, KV, 1}),
+                        Tensor(probe_pos.data, DType::I32, {1}), single, nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        for (int h = 0; h < KV; ++h) {
+            const auto row = std::size_t(ht[p / Page] * KV + h) * Page + p % Page;
+            std::uint8_t code[64], meta[8];
+            CUDA_CHECK(cudaMemcpy(code, cv.data + row * 64, 64, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(meta, mv.data + row * 8, 8, cudaMemcpyDeviceToHost));
+            double decoded[D];
+            decode(code, meta, h, p, true, decoded);
+            hadamard(decoded);
+            for (int d = 0; d < D; ++d) expected_sum[h * D + d] += decoded[d] * sign(d) / 16;
+        }
+    }
+    const CausalAttentionExecutionEnvelope envelope{std::uint32_t(keys), std::uint32_t(keys)};
+    const AttentionHeadGeometry geometry{D, H, KV};
+    const auto capacity = causal_softmax_attention_workspace_capacity_bytes(
+        geometry, Storage, envelope, 1, width, width);
+    DeviceArray<std::uint8_t> scratch(capacity);
+    WorkspaceArena workspace(DeviceSpan{scratch.data, capacity});
+    std::printf("long cache H%d keys=%d width=%d cached=%d\n", H, keys, width, int(cached));
+    std::fflush(stdout);
+    if (cached)
+        causal_softmax_attention_cached(tq, tp, geometry, .0625f, single, envelope,
+                                         workspace, out, nullptr);
+    else
+        causal_softmax_attention(tq, tk, tv, tp, Tensor{}, tr, geometry, .0625f, cache,
+                                envelope, workspace, out, nullptr);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const auto actual = output.get();
+    double worst_rel = 0;
+    for (int t = 0; t < width; ++t)
+        for (int h = 0; h < H; ++h) {
+            double error = 0, norm = 0, dot = 0, actual_norm = 0;
+            for (int d = 0; d < D; ++d) {
+                const double ref = expected_sum[(h / (H / KV)) * D + d] / (hp[t] + 1);
+                const double got = __bfloat162float(actual[(t * H + h) * D + d]);
+                error += (got - ref) * (got - ref);
+                norm += ref * ref;
+                dot += ref * got;
+                actual_norm += got * got;
+            }
+            const double rel = std::sqrt(error / norm), cosine = dot / std::sqrt(norm * actual_norm);
+            worst_rel = std::max(worst_rel, rel);
+            if (!(rel < .02 && cosine > .999))
+                throw std::runtime_error("long-cache uniform-attention oracle mismatch");
+        }
+    std::printf("  long-cache relative L2 %.6f ok\n", worst_rel);
+}
+
+void run_long_caches() {
+    for (int keys : {262208, 524032, 1048320}) {
+        run_long_cache(keys, 96, false);
+        run_long_cache(keys, 96, true);
+        run_long_cache(keys, 1, true);
+    }
+    run_long_cache(1048320, 6, false, 16);
+    run_long_cache(1048320, 6, true, 16);
+}
+
 void run(const Scenario& sc, unsigned seed) {
     const int H = sc.heads, KV = H == 24 ? 4 : 2, B = sc.batch, W = sc.width;
     const int history = sc.window - W, pages_per_batch = (sc.window + Page - 1) / Page;
@@ -409,12 +511,17 @@ void run(const Scenario& sc, unsigned seed) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int failures = 0;
     try {
         cudaDeviceProp prop{};
         CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
         std::printf("device: %s\n", prop.name);
+        if (argc == 2 && std::strcmp(argv[1], "--long-cache") == 0) {
+            run_long_caches();
+            std::puts("OK long-cache bounds");
+            return 0;
+        }
         const Scenario scenarios[]{
             {"w32 t1", 24, 1, 1, 32},
             {"w64 t1", 24, 1, 1, 64},
@@ -453,6 +560,7 @@ int main() {
                 ++failures;
             }
         }
+        run_long_caches();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         ++failures;

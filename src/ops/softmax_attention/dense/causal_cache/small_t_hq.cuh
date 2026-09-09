@@ -43,7 +43,6 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
     constexpr int QKKs          = D / 16;
     constexpr int PVNt          = D / 8;
     constexpr int PVKs          = Bc / 16;
-    constexpr int PageIds       = 64;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
     constexpr int QkvRows       = 2 * Bc;
@@ -55,7 +54,6 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
 
     __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
     __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
-    __shared__ std::int32_t physical_pages_s[PageIds];
     __shared__ __align__(16) std::int8_t signs_s[kHqHeadDim];
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
@@ -150,12 +148,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
     }
     const int first_tile = (split_start / Bc) * Bc;
     const int key_blocks = div_up(split_end - first_tile, Bc);
-    const int first_page = first_tile >> kPagedKVPageShift;
-    const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
-    for (int page = tid; page < page_count; page += Threads) {
-        physical_pages_s[page] = block_table[first_page + page];
-    }
-
+    // HQ row decoders resolve physical pages directly from block_table. Do not stage the
+    // whole split in a fixed-size page array: long histories can span more than 64 pages.
     hq_engine_signs_fill(signs_s);
     __syncthreads();
 
@@ -254,7 +248,6 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
                     smem_addr(&qkv_s[arow * D + causal_small_t_tc_swz(arow, acol)]));
     }
     __syncthreads();
-    int physical_page = physical_pages_s[0];
     float acc[PVNt][4];
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
@@ -265,9 +258,6 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
-        if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
-            physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
-        }
         // Tile source: group-decode the K/V rows straight into the swizzled tile positions.
         // Under the XOR swizzle each lattice word's 8 outputs stay contiguous, so the decoder
         // only remaps the word base (chunk ^ (key row & 7)). Rows outside this split's key

@@ -238,8 +238,8 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
             else if (cache_storage == KvCacheStorage::Nvfp4Group16)
                 target_ctas = narrow ? 320 : 160;
             const int grid_limit = div_up(target_ctas, 4 * batch_size);
-            // A split stages at most 64 physical-page IDs. Leave two 64-key pages for
-            // key-tile rounding and page alignment at the 262144-key resource limit.
+            // Target 64 physical pages per split, reserving two for tile/page alignment.
+            // At the split-count ceiling, the 128-entry staging still covers the 524k limit.
             const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
             return std::min(capacity, std::max({4, grid_limit, page_limit}));
         }

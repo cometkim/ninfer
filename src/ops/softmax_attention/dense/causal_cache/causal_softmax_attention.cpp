@@ -22,6 +22,11 @@ constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 
+constexpr std::uint32_t visible_key_ceiling(KvCacheStorage storage) {
+    return storage == KvCacheStorage::HqE8Rice2B ? kCausalAttentionMaximumVisibleKeys
+                                                : kCausalAttentionMaximumLinearVisibleKeys;
+}
+
 std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
                                            std::int32_t batch_size, KvCacheStorage storage,
                                            CausalAttentionExecutionEnvelope envelope) {
@@ -176,7 +181,7 @@ void validate_envelope(CausalAttentionExecutionEnvelope envelope, const PagedKVL
                        std::int32_t tokens, const char* op) {
     const std::uint32_t capacity = validate_cache(cache, cache.num_kv_heads, op);
     if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > visible_key_ceiling(cache.storage) ||
         envelope.max_visible_keys > capacity) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope");
     }
@@ -255,15 +260,9 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
         throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
     }
     const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
-    // U8 (hq-e8-2b) reaches the absolute envelope ceiling; the paged BF16/I8 decode kernels
-    // stage a fixed number of page ids per split, so their linear envelopes stay capped.
-    const std::uint32_t ceiling =
-        cache.storage == KvCacheStorage::HqE8Rice2B
-            ? kCausalAttentionMaximumVisibleKeys
-            : kCausalAttentionMaximumLinearVisibleKeys;
     if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > ceiling ||
+        envelope.max_visible_keys > visible_key_ceiling(cache.storage) ||
         envelope.max_visible_keys > capacity ||
         (!masked && envelope.max_visible_keys < static_cast<std::uint32_t>(width))) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope or table");
@@ -436,7 +435,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     if (!supported_dtype || batch_size <= 0 || batch_size > kMaximumBatchSize || min_width <= 0 ||
         max_width < min_width || (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys) {
+        envelope.max_visible_keys > visible_key_ceiling(cache_storage)) {
         throw std::invalid_argument(
             "causal_softmax_attention workspace: invalid profile or interval");
     }
