@@ -52,8 +52,19 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * vector occupies 128 code bytes plus 16 scale bytes. K8V4 uses the existing 256-byte row-scaled
  * FP8 K code plus one FP16 scale, and the 144-byte NVFP4 representation for V.
  *
+ * HQ-E8-Rice-2B stores both K and V as 64 U8 code bytes and 8 U8 metadata bytes per D256 row.
+ * The fixed transform is R=H256*diag(signs)/16 with signs from seed 0x5EED01 (the codec's
+ * engine-global hash). Normalize R*x by ||x||/16 and quantize 8-D words to the nearest point
+ * of 2*E8 at alpha=1.45f. Strip the shared coset/parity and Rice-code the signed coordinates.
+ * Halve alpha until the row fits 512 bits, at most twice, then use the zero-lattice fallback.
+ * Metadata stores the FP16_RNE norm, Rice k, escalation, used-bit count and segment offsets;
+ * unused code words are zero. A represented rotated coordinate is the signed lattice code
+ * times the exact stored norm times 2^escalation/(alpha*16). The codec header defines the
+ * exact word packing and metadata fields. No dither or residual window is part of this profile.
+ *
  * INT8 and FP8 apply the fixed normalized D256 Hadamard preparation to K; NVFP4 and K8V4 apply it
- * to both K and V. Every transform is evaluated in FP32 from represented BF16 source values. The
+ * to both K and V. HQ applies its signed transform to both K and V. Every transform is evaluated
+ * in FP32 from represented BF16 source values. The
  * paired Q and output interpretation belongs to the causal softmax_attention contract. Transform
  * results and raw code/scale bytes are not standalone mathematical outputs. Standalone and fused
  * append produce byte-identical cache representations. Every addressed code/value and scale is

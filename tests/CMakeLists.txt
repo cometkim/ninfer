@@ -269,6 +269,11 @@ ninfer_add_op_test(ninfer_linear_topk_test
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES ops/test_candidate_selector.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_hq_codec_test
+  SOURCES ops/test_hq_codec.cu)
+ninfer_add_op_test(ninfer_hq_attention_test
+  SOURCES ops/softmax_attention/test_hq_attention.cu
+  LIBRARIES ninfer_ops)
 
 # Stateful, fused, and exact-shape Ops remain central even when the current implementation domain
 # is one checkpoint/device.

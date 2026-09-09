@@ -78,7 +78,7 @@ MTP 与 DFlash 在一个 Engine 内互斥，因此当前最多有两个 growing 
 | MTP | MTP persistent K/V 与其 code/scale planes | MTP KV frontier |
 | DFlash Full | DFlash persistent full-context K/V | DFlash context frontier |
 
-Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16 或 K8V4
+Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16、K8V4 或 HQ-E8-Rice-2B
 KV profile；DFlash Full 使用自己的 BF16 profile。`BFloat16` 名称下的物理 layout 为 BF16 K、FP16 V，
 写入端将 BF16 V 一次转换为 FP16。K8V4 是封闭的非对称 profile，不是运行时 bit-width 组合：K 固定为
 FP8-E4M3FN-row256，V 固定为 NVFP4-G16。
@@ -277,6 +277,17 @@ D256 Main/MTP profile 的单 token/head 物理 payload 为：
 | FP8-E4M3FN-row256 | 256 B + 2 B | 256 B + 2 B | 516 B |
 | NVFP4-G16 | 128 B + 16 B | 128 B + 16 B | 288 B |
 | K8V4 | 256 B + 2 B | 128 B + 16 B | 402 B |
+| HQ-E8-Rice-2B | 64 B + 8 B metadata | 64 B + 8 B metadata | 144 B |
+
+`hq-e8-2b` is the sixth closed D256 profile for Main Text and MTP. Both code planes are U8
+with extent 64; both scale-plane slots hold U8 metadata with extent 8. The metadata carries the
+FP16 row norm, Rice parameter, escalation and bit offsets. The fixed signed Hadamard transform,
+nearest 2*E8 lattice and bounded Rice coding are defined in `kv_cache_append.h` and
+`src/ops/kv_cache/hq_e8_rice_codec.cuh`. Small-T decodes directly into tensor-core tiles and
+writes inverse-rotated FP32 partials. Prompt attention decodes the visible history once into
+caller-owned BF16 scratch (two planes of `max_visible_keys * Hkv * 256` elements).
+The current context limit remains 262144; dither, residual windows and larger YaRN lanes are
+the separate 1M-context port.
 
 K/V 的 code 和 scale planes 具有各自的 dtype、leading extent 和 group size；它们仍共享 page-group
 identity、frontier 和 lifetime。Capacity curve、Device/Host replica、continuation transfer 和 memory

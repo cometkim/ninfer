@@ -49,6 +49,9 @@ struct ContextAttentionExecutionEnvelope {
  * It does not quantize or round q, probabilities, partial sums or decoded vectors to copy a
  * kernel's private arithmetic. Newly appended rows cross their specified persistent codec
  * boundary before attention observes them.
+ * HQ-E8-Rice-2B uses the same formula with R=H256*diag(signs)/16, signed lattice coordinates
+ * and exact stored FP16 norms. Its BF16 QK/PV implementation is qualified per output row with
+ * cosine > 0.999 and relative L2 < 0.02 against the independent FP64 oracle at both geometries.
  *
  * Kernels may select native BF16/FP16/INT8/FP8 operands, internal reductions, staging precision
  * and decomposition. These are qualified implementation profiles, not extra public tensor
@@ -109,7 +112,7 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6) and [256,16,2] (group 8), with
  * scale=1/sqrt(256). q/out are contiguous BF16 [D,Hq,W,B], k/v are contiguous BF16
  * [D,Hkv,W,B], positions are contiguous device I32 [W,B], kv_table_rows is contiguous device I32
- * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, or K8V4. valid_columns is
+ * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, K8V4, or HQ-E8-Rice-2B. valid_columns is
  * either contiguous device I32 [B] or an empty Tensor meaning every row has W live columns. This
  * dense/masked topology is chosen by the caller and never inferred by copying device metadata to
  * the host. B=1 accepts every positive W in the current prompt/decode domain; B=2..8 accepts
@@ -123,8 +126,9 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * through the inert tail; an empty row uses zero positions. Other tail values are safe dummies.
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
- * The registered prompt route consumes the paged cache directly and requires zero transient
- * workspace. Small-T routes may use the split state returned by the capacity query below.
+ * HQ prompt attention materializes two rotated BF16 scratch planes covering the visible-key
+ * envelope. Other prompt routes consume the pages directly, with split state where selected.
+ * Small-T routes use split state. All transient capacity comes from the capacity query below.
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
@@ -157,7 +161,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
  * head geometry, cache dtype, and execution envelope are fixed implementation-profile inputs.
- * Invalid profiles or intervals throw; an interval containing only prompt routes returns zero.
+ * Invalid profiles or intervals throw; scratch-free intervals return zero.
  */
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,

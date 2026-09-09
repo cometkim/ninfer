@@ -52,6 +52,7 @@ Ongoing feature experimentation:
 | `feat/windows-port` | `master` | rebuilt clean: the Windows build layer + MSVC flags + TMA descriptor blocks + UTF8PROC_STATIC | `squash(feat/windows-port)` |
 | `feat/webui` | `feat/windows-port` | in-process llama.cpp WebUI + server dialect; upstream PR candidate | `squash(feat/webui)` (stack bottom) |
 | `feat/mtp7` | `master` | fork-only: MTP draft tokens to 7 | `squash(feat/mtp7)` |
+| `feat/hyperquant` | `feat/windows-port` | self-contained hq-e8-2b KV storage profile (codec, append/prompt/small-t routes, product surface) | `squash(feat/hyperquant)` |
 
 When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
 its row into the upstream lineage note.
@@ -176,6 +177,14 @@ What this fork adds on top (one squashed commit per feature branch, per
 
 - **`feat/mtp7`** — MTP draft windows extended to 7 on the 27B (four coordinated bounds:
   product gate, kMaximumMtpDraftTokens, family decode-frame domain, op domain).
+
+- **`feat/hyperquant`** — the `hq-e8-2b` KV cache: E8-lattice + Rice entropy coding at
+  2.25 bits/scalar (3.7× smaller payload than INT8 at 262k context), prompt attention over
+  one-shot decoded rotated bf16 scratch, an 8-lane cooperative k=0 Rice decoder with a
+  parallel unary packer, and a tensor-core tile-source decode kernel (the hq route is a
+  KV-source policy of the bf16 TC kernel). After the residual-window + dither work below,
+  hq decode matches or beats same-session INT8 at the measured cells (tg128 80.6 vs 71.7,
+  pp32k+tg64 62.2 vs 58.1 tok/s).
 
 Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
 requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from upstream.
