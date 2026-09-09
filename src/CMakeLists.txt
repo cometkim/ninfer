@@ -22,6 +22,7 @@ add_library(ninfer_core STATIC
   core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
   core/host_kv_arena.cpp
+  core/kv_ring_bits.cu
   core/paged_kv_cache.cpp
   core/linear_attention_state.cpp
   core/layout.cpp
@@ -83,6 +84,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/rmsnorm.cu
   ops/launcher/rmsnorm_pack_tail.cu
   ops/launcher/rope.cu
+  ops/launcher/qk_norm_rope.cu
   ops/launcher/sampling.cu
   ops/launcher/scalar.cu
   ops/launcher/scatter.cu
@@ -93,18 +95,30 @@ add_library(ninfer_ops STATIC
   ops/rmsnorm_rope/rmsnorm_rope.cpp
   ops/rmsnorm_rope/launch.cu
   ops/context_kv_materialize/context_kv_materialize.cpp
+  ops/context_kv_materialize/context_kv_key_post.cu
   ops/context_kv_materialize/materialize.cu
+  ops/context_kv_materialize/materialize_nvfp4.cu
   ops/candidate_selector/bf16/candidate_selector_path.cu
+  ops/candidate_selector/nvfp4/candidate_selector_path_nvfp4.cu
   ops/candidate_selector/bf16/candidate_selector_path_plan.cpp
   # Softmax Attention and KV-cache state transitions.
   ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
   ops/softmax_attention/dense/causal_cache/small_t.cu
+  ops/softmax_attention/dense/causal_cache/small_t_tc_i8.cu
+  ops/softmax_attention/dense/causal_cache/small_t_tc_bf16.cu
   ops/softmax_attention/dense/causal_cache/small_t_fp8.cu
+  ops/softmax_attention/dense/causal_cache/small_t_fp8_tc.cu
   ops/softmax_attention/dense/causal_cache/small_t_nvfp4.cu
+  ops/softmax_attention/dense/causal_cache/small_t_nvfp4_tc.cu
+  ops/softmax_attention/dense/causal_cache/small_t_hq.cu
+  ops/softmax_attention/dense/causal_cache/small_t_hq_h24.cu
+  ops/softmax_attention/dense/causal_cache/small_t_hq_h16.cu
   ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+  ops/softmax_attention/dense/causal_cache/small_t_k8v4_tc.cu
   ops/softmax_attention/dense/causal_cache/prompt.cu
   ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
   ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cu
+  ops/softmax_attention/dense/causal_cache/prompt_hq.cu
   ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu
   ops/softmax_attention/dense/packed/packed_softmax_attention.cpp
   ops/softmax_attention/dense/packed/launch.cu
@@ -115,6 +129,7 @@ add_library(ninfer_ops STATIC
   ops/kv_cache/append/kv_cache_append.cpp
   ops/kv_cache/append/launch.cu
   ops/kv_cache/append/nvfp4_launch.cu
+  ops/kv_cache/append/hq_launch.cu
   ops/kv_cache/append/k8v4_launch.cu
   # Gated DeltaNet Linear Attention core.
   ops/linear_attention/gated_delta_net/gated_delta_net.cpp
@@ -136,6 +151,7 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
+  ops/attn_input_proj/nvfp4/nvfp4_dflash2_attn_input.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
@@ -173,7 +189,9 @@ add_library(ninfer_ops STATIC
   ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
   ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
+  ops/dynamic_grouped_conv/dynamic_grouped_conv_add_finish.cu
   ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_partial.cu
+  ops/dynamic_grouped_conv/nvfp4/nvfp4_dynamic_grouped_conv_prepare.cu
   ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_reduce.cu
   ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp
   ops/dynamic_grouped_conv/w8/w8_dynamic_grouped_conv_add_materialized.cu
@@ -193,6 +211,7 @@ add_library(ninfer_ops STATIC
   ops/linear/nvfp4/nvfp4_format.cpp
   ops/linear/nvfp4/nvfp4_gemv.cu
   ops/linear/nvfp4/nvfp4_small_t.cu
+  ops/linear/nvfp4/nvfp4_small_t_dflash2.cu
   ops/linear/nvfp4/nvfp4_w4a4.cu
   ops/linear/nvfp4/nvfp4_dispatch.cpp
   ops/linear/q4/q4_small_t_mma.cu
@@ -248,6 +267,14 @@ add_library(ninfer_ops STATIC
   ops/linear/w8/w8_rowsplit_gemm_simt.cu
   ops/linear/w8/w8_rowsplit_gemm_decode.cu
   ops/linear/w8/w8_small_t.cu
+  ops/linear/w8/w8_small_t_exact_mtp_input.cu
+  ops/linear/w8/w8_small_t_exact_mtp_attention.cu
+  ops/linear/w8/w8_small_t_exact_mtp_attention_output.cu
+  ops/linear/w8/w8_small_t_exact_mtp_gate_up.cu
+  ops/linear/w8/w8_small_t_exact_mtp_down.cu
+  ops/linear/w8/w8_small_t_exact_35b_mtp_projection.cu
+  ops/linear/w8/w8_small_t_exact_dflash2_attention.cu
+  ops/linear/w8/w8_small_t_vocabulary.cu
   ops/linear/w8/w8_rowsplit_gemm_splitk.cu
   ops/linear/w8/w8_dispatch.cpp
   ops/linear_pair/w8/w8_pair_decode.cu
@@ -297,6 +324,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/rmsnorm.cpp
   ops/wrapper/rmsnorm_pack_tail.cpp
   ops/wrapper/rope.cpp
+  ops/wrapper/qk_norm_rope.cpp
   ops/wrapper/sampling.cpp
   ops/wrapper/scalar.cpp
   ops/wrapper/scatter.cpp
@@ -314,6 +342,7 @@ add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+target_compile_definitions(ninfer_text PUBLIC UTF8PROC_STATIC)
 
 add_library(ninfer_media_decode STATIC
   media/decode/decode.cpp)
@@ -326,6 +355,9 @@ if(NINFER_BUILD_MEDIA_ACQUIRE)
     product/media_acquire/acquire.cpp)
   ninfer_internal_includes(ninfer_media_acquire)
   target_link_libraries(ninfer_media_acquire PRIVATE ${NINFER_CURL_TARGET})
+  if(WIN32)
+    target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)
@@ -390,11 +422,12 @@ if(NINFER_BUILD_SERVE)
     serve/request_log.cpp
     serve/http_server.cpp
     serve/openai_responses_http.cpp
-    serve/serve_options.cpp)
+    serve/serve_options.cpp
+    serve/webui_update.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire ninfer_product_logging ${NINFER_CUDART_TARGET})
+    PRIVATE ninfer_media_acquire ninfer_product_logging ${NINFER_CUDART_TARGET} winhttp)
 endif()

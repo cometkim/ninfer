@@ -13,7 +13,11 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -667,7 +671,13 @@ int main() {
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
+        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(
+#ifdef _WIN32
+            ::_getpid()
+#else
+            ::getpid()
+#endif
+            )) +
          ".jsonl");
     std::filesystem::remove(log_path);
     {

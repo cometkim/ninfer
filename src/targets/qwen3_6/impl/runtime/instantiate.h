@@ -25,3 +25,12 @@
 #include "targets/qwen3_6/impl/runtime/mtp_impl.h"
 #include "targets/qwen3_6/impl/runtime/request_plan_impl.h"
 #include "targets/qwen3_6/impl/runtime/program_impl.h"
+
+// MSVC does not implicitly instantiate these family plan members in the TUs that
+// use them through std::optional; instantiate the classes explicitly so every
+// compiler emits the special members exactly once from this exact target TU.
+template class ninfer::targets::qwen3_6::SequencePlan<NINFER_QWEN36_VARIANT>;
+template class ninfer::targets::qwen3_6::RequestBasePlan<NINFER_QWEN36_VARIANT>;
+template class ninfer::targets::qwen3_6::AdmissionCandidate<NINFER_QWEN36_VARIANT>;
+template class ninfer::targets::qwen3_6::CapturePressureCandidate<NINFER_QWEN36_VARIANT>;
+template class ninfer::targets::qwen3_6::ResourcePlan<NINFER_QWEN36_VARIANT>;

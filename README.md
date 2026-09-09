@@ -49,6 +49,7 @@ Ongoing feature experimentation:
 | feat branch | stacked on | status | squashed on dev as |
 |---|---|---|---|
 | `feat/msvc-test-constexpr` | `master` | upstream PR candidate (constexpr to const test constants) | `squash(feat/msvc-test-constexpr)` |
+| `feat/windows-port` | `master` | rebuilt clean: the Windows build layer + MSVC flags + TMA descriptor blocks + UTF8PROC_STATIC | `squash(feat/windows-port)` |
 
 When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
 its row into the upstream lineage note.
