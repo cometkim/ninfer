@@ -51,6 +51,7 @@ Ongoing feature experimentation:
 | `feat/msvc-test-constexpr` | `master` | upstream PR candidate (constexpr to const test constants) | `squash(feat/msvc-test-constexpr)` |
 | `feat/windows-port` | `master` | rebuilt clean: the Windows build layer + MSVC flags + TMA descriptor blocks + UTF8PROC_STATIC | `squash(feat/windows-port)` |
 | `feat/webui` | `feat/windows-port` | in-process llama.cpp WebUI + server dialect; upstream PR candidate | `squash(feat/webui)` (stack bottom) |
+| `feat/mtp7` | `master` | fork-only: MTP draft tokens to 7 | `squash(feat/mtp7)` |
 
 When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
 its row into the upstream lineage note.
@@ -172,6 +173,9 @@ What this fork adds on top (one squashed commit per feature branch, per
   gates API paths only (llama-server parity); the OpenAI endpoints additionally accept the
   llama.cpp server dialect (`chat_template_kwargs.enable_thinking`, negative `max_tokens`,
   `/props` introspection, `status`/`meta.n_ctx` on the models objects).
+
+- **`feat/mtp7`** — MTP draft windows extended to 7 on the 27B (four coordinated bounds:
+  product gate, kMaximumMtpDraftTokens, family decode-frame domain, op domain).
 
 Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
 requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from upstream.
