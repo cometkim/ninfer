@@ -147,6 +147,7 @@ struct Scenario {
     // Run with the residual window: side planes + validity words threaded through every view;
     // the oracle reads sink/recent keys from the exact rotated rows instead of codec rows.
     bool residual = false;
+    bool broad_envelope = false;
 };
 
 // Sparse represented V rows and zero Q make attention the uniform mean over the logical
@@ -249,6 +250,7 @@ void run_long_caches() {
     }
     run_long_cache(1048320, 6, false, 16);
     run_long_cache(1048320, 6, true, 16);
+    run_long_cache(1048320, 1, true, 16);
 }
 
 void run(const Scenario& sc, unsigned seed) {
@@ -362,8 +364,9 @@ void run(const Scenario& sc, unsigned seed) {
     Tensor tr(rows.data, DType::I32, {B}), tvalid(valid.data, DType::I32, {B});
     Tensor out(output.data, DType::BF16, {D, H, W, B});
     const AttentionHeadGeometry geometry{D, H, KV};
-    const CausalAttentionExecutionEnvelope envelope{std::uint32_t(sc.window),
-                                                    std::uint32_t(sc.window)};
+    const CausalAttentionExecutionEnvelope envelope{
+        sc.broad_envelope ? 1u : std::uint32_t(sc.window),
+        sc.broad_envelope ? std::uint32_t(pages_per_batch * Page) : std::uint32_t(sc.window)};
     const auto capacity =
         causal_softmax_attention_workspace_capacity_bytes(geometry, Storage, envelope, B, W, W);
     DeviceArray<std::uint8_t> scratch(capacity);
@@ -550,6 +553,15 @@ int main(int argc, char** argv) {
             {"residual prompt t96", 24, 1, 96, 300, false, false, false, true},
             {"residual prompt graph", 24, 1, 96, 300, false, false, true, true},
             {"H16 residual prompt 1k", 16, 1, 96, 1024, false, false, false, true},
+            // The narrow decode tile changes row/dimension ownership and active splits.
+            // Nonzero-Q oracle cases protect both geometries, append/cached state,
+            // residual rows, masked batches, and graphs with spare launch capacity.
+            {"narrow threshold graph", 24, 1, 1, 1025, false, false, true, true, true},
+            {"narrow cached", 24, 1, 1, 8193, false, true, false, false, true},
+            {"H16 narrow append", 16, 1, 1, 4097, false, false, false, true, true},
+            {"H16 narrow cached graph", 16, 1, 1, 8193, false, true, true, false, true},
+            {"narrow masked graph", 24, 3, 1, 2049, true, false, true, true, true},
+            {"narrow b8", 24, 8, 1, 1025, false, false, false, true, true},
         };
         unsigned seed = 7;
         for (const auto& sc : scenarios) {

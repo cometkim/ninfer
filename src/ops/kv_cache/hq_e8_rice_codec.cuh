@@ -672,10 +672,12 @@ __device__ __forceinline__ void hq_group_scan_window(unsigned long long w, std::
     }
 }
 
-__device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
-                                                    const std::uint8_t* meta,
-                                                    __nv_bfloat16* out, int lane,
-                                                    int xor_chunk, std::uint64_t dither_seed) {
+template <bool Packed = true>
+__device__ __forceinline__ void
+hq_decode_row_group(const std::uint8_t* codes, const std::uint8_t* meta, __nv_bfloat16* out,
+                    int lane, int xor_chunk, std::uint64_t dither_seed,
+                    std::uint16_t* symbols = nullptr) {
+    if (symbols == nullptr) { symbols = reinterpret_cast<std::uint16_t*>(out); }
     const std::uint32_t mw0 = *reinterpret_cast<const std::uint32_t*>(meta);
     const std::uint32_t mw1 = *reinterpret_cast<const std::uint32_t*>(meta + 4);
     const unsigned used_bits = ((mw0 >> 24) & 0xFFu) | ((mw1 & 0x3u) << 8);
@@ -734,7 +736,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
         int carry = __shfl_up_sync(gmask, run, 1, 8);
         if (lane == 0) { carry = 0; }
         // Decode this window's symbols: z = zeros before each 1-bit.
-        std::uint16_t* out16 = reinterpret_cast<std::uint16_t*>(out);
+        std::uint16_t* out16 = symbols;
         unsigned long long v = w;
         int n                = 0;
         while (v != 0ull && base + n < kHqHeadDim) {
@@ -784,7 +786,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
         }
         idx_total = idx;
 
-        std::uint16_t* out16 = reinterpret_cast<std::uint16_t*>(out);
+        std::uint16_t* out16 = symbols;
         int pending = -1;
         int s       = my_i;
         {
@@ -837,7 +839,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
     // zero, exactly like the sequential reader's unary guard. Well-formed
     // rows always parse 256 symbols, so this never runs in the engine.
     if (idx_total < kHqHeadDim && lane == 0) {
-        std::uint16_t* out16 = reinterpret_cast<std::uint16_t*>(out);
+        std::uint16_t* out16 = symbols;
 #pragma unroll 1
         for (int t = idx_total; t < kHqHeadDim; ++t) { out16[hq_swz_element(t, xor_chunk)] = 0; }
     }
@@ -859,17 +861,35 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
         const int word = lane + 8 * i;
         const int base = hq_swz_element(word * 8, xor_chunk);
         std::uint32_t z[8];
+        if constexpr (Packed) {
+            // Each lattice word occupies one aligned 16-byte vector. Keep the
+            // shared/global exchange vectorized instead of eight strided scalar loads.
+            const uint4 packed = *reinterpret_cast<const uint4*>(symbols + base);
+            const auto* lanes  = reinterpret_cast<const std::uint16_t*>(&packed);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            z[j] = reinterpret_cast<const std::uint16_t*>(out)[base + j];
+            for (int j = 0; j < 8; ++j) { z[j] = lanes[j]; }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { z[j] = symbols[base + j]; }
         }
         int y[8];
         hq_unstrip_word(z, y);
         const std::uint64_t wseed = hq_dither_word_seed(dither_seed, word);
+        if constexpr (Packed) {
+            uint4 packed;
+            auto* values = reinterpret_cast<__nv_bfloat16*>(&packed);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            out[base + j] = __float2bfloat16(
-                (static_cast<float>(y[j]) + hq_dither(wseed, j)) * norm * inv_scale);
+            for (int j = 0; j < 8; ++j) {
+                values[j] = __float2bfloat16((static_cast<float>(y[j]) + hq_dither(wseed, j)) *
+                                             norm * inv_scale);
+            }
+            *reinterpret_cast<uint4*>(out + base) = packed;
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                out[base + j] = __float2bfloat16((static_cast<float>(y[j]) + hq_dither(wseed, j)) *
+                                                 norm * inv_scale);
+            }
         }
     }
 }

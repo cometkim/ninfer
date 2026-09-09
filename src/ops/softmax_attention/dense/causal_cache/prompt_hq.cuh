@@ -41,6 +41,10 @@ __global__ void causal_attention_prompt_hq_scratch_kernel(
     __nv_bfloat16* __restrict__ scratch_v, std::int32_t key_begin, std::int32_t band_rows,
     const __nv_bfloat16* residual_k, const __nv_bfloat16* residual_v,
     const std::uint32_t* side_words, bool has_fresh) {
+    // Unary symbols are temporary decoder state, not observable scratch output.
+    // Stage them on chip so only reconstructed BF16 rows reach device memory.
+    __shared__ __align__(16)
+        std::uint16_t symbols[(kCausalPromptHqScratchThreads / 8) * kHqHeadDim];
     const std::int32_t tid =
         static_cast<std::int32_t>(blockIdx.x) * static_cast<std::int32_t>(blockDim.x) +
         static_cast<std::int32_t>(threadIdx.x);
@@ -84,10 +88,10 @@ __global__ void causal_attention_prompt_hq_scratch_kernel(
             store_vec(dst + lane8 * 32 + j * 8, load_vec<int4>(side + lane8 * 32 + j * 8));
         }
     } else {
-        hq_decode_row_group(
+        hq_decode_row_group<true>(
             kv_cache_hq_row_codes<Geometry>(role_v ? codes_v : codes_k, table, head, pos),
-            kv_cache_hq_row_meta<Geometry>(role_v ? meta_v : meta_k, table, head, pos), dst,
-            lane8, 0, hq_dither_row_seed(head, pos, role_v));
+            kv_cache_hq_row_meta<Geometry>(role_v ? meta_v : meta_k, table, head, pos), dst, lane8,
+            0, hq_dither_row_seed(head, pos, role_v), symbols + (threadIdx.x / 8) * kHqHeadDim);
     }
 }
 

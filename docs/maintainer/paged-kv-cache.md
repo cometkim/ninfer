@@ -284,8 +284,11 @@ with extent 64; both scale-plane slots hold U8 metadata with extent 8. The metad
 FP16 row norm, Rice parameter, escalation and bit offsets. The fixed signed Hadamard transform,
 nearest 2*E8 lattice and bounded Rice coding are defined in `kv_cache_append.h` and
 `src/ops/kv_cache/hq_e8_rice_codec.cuh`. Small-T decodes directly into tensor-core tiles and
-writes inverse-rotated FP32 partials. Prompt attention decodes the visible history once into
-caller-owned BF16 scratch (two planes of `max_visible_keys * Hkv * 256` elements).
+writes inverse-rotated FP32 partials. Single-token decode uses four warps over disjoint output
+coordinate slices; wider speculative tiles retain their query-row warp ownership. Prompt
+attention decodes each history band into caller-owned BF16 scratch (two planes of
+`min(max_visible_keys, 262144) * Hkv * 256` elements). Temporary Rice symbols stay in shared
+memory, and only the reconstructed BF16 rows are written to the scratch planes.
 
 The codec also carries two long-window quality levers:
 

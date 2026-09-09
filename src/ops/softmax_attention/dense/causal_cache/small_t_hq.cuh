@@ -1,13 +1,13 @@
 #pragma once
 
 // hq-e8-2b split-KV causal small-T attention, tensor-core partial kernel. Structurally the
-// BF16-K/BF16-V kernel (causal_attention_small_t.cuh scaffolding): every 32-key tile's K/V rows
+// BF16-K/BF16-V kernel (causal_attention_small_t.cuh scaffolding): each key tile's K/V rows
 // are group-decoded straight into the swizzled shared tile from the E8+Rice pages, the staged q
 // rows are FWHT-rotated into the codec frame before QK, and the split-local accumulators are
 // un-rotated once before the shared FP32 reducer consumes them, so all cache dtypes combine
 // identical-frame partials. The fused append encodes each split's new K/V rows in-range with
-// per-warp encoders aliasing the qkv tile (unused until q staging). One runtime-width
-// instantiation per geometry covers every legal token width.
+// per-warp encoders aliasing the qkv tile. The single-token tile gives four warps disjoint
+// PV coordinate slices; the wider tile assigns a 16-query row tile to each warp.
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -21,27 +21,34 @@
 
 namespace ninfer::ops {
 
+template <bool Narrow>
+__device__ __forceinline__ int causal_hq_probability_swizzle(int row, int col) {
+    return (((col >> 3) ^ (row & (Narrow ? 1 : 3))) << 3) | (col & 7);
+}
+
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput>
-__launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq_kernel(
-    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::uint8_t* codes_k,
-    std::uint8_t* codes_v, std::uint8_t* meta_k, std::uint8_t* meta_v,
-    __nv_bfloat16* residual_k, __nv_bfloat16* residual_v, std::uint32_t* side_words,
-    const std::int32_t* block_tables, const std::int32_t* valid_columns,
-    const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    float* partial_acc, float* partial_m, float* partial_l) {
+          typename CacheInput, bool Narrow = false>
+__launch_bounds__(128, Narrow ? 4 : 2) __global__
+    void causal_attention_small_t_tc_partial_hq_kernel(
+        const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::uint8_t* codes_k,
+        std::uint8_t* codes_v, std::uint8_t* meta_k, std::uint8_t* meta_v,
+        __nv_bfloat16* residual_k, __nv_bfloat16* residual_v, std::uint32_t* side_words,
+        const std::int32_t* block_tables, const std::int32_t* valid_columns,
+        const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
+        std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
+        float scale, float* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
     constexpr int Wc            = WarpsPerCta;
-    constexpr int Br            = Wc * 16;
-    constexpr int Bc            = 32;
+    constexpr int Br            = Narrow ? 16 : Wc * 16;
+    constexpr int QRows         = Narrow ? 8 : Br;
+    constexpr int Bc            = Narrow ? 16 : 32;
     constexpr int D             = kCausalHeadDim;
     constexpr int Threads       = Wc * 32;
     constexpr int QKNt          = Bc / 8;
     constexpr int QKKs          = D / 16;
-    constexpr int PVNt          = D / 8;
+    constexpr int PVNt          = Narrow ? D / (8 * Wc) : D / 8;
     constexpr int PVKs          = Bc / 16;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
@@ -53,7 +60,11 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
                   "per-warp append scratch must fit the qkv tile it aliases");
 
     __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
-    __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
+    __shared__ __align__(16) __nv_bfloat16 p_storage[Narrow ? 1 : Wc * 16 * Bc];
+    __shared__ __align__(16) __nv_bfloat16 q_storage[Narrow ? QRows * D : 1];
+    __nv_bfloat16* q_stage = Narrow ? q_storage : qkv_s;
+    __nv_bfloat16* p_s     = Narrow ? qkv_s : p_storage;
+    float* alpha_s         = reinterpret_cast<float*>(qkv_s + Br * Bc);
     __shared__ __align__(16) std::int8_t signs_s[kHqHeadDim];
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
@@ -132,7 +143,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
 
     const int window = last_pos + 1;
     const int active_split_count =
-        causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
+        Narrow ? causal_hq_narrow_active_splits<Geometry>(window, split_count)
+               : causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
 
     const int logical_tiles = div_up(window, Bc);
@@ -195,7 +207,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
         __syncthreads();
     }
 
-    for (int idx = tid; idx < Br * D; idx += Threads) {
+    for (int idx = tid; idx < QRows * D; idx += Threads) {
         const int row = idx / D;
         const int d   = idx - row * D;
         int q_head    = 0;
@@ -205,7 +217,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
         if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head)) {
             value = q[causal_q_index<Geometry>(q_head, d, token)];
         }
-        qkv_s[row * D + causal_small_t_tc_swz(row, d)] = value;
+        q_stage[row * D + causal_small_t_tc_swz(row, d)] = value;
     }
     __syncthreads();
 
@@ -216,12 +228,12 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
         float reg[8];
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
-            reg[s] = __bfloat162float(qkv_s[row * D + causal_small_t_tc_swz(row, s * 32 + lane)]);
+            reg[s] = __bfloat162float(q_stage[row * D + causal_small_t_tc_swz(row, s * 32 + lane)]);
         }
         hq_fwht256_sign(reg, signs_s, 0, lane);
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
-            qkv_s[row * D + causal_small_t_tc_swz(row, s * 32 + lane)] = __float2bfloat16(reg[s]);
+            q_stage[row * D + causal_small_t_tc_swz(row, s * 32 + lane)] = __float2bfloat16(reg[s]);
         }
     }
     __syncthreads();
@@ -236,16 +248,18 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    const int warp_row0 = warp * 16;
-    __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];
+    const int warp_row0 = Narrow ? 0 : warp * 16;
+    __nv_bfloat16* p_sw = &p_s[(Narrow ? 0 : warp * 16) * Bc];
 
-    unsigned af_q[QKKs][4];
+    unsigned af_q[Narrow ? 1 : QKKs][4];
+    if constexpr (!Narrow) {
 #pragma unroll
-    for (int k = 0; k < QKKs; ++k) {
-        const int arow = warp_row0 + a_rowoff;
-        const int acol = k * 16 + a_coloff;
-        ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
-                    smem_addr(&qkv_s[arow * D + causal_small_t_tc_swz(arow, acol)]));
+        for (int k = 0; k < QKKs; ++k) {
+            const int arow = warp_row0 + a_rowoff;
+            const int acol = k * 16 + a_coloff;
+            ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
+                        smem_addr(&q_stage[arow * D + causal_small_t_tc_swz(arow, acol)]));
+        }
     }
     __syncthreads();
     float acc[PVNt][4];
@@ -287,7 +301,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
                         store_vec(row_dst + chunk, load_vec<int4>(side + lane8 * 32 + j * 8));
                     }
                 } else {
-                    hq_decode_row_group(
+                    hq_decode_row_group<Narrow>(
                         kv_cache_hq_row_codes<Geometry>(role_v ? codes_v : codes_k, block_table,
                                                         kv_head, key),
                         kv_cache_hq_row_meta<Geometry>(role_v ? meta_v : meta_k, block_table,
@@ -304,118 +318,170 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
         }
         __syncthreads();
 
-        float score[QKNt][4];
+        // All warps decompress. The narrow tile has one QK/softmax producer;
+        // its four warps then consume disjoint 64-coordinate PV slices.
+        if (!Narrow || warp == 0) {
+            float score[QKNt][4];
+            if constexpr (Narrow) {
 #pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+                }
 #pragma unroll
-            for (int k = 0; k < QKKs; ++k) {
-                unsigned bf[2];
-                const int brow = nt * 8 + b_rin;
-                const int bcol = k * 16 + b_koff;
-                ldmatrix_x2(bf[0], bf[1],
-                            smem_addr(&k_s[brow * D + causal_small_t_tc_swz(brow, bcol)]));
-                mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[k][0],
-                         af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
+                for (int k = 0; k < QKKs; ++k) {
+                    ldmatrix_x4(
+                        af_q[0][0], af_q[0][1], af_q[0][2], af_q[0][3],
+                        smem_addr(
+                            &q_stage[(a_rowoff & 7) * D +
+                                     causal_small_t_tc_swz(a_rowoff & 7, k * 16 + a_coloff)]));
+                    // Single-token GQA has at most eight live rows. The lower half
+                    // of the 16-row MMA tile is zero without occupying shared storage.
+                    af_q[0][1] = 0u;
+                    af_q[0][3] = 0u;
+#pragma unroll
+                    for (int nt = 0; nt < QKNt; ++nt) {
+                        unsigned bf[2];
+                        const int brow = nt * 8 + b_rin;
+                        ldmatrix_x2(
+                            bf[0], bf[1],
+                            smem_addr(
+                                &k_s[brow * D + causal_small_t_tc_swz(brow, k * 16 + b_koff)]));
+                        mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[0][0],
+                                 af_q[0][1], af_q[0][2], af_q[0][3], bf[0], bf[1]);
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+#pragma unroll
+                    for (int k = 0; k < QKKs; ++k) {
+                        unsigned bf[2];
+                        const int brow = nt * 8 + b_rin;
+                        const int bcol = k * 16 + b_koff;
+                        ldmatrix_x2(bf[0], bf[1],
+                                    smem_addr(&k_s[brow * D + causal_small_t_tc_swz(brow, bcol)]));
+                        mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[k][0],
+                                 af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
+                    }
+                }
+            }
+
+            const int row0 = warp_row0 + gid;
+            const int row1 = row0 + 8;
+            int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
+            causal_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head0, token0);
+            causal_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head1, token1);
+            const int qabs0 = (row0 < row_count) ? pos[token0] : -1;
+            const int qabs1 = (row1 < row_count) ? pos[token1] : -1;
+
+            float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                const int col0 = nt * 8 + 2 * lid;
+                const int col1 = col0 + 1;
+                const int key0 = k0 + col0;
+                const int key1 = col1 + k0;
+                score[nt][0] =
+                    (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                        ? score[nt][0] * scale
+                        : -CUDART_INF_F;
+                score[nt][1] =
+                    (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                        ? score[nt][1] * scale
+                        : -CUDART_INF_F;
+                score[nt][2] =
+                    (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                        ? score[nt][2] * scale
+                        : -CUDART_INF_F;
+                score[nt][3] =
+                    (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                        ? score[nt][3] * scale
+                        : -CUDART_INF_F;
+                bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+                bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+            }
+            bm0 = warp_max<4>(bm0, FullMask);
+            bm1 = warp_max<4>(bm1, FullMask);
+
+            const float nm0    = fmaxf(m0, bm0);
+            const float nm1    = fmaxf(m1, bm1);
+            const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx((m0 - nm0) * Log2E);
+            const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx((m1 - nm1) * Log2E);
+
+            float bl0 = 0.0f, bl1 = 0.0f;
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                const int col0  = nt * 8 + 2 * lid;
+                const int col1  = col0 + 1;
+                const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
+                                      ? exp2_approx((score[nt][0] - nm0) * Log2E)
+                                      : 0.0f;
+                const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
+                                      ? exp2_approx((score[nt][1] - nm0) * Log2E)
+                                      : 0.0f;
+                const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
+                                      ? exp2_approx((score[nt][2] - nm1) * Log2E)
+                                      : 0.0f;
+                const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
+                                      ? exp2_approx((score[nt][3] - nm1) * Log2E)
+                                      : 0.0f;
+                bl0 += p00 + p01;
+                bl1 += p10 + p11;
+                p_sw[gid * Bc + causal_hq_probability_swizzle<Narrow>(gid, col0)] =
+                    __float2bfloat16_rn(p00);
+                p_sw[gid * Bc + causal_hq_probability_swizzle<Narrow>(gid, col1)] =
+                    __float2bfloat16_rn(p01);
+                p_sw[(gid + 8) * Bc + causal_hq_probability_swizzle<Narrow>(gid + 8, col0)] =
+                    __float2bfloat16_rn(p10);
+                p_sw[(gid + 8) * Bc + causal_hq_probability_swizzle<Narrow>(gid + 8, col1)] =
+                    __float2bfloat16_rn(p11);
+            }
+            bl0 = warp_sum<4>(bl0, FullMask);
+            bl1 = warp_sum<4>(bl1, FullMask);
+
+            l0 = l0 * alpha0 + bl0;
+            l1 = l1 * alpha1 + bl1;
+            m0 = nm0;
+            m1 = nm1;
+            if constexpr (Narrow) {
+                if (lid == 0) {
+                    alpha_s[gid]     = alpha0;
+                    alpha_s[gid + 8] = alpha1;
+                }
+            } else {
+#pragma unroll
+                for (int n = 0; n < PVNt; ++n) {
+                    acc[n][0] *= alpha0;
+                    acc[n][1] *= alpha0;
+                    acc[n][2] *= alpha1;
+                    acc[n][3] *= alpha1;
+                }
+            }
+            __syncwarp();
+        }
+        if constexpr (Narrow) { __syncthreads(); }
+        if constexpr (Narrow) {
+#pragma unroll
+            for (int n = 0; n < PVNt; ++n) {
+                acc[n][0] *= alpha_s[gid];
+                acc[n][1] *= alpha_s[gid];
+                acc[n][2] *= alpha_s[gid + 8];
+                acc[n][3] *= alpha_s[gid + 8];
             }
         }
-
-        const int row0 = warp_row0 + gid;
-        const int row1 = row0 + 8;
-        int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
-        causal_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head0, token0);
-        causal_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head1, token1);
-        const int qabs0 = (row0 < row_count) ? pos[token0] : -1;
-        const int qabs1 = (row1 < row_count) ? pos[token1] : -1;
-
-        float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
-#pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0 = nt * 8 + 2 * lid;
-            const int col1 = col0 + 1;
-            const int key0 = k0 + col0;
-            const int key1 = col1 + k0;
-            score[nt][0] =
-                (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0)
-                    ? score[nt][0] * scale
-                    : -CUDART_INF_F;
-            score[nt][1] =
-                (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0)
-                    ? score[nt][1] * scale
-                    : -CUDART_INF_F;
-            score[nt][2] =
-                (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1)
-                    ? score[nt][2] * scale
-                    : -CUDART_INF_F;
-            score[nt][3] =
-                (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1)
-                    ? score[nt][3] * scale
-                    : -CUDART_INF_F;
-            bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-            bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
-        }
-        bm0 = warp_max<4>(bm0, FullMask);
-        bm1 = warp_max<4>(bm1, FullMask);
-
-        const float nm0    = fmaxf(m0, bm0);
-        const float nm1    = fmaxf(m1, bm1);
-        const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx((m0 - nm0) * Log2E);
-        const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx((m1 - nm1) * Log2E);
-
-        float bl0 = 0.0f, bl1 = 0.0f;
-#pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0  = nt * 8 + 2 * lid;
-            const int col1  = col0 + 1;
-            const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][0] - nm0) * Log2E)
-                                  : 0.0f;
-            const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][1] - nm0) * Log2E)
-                                  : 0.0f;
-            const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][2] - nm1) * Log2E)
-                                  : 0.0f;
-            const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][3] - nm1) * Log2E)
-                                  : 0.0f;
-            bl0 += p00 + p01;
-            bl1 += p10 + p11;
-            p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col0)] = __float2bfloat16_rn(p00);
-            p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col1)] = __float2bfloat16_rn(p01);
-            p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col0)] =
-                __float2bfloat16_rn(p10);
-            p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col1)] =
-                __float2bfloat16_rn(p11);
-        }
-        bl0 = warp_sum<4>(bl0, FullMask);
-        bl1 = warp_sum<4>(bl1, FullMask);
-
-        l0 = l0 * alpha0 + bl0;
-        l1 = l1 * alpha1 + bl1;
-        m0 = nm0;
-        m1 = nm1;
-#pragma unroll
-        for (int n = 0; n < PVNt; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
-        }
-        __syncwarp();
-
 #pragma unroll
         for (int n = 0; n < PVNt; ++n) {
 #pragma unroll
             for (int k = 0; k < PVKs; ++k) {
                 unsigned pf[4];
                 const int pcol = k * 16 + a_coloff;
-                ldmatrix_x4(
-                    pf[0], pf[1], pf[2], pf[3],
-                    smem_addr(&p_sw[a_rowoff * Bc + causal_small_t_tc_swz32(a_rowoff, pcol)]));
+                ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
+                            smem_addr(&p_sw[a_rowoff * Bc + causal_hq_probability_swizzle<Narrow>(
+                                                                a_rowoff, pcol)]));
                 unsigned vf[2];
                 const int vrow = k * 16 + b_koff + b_rin;
-                const int vcol = n * 8;
+                const int vcol = (Narrow ? warp * (D / Wc) : 0) + n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_s[vrow * D + causal_small_t_tc_swz(vrow, vcol)]));
                 mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
@@ -425,7 +491,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
         __syncthreads();
     }
 
-    if (lid == 0) {
+    if (lid == 0 && (!Narrow || warp == 0)) {
         const int row0 = warp_row0 + gid;
         const int row1 = row0 + 8;
         if (row0 < row_count) {
@@ -444,38 +510,67 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_hq
         }
     }
 
-    // Redistribute MMA fragments to full rows for the inverse rotation. Eight FP32 rows per
-    // warp fit the dead BF16 K/V tile, so handle the two fragment row halves in turn. Preserve
-    // FP32 through staging, rotation and partial stores: the shared reducer consumes floats.
-    static_assert(Wc * 8 * D * sizeof(float) <= sizeof(qkv_s));
-    float* acc_s = reinterpret_cast<float*>(qkv_s);
-#pragma unroll
-    for (int half = 0; half < 2; ++half) {
+    if constexpr (Narrow) {
+        // Four warps own disjoint 64-coordinate PV slices of the same 16 rows.
+        // Reassemble complete rows only once, after the key loop, for inverse RHT.
+        float* acc_s = reinterpret_cast<float*>(qkv_s);
+        static_assert(16 * D * sizeof(float) <= sizeof(qkv_s));
 #pragma unroll
         for (int n = 0; n < PVNt; ++n) {
-            const int d                         = n * 8 + 2 * lid;
-            acc_s[(warp * 8 + gid) * D + d]     = acc[n][half * 2];
-            acc_s[(warp * 8 + gid) * D + d + 1] = acc[n][half * 2 + 1];
+            const int d                  = warp * (D / Wc) + n * 8 + 2 * lid;
+            acc_s[gid * D + d]           = acc[n][0];
+            acc_s[gid * D + d + 1]       = acc[n][1];
+            acc_s[(gid + 8) * D + d]     = acc[n][2];
+            acc_s[(gid + 8) * D + d + 1] = acc[n][3];
         }
-        __syncwarp();
-        for (int r = 0; r < 8; ++r) {
-            const int row = warp_row0 + half * 8 + r;
-            if (row >= row_count) { break; }
-            int q_head = 0;
-            int token  = 0;
+        __syncthreads();
+        for (int row = warp; row < row_count; row += Wc) {
+            int q_head = 0, token = 0;
             causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-            if (!causal_valid_q_head<Geometry>(kv_head, q_head)) { continue; }
             float reg[8];
 #pragma unroll
-            for (int s = 0; s < 8; ++s) { reg[s] = acc_s[(warp * 8 + r) * D + s * 32 + lane]; }
+            for (int i = 0; i < 8; ++i) { reg[i] = acc_s[row * D + i * 32 + lane]; }
             hq_ifwht256_sign(reg, signs_s, 0, lane);
 #pragma unroll
-            for (int s = 0; s < 8; ++s) {
-                partial_acc[causal_partial_acc_index<Geometry>(q_head, s * 32 + lane, token, split,
-                                                               tokens)] = reg[s];
+            for (int i = 0; i < 8; ++i) {
+                partial_acc[causal_partial_acc_index<Geometry>(q_head, i * 32 + lane, token, split,
+                                                               tokens)] = reg[i];
             }
         }
-        __syncwarp();
+    } else {
+        // Redistribute MMA fragments to full rows for the inverse rotation. Eight FP32 rows per
+        // warp fit the dead BF16 K/V tile, so handle the two fragment row halves in turn. Preserve
+        // FP32 through staging, rotation and partial stores: the shared reducer consumes floats.
+        static_assert(Wc * 8 * D * sizeof(float) <= sizeof(qkv_s));
+        float* acc_s = reinterpret_cast<float*>(qkv_s);
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+#pragma unroll
+            for (int n = 0; n < PVNt; ++n) {
+                const int d                         = n * 8 + 2 * lid;
+                acc_s[(warp * 8 + gid) * D + d]     = acc[n][half * 2];
+                acc_s[(warp * 8 + gid) * D + d + 1] = acc[n][half * 2 + 1];
+            }
+            __syncwarp();
+            for (int r = 0; r < 8; ++r) {
+                const int row = warp_row0 + half * 8 + r;
+                if (row >= row_count) { break; }
+                int q_head = 0;
+                int token  = 0;
+                causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+                if (!causal_valid_q_head<Geometry>(kv_head, q_head)) { continue; }
+                float reg[8];
+#pragma unroll
+                for (int s = 0; s < 8; ++s) { reg[s] = acc_s[(warp * 8 + r) * D + s * 32 + lane]; }
+                hq_ifwht256_sign(reg, signs_s, 0, lane);
+#pragma unroll
+                for (int s = 0; s < 8; ++s) {
+                    partial_acc[causal_partial_acc_index<Geometry>(q_head, s * 32 + lane, token,
+                                                                   split, tokens)] = reg[s];
+                }
+            }
+            __syncwarp();
+        }
     }
 }
 

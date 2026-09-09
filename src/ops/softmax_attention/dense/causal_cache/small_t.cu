@@ -243,10 +243,20 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
             const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
             return std::min(capacity, std::max({4, grid_limit, page_limit}));
         }
+        if (cache_storage == KvCacheStorage::HqE8Rice2B && tokens == 1 &&
+            envelope.max_visible_keys > 1024) {
+            return std::min(256, 2 * capacity);
+        }
         return capacity;
     }
     if (q_heads == CausalD256H16Kv2::QHeads) {
-        return causal_small_t_launch_capacity<CausalD256H16Kv2>(envelope, tokens, cache_storage);
+        const int capacity =
+            causal_small_t_launch_capacity<CausalD256H16Kv2>(envelope, tokens, cache_storage);
+        if (cache_storage == KvCacheStorage::HqE8Rice2B && tokens == 1 &&
+            envelope.max_visible_keys > 1024) {
+            return std::min(256, 2 * capacity);
+        }
+        return capacity;
     }
     throw std::invalid_argument(
         "causal_softmax_attention split capacity: unsupported head geometry");
