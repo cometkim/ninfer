@@ -49,6 +49,7 @@ Ongoing feature experimentation:
 | feat branch | stacked on | status | squashed on dev as |
 |---|---|---|---|
 | `feat/hyperquant` | `feat/windows-port` | self-contained hq-e8-2b KV storage profile (codec, append/prompt/small-t routes, product surface) | `squash(feat/hyperquant)` |
+| `feat/1m-context` | `feat/hyperquant` | self-contained dither/residual window, YaRN, banded scratch, 1M envelope and retrieval gate | `squash(feat/1m-context)` |
 
 When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
 its row into the upstream lineage note.
@@ -170,6 +171,13 @@ What this fork adds on top (one squashed commit per feature branch, per
   KV-source policy of the bf16 TC kernel). After the residual-window + dither work below,
   hq decode matches or beats same-session INT8 at the measured cells (tg128 80.6 vs 71.7,
   pp32k+tg64 62.2 vs 58.1 tok/s).
+
+
+- **`feat/1m-context`** — the 1,048,576-key hq envelope with YaRN scaling,
+  query-side temperature and FP64 angle reduction; 262144-key scratch bands bound
+  prompt workspace independently of the envelope. BF16 sink/recent rows (32/512)
+  and half-cell subtractive dither preserve the hq quality track. The independent
+  1M-row codec retrieval gate requires all five needles at unique top-1.
 
 
 Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
