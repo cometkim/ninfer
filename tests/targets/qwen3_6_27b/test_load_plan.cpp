@@ -189,6 +189,83 @@ int verify_nvfp4(const std::filesystem::path& path) {
     return 0;
 }
 
+int verify_dflash2_bundle(const std::filesystem::path& path, WeightsProfile profile);
+
+int verify_nvfp4full(const std::filesystem::path& path) {
+    ninfer::artifact::Reader reader(path);
+    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen38Nvfp4Full) {
+        std::cerr << "nvfp4full identity resolved to the wrong profile\n";
+        return 1;
+    }
+    ninfer::artifact::Binder binder(reader);
+    const ArtifactLoadPlan plan =
+        bind_artifact(binder, WeightsProfile::Qwen38Nvfp4Full, all_features());
+    const std::size_t validate_only = plan.materialization.object_count -
+                                      plan.materialization.device_objects.size() -
+                                      plan.materialization.host_objects.size();
+    if (plan.materialization.object_count != 1325 || plan.materialization.host_objects.size() != 6 ||
+        validate_only < 66 || plan.materialization.device_capacity_bytes == 0) {
+        std::cerr << "nvfp4full materialization plan is incomplete: objects="
+                  << plan.materialization.object_count
+                  << " host=" << plan.materialization.host_objects.size()
+                  << " validate_only=" << validate_only << '\n';
+        return 1;
+    }
+    if (plan.bindings.token_embedding.format != NumericFormat::W8G32_F16S ||
+        plan.bindings.output_head.format != NumericFormat::W8G32_F16S) {
+        std::cerr << "nvfp4full vocabulary endpoints have the wrong storage profile\n";
+        return 1;
+    }
+
+    std::size_t nvfp4_weights          = 0;
+    std::size_t bf16_attention_inputs  = 0;
+    std::size_t bf16_attention_outputs = 0;
+    std::size_t bf16_gdn_outputs       = 0;
+    const auto count_weight            = [&](const WeightPlan& weight) {
+        if (weight.format == NumericFormat::NVFP4) {
+            ++nvfp4_weights;
+            return valid_divisors(weight);
+        }
+        return true;
+    };
+    for (const TextLayerPlan& layer : plan.bindings.text_layers) {
+        if (!count_weight(layer.mlp.gate_up) || !count_weight(layer.mlp.down)) {
+            std::cerr << "nvfp4full MLP divisor is invalid\n";
+            return 1;
+        }
+        if (layer.is_full_attention) {
+            const auto* fused =
+                std::get_if<FusedAttentionProjectionPlan>(&layer.attention.projection);
+            if (fused == nullptr || !count_weight(fused->query_key_gate_value) ||
+                !count_weight(layer.attention.output)) {
+                std::cerr << "nvfp4full attention binding is invalid\n";
+                return 1;
+            }
+            bf16_attention_inputs +=
+                fused->query_key_gate_value.format == NumericFormat::BF16 ? 1 : 0;
+            bf16_attention_outputs += layer.attention.output.format == NumericFormat::BF16 ? 1 : 0;
+        } else {
+            const auto* fused =
+                std::get_if<FusedGdnInputProjectionPlan>(&layer.gdn.input_projection);
+            if (fused == nullptr || !count_weight(fused->query_key_value_z) ||
+                !count_weight(layer.gdn.output)) {
+                std::cerr << "nvfp4full GDN binding is invalid\n";
+                return 1;
+            }
+            bf16_gdn_outputs += layer.gdn.output.format == NumericFormat::BF16 ? 1 : 0;
+        }
+    }
+    if (nvfp4_weights != 247 || bf16_attention_inputs != 6 || bf16_attention_outputs != 2 ||
+        bf16_gdn_outputs != 1) {
+        std::cerr << "nvfp4full Text inventory has the wrong storage profile: nvfp4="
+                  << nvfp4_weights << " bf16_attention_input=" << bf16_attention_inputs
+                  << " bf16_attention_output=" << bf16_attention_outputs
+                  << " bf16_gdn_output=" << bf16_gdn_outputs << '\n';
+        return 1;
+    }
+    return verify_dflash2_bundle(path, WeightsProfile::Qwen38Nvfp4Full);
+}
+
 int verify_legacy_dflash2_compatibility(const std::filesystem::path& path, WeightsProfile profile) {
     {
         ninfer::artifact::Reader reader(path);
@@ -352,6 +429,13 @@ int main() {
     if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
     if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
     if (const int result = verify_nvfp4(nvfp4); result != 0) { return result; }
+    const std::filesystem::path qwen38_nvfp4full = artifact_path(
+        "NINFER_QWEN3_8_27B_NVFP4FULL_WEIGHTS", "qwen3_8_27b_nvfp4full.ninfer");
+    if (std::filesystem::is_regular_file(qwen38_nvfp4full)) {
+        if (const int result = verify_nvfp4full(qwen38_nvfp4full); result != 0) {
+            return result;
+        }
+    }
     if (const int result =
             verify_legacy_dflash2_compatibility(groupwise, WeightsProfile::Qwen36GroupwiseInt);
         result != 0) {

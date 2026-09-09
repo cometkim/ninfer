@@ -55,6 +55,7 @@ Ongoing feature experimentation:
 | `feat/hyperquant` | `feat/windows-port` | self-contained hq-e8-2b KV storage profile (codec, append/prompt/small-t routes, product surface) | `squash(feat/hyperquant)` |
 | `feat/1m-context` | `feat/hyperquant` | self-contained dither/residual window, YaRN, banded scratch, 1M envelope and retrieval gate | `squash(feat/1m-context)` |
 | `feat/dflash2` | `feat/windows-port` | fork-format NVFP4 DFlash2 draft module execution + unified binder; self-contained, also PR-able to nvfp4full-first forks | `squash(feat/dflash2)` |
+| `feat/qwen3.8-nvfp4full` | `feat/dflash2` | fuller-NVFP4 weights profile + converter; upstream-PR candidate | `squash(feat/qwen3.8-nvfp4full)` |
 
 When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
 its row into the upstream lineage note.
@@ -202,6 +203,10 @@ What this fork adds on top (one squashed commit per feature branch, per
   Self-contained on `feat/windows-port`, so it is also PR-able to forks that treat the
   nvfp4full profile as first-class (upstream's DFlash2 schedule remains the semantic
   authority; this branch carries only the module encoding's execution).
+
+- **`feat/qwen3.8-nvfp4full`** — the Qwen3.8-27B NVFP4 full-precision-requant artifact:
+  unified activation scale space, conversion tooling, model card, and the published gpqa
+  comparison.
 
 Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
 requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from upstream.
