@@ -284,10 +284,39 @@ with extent 64; both scale-plane slots hold U8 metadata with extent 8. The metad
 FP16 row norm, Rice parameter, escalation and bit offsets. The fixed signed Hadamard transform,
 nearest 2*E8 lattice and bounded Rice coding are defined in `kv_cache_append.h` and
 `src/ops/kv_cache/hq_e8_rice_codec.cuh`. Small-T decodes directly into tensor-core tiles and
-writes inverse-rotated FP32 partials. Prompt attention decodes the visible history once into
-caller-owned BF16 scratch (two planes of `max_visible_keys * Hkv * 256` elements).
-The current context limit remains 262144; dither, residual windows and larger YaRN lanes are
-the separate 1M-context port.
+writes inverse-rotated FP32 partials. Single-token decode uses four warps over disjoint output
+coordinate slices; wider speculative tiles retain their query-row warp ownership. Prompt
+attention decodes each history band into caller-owned BF16 scratch (two planes of
+`min(max_visible_keys, 262144) * Hkv * 256` elements). Temporary Rice symbols stay in shared
+memory, and only the reconstructed BF16 rows are written to the scratch planes.
+
+The codec also carries two long-window quality levers:
+
+- **Half-cell subtractive dither.** A deterministic counter hash of (kv_head, position, role,
+  word) derives a per-word dither in [-0.5, 0.5)^8, subtracted before the E8 nearest point and
+  added back at every decode site (absolute across escalation attempts, never stored). The
+  per-vector quantization bias is thereby made zero-mean, so it no longer compounds across
+  hundreds of thousands of distractor rows.
+- **Residual window (sink + recent ring).** Every hq cache additionally allocates BF16 side
+  planes `[256, Hkv, 544, layers * table_rows]` for K and V plus per-slot validity words
+  `[17, table_rows]`, all in the codec's rotated frame. Appends dual-write the row exactly
+  (single bf16 rounding) for the first 32 (sink) and last 512 (ring) positions of the owning
+  history and mark the slot's bit; every hq consumer (small-T tile fetch, prompt scratch) reads
+  those keys from the side planes instead of the codec planes. Ring ownership is per execution
+  row with a handover epoch in `KVAddressSpaceStore`: backward trims revalidate the surviving
+  bits, rejected speculative drafts invalidate theirs, and a prefix fork inherits the source
+  row's planes when still coherent (otherwise the fork falls back to codec rows for the
+  inherited window and its own appends repopulate the ring). The prompt route additionally
+  stages the current chunk's bf16 rows into the scratch exact, so every prefill query sees its
+  full in-chunk recent window exact.
+
+The codec planes stay complete — any side row can fall back to the codec path. The 27B hq
+envelope reaches 1048576 keys. Prompt attention materializes at most 262144 rotated keys per
+band and carries online-softmax state between bands, bounding the two BF16 scratch planes at
+1 GiB for 4 KV heads. Workspace planning and allocation use that same band limit; reserving
+full-envelope BF16 scratch at 1M would waste 3 GiB. Decode split launch capacity is capped by
+the geometry, while active split counts follow the current visible window. YaRN tables belong
+to the Program and every execution context, including graph capture, must bind that table.
 
 K/V 的 code 和 scale planes 具有各自的 dtype、leading extent 和 group size；它们仍共享 page-group
 identity、frontier 和 lifetime。Capacity curve、Device/Host replica、continuation transfer 和 memory

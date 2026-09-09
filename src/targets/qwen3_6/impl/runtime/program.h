@@ -6,6 +6,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -634,6 +635,11 @@ public:
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    const ops::RopeFrequencies rope_frequencies;
+    const float rope_scaling_factor;
+    const float rope_scaling_temperature;
+    const float rope_scaling_beta_fast;
+    const float rope_scaling_beta_slow;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -1235,6 +1241,16 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    // hq-e8-2b residual-window lifecycle (no-ops on every other storage profile).
+    void acquire_sequence_side_rows(SequenceState& sequence);
+    void revalidate_sequence_side_rows(SequenceState& sequence, std::uint32_t retained_text,
+                                       std::uint32_t retained_backend);
+    void invalidate_sequence_side_rows(SequenceState& sequence, std::uint32_t rejected_from,
+                                       std::uint32_t rejected_end);
+    void inherit_fork_side_rows(qwen3_6::PagedKVCache& cache, KVAddressSpaceStore& store,
+                                KVAddressSpaceHandle destination, std::int32_t source_row,
+                                std::uint32_t source_written, std::uint32_t frontier,
+                                cudaStream_t stream);
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                  std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

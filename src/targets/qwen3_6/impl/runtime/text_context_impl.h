@@ -226,7 +226,8 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
                          const qwen3_6::PagedKVCache* batch_mtp_kv)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
       prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
-      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
+      batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv),
+      rope_frequencies_(ops::rope_linear_frequencies(kCfg.rope_theta, kCfg.rotary_dim)) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -382,7 +383,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
     ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    ops::rope(rope_for_op, kCfg.rotary_dim, rope_frequencies_, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     if (active_sequence_batch_ != 0) {
@@ -492,7 +493,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
         ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
-        ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
+        ops::rope(rope_positions, kCfg.rotary_dim, rope_frequencies_, kn, ops::RopeSide::Key, s);
         ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
 
         if (final_chunk) {
@@ -532,7 +533,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                     cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
             }
         }
-        ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
+        ops::rope(last_rope_position, kCfg.rotary_dim, rope_frequencies_, qn,
+                  ops::RopeSide::Query, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
         ops::causal_softmax_attention_cached(qn, last_position,
@@ -845,7 +847,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    ops::rope(rope_for_op, kCfg.rotary_dim, rope_frequencies_, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =

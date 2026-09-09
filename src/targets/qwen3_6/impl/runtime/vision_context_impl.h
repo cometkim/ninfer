@@ -338,7 +338,8 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
                 k.nb[2] = qkv.nb[1];
                 v.nb[2] = qkv.nb[1];
                 ops::rope(position_ids, VisionScheduleConfig::rotary_dim,
-                          VisionScheduleConfig::rope_theta, q, k, stream);
+                          ops::rope_vision_frequencies(VisionScheduleConfig::rope_theta), q, k,
+                          stream);
                 Tensor attended_heads = attended.view(
                     {VisionScheduleConfig::head_dim, VisionScheduleConfig::heads, patches});
                 ops::packed_softmax_attention(q, k, v,

@@ -25,6 +25,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
+    card.set_rope_frequencies(state.execution.rope_frequencies);
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);

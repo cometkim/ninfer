@@ -60,6 +60,17 @@ PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cac
         .v_pages       = cache.v_pages,
         .k_scale_pages = cache.k_scale_pages,
         .v_scale_pages = cache.v_scale_pages,
+        // Narrow the residual planes to this view's slot row so batch kernels address it with
+        // their (absent) table-row selector defaulting to row 0.
+        .residual_k    = cache.residual_k.data == nullptr
+                             ? Tensor()
+                             : cache.residual_k.slice(3, cache.slot, 1),
+        .residual_v    = cache.residual_v.data == nullptr
+                             ? Tensor()
+                             : cache.residual_v.slice(3, cache.slot, 1),
+        .side_words    = cache.side_words.data == nullptr
+                             ? Tensor()
+                             : cache.side_words.slice(1, cache.slot, 1),
         .block_tables  = cache.block_table.view({cache.block_table.ne[0], 1}),
         .head_dim      = cache.head_dim,
         .num_kv_heads  = cache.num_kv_heads,

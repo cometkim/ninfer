@@ -765,6 +765,12 @@ models objects.
 
 The table lists executable defaults. The startup example selects a long-context FP8/MTP3 profile.
 
+The 27B runtime permits up to 1,048,576 logical tokens with `hq-e8-2b` and
+524,288 with the other KV profiles. These are execution envelopes, not checkpoint training
+lengths or guarantees of long-context answer quality. Use `--rope-scaling yarn:2`, `yarn:3`,
+or `yarn:4` for the 524288/786432/1048576 presets. Scaling is fixed at startup; query-side
+temperature is applied consistently during prefill, eager decode and CUDA Graph capture.
+
 | Option | Meaning | Default |
 |---|---|---:|
 | `--host H` | listen address | `127.0.0.1` |
@@ -789,6 +795,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|hq-e8-2b` | KV-cache storage | `bf16` |
+| `--rope-scaling none\|yarn:F[,t=<c>][,bf=<n>][,bs=<n>]` | startup RoPE scaling and optional temperature/ramp parameters | `none` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..7`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |

@@ -2408,7 +2408,7 @@ int verify_workspace_capacity_contract() {
     try {
         (void)ops::causal_softmax_attention_workspace_capacity_bytes(
             {kHeadDim, 16, 2}, KvCacheStorage::BFloat16,
-            {1, ops::kCausalAttentionMaximumVisibleKeys}, 1, 1, 1);
+            {1, ops::kCausalAttentionMaximumLinearVisibleKeys}, 1, 1, 1);
     } catch (const std::invalid_argument&) {
         std::cerr << "causal_softmax_attention rejected its maximum visible-key envelope\n";
         ++failures;
@@ -2416,14 +2416,134 @@ int verify_workspace_capacity_contract() {
     try {
         (void)ops::causal_softmax_attention_workspace_capacity_bytes(
             {kHeadDim, 16, 2}, KvCacheStorage::BFloat16,
-            {1, ops::kCausalAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
+            {1, ops::kCausalAttentionMaximumLinearVisibleKeys + 1}, 1, 1, 1);
         std::cerr << "causal_softmax_attention accepted an envelope outside the launcher domain\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
     return failures;
 }
 
+// Zero Q makes the independent softmax oracle the uniform mean of represented V.
+// Three nonzero rows avoid a quadratic reference or a host copy of the full cache.
+int run_long_linear_case(KvCacheStorage storage, int width, bool cached) {
+    const Geometry& geometry = kGeometries[0];
+    constexpr int keys = ops::kCausalAttentionMaximumLinearVisibleKeys;
+    constexpr int pages = keys / kPagedKVPageSize;
+    const auto layout = test_cache_layout(storage);
+    const auto plane_bytes = [&](const TestVectorLayout& v, bool scales) {
+        return std::size_t(keys) * geometry.kv_heads *
+               (scales ? v.scale_extent * dtype_size(v.scale_dtype)
+                       : v.code_extent * dtype_size(v.code_dtype));
+    };
+    GuardedDeviceBuffer dk(plane_bytes(layout.key, false)), dv(plane_bytes(layout.value, false)),
+        dks(std::max<std::size_t>(1, plane_bytes(layout.key, true))),
+        dvs(std::max<std::size_t>(1, plane_bytes(layout.value, true))), dt(pages * sizeof(int));
+    dk.fill(); dv.fill(); dks.fill(); dvs.fill();
+    std::vector<int> table(pages), positions(width);
+    for (int p = 0; p < pages; ++p) table[p] = pages - 1 - p;
+    for (int t = 0; t < width; ++t) positions[t] = keys - width + t;
+    dt.copy_from_host(table.data(), table.size() * sizeof(int));
+    const auto plane = [&](GuardedDeviceBuffer& data, const TestVectorLayout& v, bool scales) {
+        const int extent = scales ? v.scale_extent : v.code_extent;
+        return extent == 0 ? Tensor{} : Tensor(data.data(), scales ? v.scale_dtype : v.code_dtype,
+                                               {extent, kPagedKVPageSize, geometry.kv_heads, pages});
+    };
+    PagedKVLayerView cache{.k_pages = plane(dk, layout.key, false),
+                           .v_pages = plane(dv, layout.value, false),
+                           .k_scale_pages = plane(dks, layout.key, true),
+                           .v_scale_pages = plane(dvs, layout.value, true),
+                           .block_table = Tensor(dt.data(), DType::I32, {pages}),
+                           .head_dim = kHeadDim, .num_kv_heads = geometry.kv_heads,
+                           .storage = storage};
+    const HostCache probe_host = make_cache(geometry, storage, 3, 928u);
+    DeviceCache probe_device(probe_host, MappingPattern::Identity);
+    const auto probe = probe_device.view();
+    std::vector<double> sums(geometry.kv_heads * kHeadDim, 0.0);
+    const int probes[]{0, 262145, keys - width - 1};
+    for (int i = 0; i < 3; ++i)
+        for (int h = 0; h < geometry.kv_heads; ++h) {
+            const int p = probes[i];
+            const auto copy_row = [&](const Tensor& from, const Tensor& to) {
+                if (to.data == nullptr) return;
+                const auto bytes = std::size_t(to.ne[0]) * dtype_size(to.dtype);
+                const auto source = std::size_t(h * kPagedKVPageSize + i) * bytes;
+                const auto dest = (std::size_t(table[p / kPagedKVPageSize] * geometry.kv_heads + h) *
+                                   kPagedKVPageSize + p % kPagedKVPageSize) * bytes;
+                CUDA_CHECK(cudaMemcpy(static_cast<std::uint8_t*>(to.data) + dest,
+                                      static_cast<const std::uint8_t*>(from.data) + source,
+                                      bytes, cudaMemcpyDeviceToDevice));
+            };
+            copy_row(probe.v_pages, cache.v_pages);
+            copy_row(probe.v_scale_pages, cache.v_scale_pages);
+            std::array<double, kHeadDim> row{};
+            for (int d = 0; d < kHeadDim; ++d) row[d] = cache_value(probe_host, false, h, i, d);
+            if (storage == KvCacheStorage::Nvfp4Group16 ||
+                storage == KvCacheStorage::Fp8KeyNvfp4Value) normalized_hadamard_d256(row);
+            for (int d = 0; d < kHeadDim; ++d) sums[h * kHeadDim + d] += row[d];
+        }
+    const auto elements = std::size_t(kHeadDim) * geometry.q_heads * width;
+    GuardedDeviceBuffer dq(elements * 2), dout(elements * 2), dp(width * sizeof(int)),
+        dnew(std::size_t(kHeadDim) * geometry.kv_heads * width * 2), drow(sizeof(int));
+    dq.fill(); dnew.fill(); drow.fill();
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(int));
+    Tensor q(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width}),
+        out(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width}),
+        pos(dp.data(), DType::I32, {width}),
+        zero(dnew.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width});
+    const ops::CausalAttentionExecutionEnvelope envelope{keys, keys};
+    const auto bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), storage, envelope, 1, width, width);
+    GuardedDeviceBuffer scratch(bytes);
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), bytes});
+    const auto label = case_label("long-linear", geometry, storage,
+                                  {width, keys - width, keys, 928u}, MappingPattern::Fragmented);
+    std::cout << label << " cached=" << cached << std::endl;
+    if (cached) {
+        ops::causal_softmax_attention_cached(q, pos, op_geometry(geometry), kAttentionScale,
+                                             cache, envelope, workspace, out, nullptr);
+    } else {
+        PagedKVBatchLayerView batch{.k_pages = cache.k_pages, .v_pages = cache.v_pages,
+                                    .k_scale_pages = cache.k_scale_pages,
+                                    .v_scale_pages = cache.v_scale_pages,
+                                    .block_tables = Tensor(dt.data(), DType::I32, {pages, 1}),
+                                    .head_dim = kHeadDim, .num_kv_heads = geometry.kv_heads,
+                                    .storage = storage};
+        ops::causal_softmax_attention(q, zero, zero, pos, Tensor{},
+                                      Tensor(drow.data(), DType::I32, {1}), op_geometry(geometry),
+                                      kAttentionScale, batch, envelope, workspace, out, nullptr);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<double> reference(elements);
+    for (int t = 0; t < width; ++t)
+        for (int h = 0; h < geometry.q_heads; ++h)
+            for (int d = 0; d < kHeadDim; ++d)
+                reference[q_index(geometry, h, d, t)] =
+                    sums[(h / geometry.query_group()) * kHeadDim + d] / (positions[t] + 1);
+    int failures = verify_attention(label, bf16_bits_to_double(
+                                       copy_from_guarded<std::uint16_t>(dout, elements)),
+                                    reference, attention_criterion(storage));
+    failures += scratch.verify_guards(label.c_str());
+    failures += dout.verify_guards(label.c_str());
+    return failures;
+}
+
+int run_long_linear_cases() {
+    int failures = 0;
+    for (auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                         KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+                         KvCacheStorage::Fp8KeyNvfp4Value}) {
+        failures += run_long_linear_case(storage, 1, true);
+        failures += run_long_linear_case(storage, 6, false);
+    }
+    return failures;
+}
+
 } // namespace
+
+int run_softmax_attention_long_cache_tests() {
+    if (cuda_unavailable()) return 77;
+    return run_long_linear_cases() == 0 ? 0 : 1;
+}
 
 int run_softmax_attention_nvfp4_tests() {
     if (cuda_unavailable()) {
@@ -2458,6 +2578,7 @@ int run_softmax_attention_causal_cache_tests() {
     }
 
     int failures = verify_workspace_capacity_contract();
+    failures += run_long_linear_cases();
     failures += run_nvfp4_cases();
     failures += run_quantized_batch_cases(KvCacheStorage::Nvfp4Group16, 720u);
     failures += report_quantization_quality(KvCacheStorage::Nvfp4Group16, 724u);

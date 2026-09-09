@@ -26,6 +26,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    card.set_rope_frequencies(state.execution.rope_frequencies);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
 
@@ -86,6 +87,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache);
+        card.set_rope_frequencies(state.execution.rope_frequencies);
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
         Tensor budgets            = frame.remaining_budgets.slice(0, 0, batch_size);

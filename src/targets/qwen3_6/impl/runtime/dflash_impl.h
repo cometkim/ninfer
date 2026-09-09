@@ -188,7 +188,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
                              state.execution.device.stream);
                 ops::rope(layer_positions.view({layer_columns}), Config::head_dim,
-                          Config::rope_theta, key, state.execution.device.stream);
+                          ops::rope_linear_frequencies(Config::rope_theta, Config::head_dim),
+                          key, ops::RopeSide::Key, state.execution.device.stream);
                 Tensor key_batch =
                     key.view({Config::head_dim, Config::kv_heads, layer_width, batch});
                 Tensor value_batch =
@@ -390,7 +391,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                              state.execution.device.stream);
                 ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
                              state.execution.device.stream);
-                ops::rope(positions.view({columns}), Config::head_dim, Config::rope_theta, query,
+                ops::rope(positions.view({columns}), Config::head_dim,
+                          ops::rope_linear_frequencies(Config::rope_theta, Config::head_dim), query,
                           key, state.execution.device.stream);
                 Tensor query_batch =
                     query.view({Config::head_dim, Config::query_heads, width, batch_size});

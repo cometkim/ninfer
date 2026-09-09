@@ -58,6 +58,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include "ninfer/ops/softmax_attention.h"
+
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -80,6 +82,51 @@ inline constexpr std::uint32_t kHqUnaryGuard = kHqRowBudgetBytes * 8;
 inline constexpr float kHqAlpha = 1.45f;
 
 // ---- zig-zag + E8int (2*E8) exact nearest point ---------------------------
+
+// ---- subtractive dither -----------------------------------------------------
+//
+// Long-window bias remedy: the fixed-rate E8 row's quantization error is data-DEPENDENT, so
+// per-vector bias compounds over hundreds of thousands of distractor rows. Subtracting a
+// pseudo-random dither d in [-0.5, 0.5)^8 per (row, word) before the lattice nearest-point and
+// adding it back at decode makes the reconstruction error zero-mean and independent of the row.
+// d is derived from a counter hash of (kv_head, position, role, word) - regenerated identically
+// at every encode and decode site, never stored. The dither is ABSOLUTE (not rescaled by the
+// escalation halvings): encode quantizes u*2^-e - d, decode reconstructs (y + d)*2^e, so every
+// attempt level agrees. Never-written rows (zeroed metadata) still decode to exact zeros; the
+// terminal fallback row decodes to bounded dither noise instead of exact zero.
+
+__device__ __forceinline__ std::uint64_t hq_dither_row_seed(int kv_head, std::int64_t position,
+                                                            bool role_v) {
+    std::uint64_t x = 0x5DEECE66Dull ^
+                      (static_cast<std::uint64_t>(kv_head) * 0x2545F4914F6CDD1Dull) ^
+                      (static_cast<std::uint64_t>(position) * 0x9E3779B97F4A7C15ull) ^
+                      (role_v ? 0xA5A5A5A5A5A5A5A5ull : 0x1B873593B5244C61ull);
+    x ^= x >> 33;
+    x *= 0xFF51AFD7ED558CCDull;
+    x ^= x >> 33;
+    return x;
+}
+
+__device__ __forceinline__ std::uint64_t hq_dither_word_seed(std::uint64_t row_seed, int word) {
+    std::uint64_t x =
+        row_seed ^ (0x9E3779B97F4A7C15ull * (static_cast<std::uint64_t>(word) + 1u));
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    return x;
+}
+
+// Coordinate dither from byte j of the word seed: 8 bits of entropy per coordinate. Scale
+// calibration: the classical full-Voronoi-cell dither (spacing 2 -> [-1, 1)) explodes the
+// fixed-budget escalation rate (17% of corpus rows at alpha/2, net cosine 0.910); the half-cell
+// dither below removes most of the data-dependent bias while keeping the rescue rate at ~1.5%
+// and the pooled cosine at 0.936.
+__device__ __forceinline__ float hq_dither(std::uint64_t word_seed, int j) {
+    const std::uint32_t bits = static_cast<std::uint32_t>((word_seed >> (8 * j)) & 0xFFull);
+    return static_cast<float>(bits) * (1.0f / 255.0f) - 0.5f;
+}
 
 __device__ __forceinline__ std::uint32_t hq_zigzag(std::int32_t v) {
     return v >= 0 ? (static_cast<std::uint32_t>(v) << 1)
@@ -326,11 +373,14 @@ __device__ __forceinline__ void hq_ifwht256_sign(float (&reg)[8], const std::int
 // Encode one bf16 row (256 dims, contiguous) into codes[64] + meta[8].
 // Scratch: u_scaled (256 floats) and syms (256 uint32) in shared memory,
 // provided by the caller. One warp per row; lane 0 commits the outputs.
+// dither_seed (from hq_dither_row_seed) subtracts the per-word dither before
+// the lattice nearest-point; the decoders add it back.
 __device__ __forceinline__ void hq_encode_row_warp(const __nv_bfloat16* row,
                                                    const std::int8_t* signs, int sign_base,
                                                    float* u_scaled, std::uint32_t* syms,
                                                    std::uint8_t* codes_out,
-                                                   std::uint8_t* meta_out) {
+                                                   std::uint8_t* meta_out,
+                                                   std::uint64_t dither_seed) {
     const int lane = static_cast<int>(threadIdx.x & 31u);
     float reg[8];
     float sumsq = 0.0f;
@@ -378,8 +428,11 @@ __device__ __forceinline__ void hq_encode_row_warp(const __nv_bfloat16* row,
         {
             float x8[8];
             int y8[8];
+            const std::uint64_t wseed = hq_dither_word_seed(dither_seed, lane);
 #pragma unroll
-            for (int j = 0; j < 8; ++j) { x8[j] = u_scaled[lane * 8 + j]; }
+            for (int j = 0; j < 8; ++j) {
+                x8[j] = u_scaled[lane * 8 + j] - hq_dither(wseed, j);
+            }
             hq_quantize_e8int(x8, y8);
             hq_strip_word(y8, z8);
         }
@@ -491,10 +544,12 @@ __device__ __forceinline__ void hq_engine_signs_fill(std::int8_t* signs) {
 // Decode one row's codes[64] + meta[8] into 256 bf16 values (rotated frame).
 // ONE THREAD per row: the Rice scan is strictly serial within the row, so
 // the engine stages tiles by giving each thread one row (the measured
-// one-thread-per-row shape from the standalone codec benchmarks).
+// one-thread-per-row shape from the standalone codec benchmarks). dither_seed
+// must equal the encode-side seed for the same (kv_head, position, role).
 __device__ __forceinline__ void hq_decode_row_thread(const std::uint8_t* codes,
                                                      const std::uint8_t* meta,
-                                                     __nv_bfloat16* out) {
+                                                     __nv_bfloat16* out,
+                                                     std::uint64_t dither_seed) {
     const std::uint16_t norm_bits = static_cast<std::uint16_t>(meta[0]) |
                                     (static_cast<std::uint16_t>(meta[1]) << 8);
     __half h;
@@ -527,10 +582,11 @@ __device__ __forceinline__ void hq_decode_row_thread(const std::uint8_t* codes,
         }
         int y[8];
         hq_unstrip_word(z, y);
+        const std::uint64_t wseed = hq_dither_word_seed(dither_seed, w);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            out[w * 8 + j] =
-                __float2bfloat16(static_cast<float>(y[j]) * norm * inv_scale);
+            out[w * 8 + j] = __float2bfloat16(
+                (static_cast<float>(y[j]) + hq_dither(wseed, j)) * norm * inv_scale);
         }
     }
 }
@@ -616,10 +672,12 @@ __device__ __forceinline__ void hq_group_scan_window(unsigned long long w, std::
     }
 }
 
-__device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
-                                                    const std::uint8_t* meta,
-                                                    __nv_bfloat16* out, int lane,
-                                                    int xor_chunk = 0) {
+template <bool Packed = true>
+__device__ __forceinline__ void
+hq_decode_row_group(const std::uint8_t* codes, const std::uint8_t* meta, __nv_bfloat16* out,
+                    int lane, int xor_chunk, std::uint64_t dither_seed,
+                    std::uint16_t* symbols = nullptr) {
+    if (symbols == nullptr) { symbols = reinterpret_cast<std::uint16_t*>(out); }
     const std::uint32_t mw0 = *reinterpret_cast<const std::uint32_t*>(meta);
     const std::uint32_t mw1 = *reinterpret_cast<const std::uint32_t*>(meta + 4);
     const unsigned used_bits = ((mw0 >> 24) & 0xFFu) | ((mw1 & 0x3u) << 8);
@@ -678,7 +736,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
         int carry = __shfl_up_sync(gmask, run, 1, 8);
         if (lane == 0) { carry = 0; }
         // Decode this window's symbols: z = zeros before each 1-bit.
-        std::uint16_t* out16 = reinterpret_cast<std::uint16_t*>(out);
+        std::uint16_t* out16 = symbols;
         unsigned long long v = w;
         int n                = 0;
         while (v != 0ull && base + n < kHqHeadDim) {
@@ -728,7 +786,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
         }
         idx_total = idx;
 
-        std::uint16_t* out16 = reinterpret_cast<std::uint16_t*>(out);
+        std::uint16_t* out16 = symbols;
         int pending = -1;
         int s       = my_i;
         {
@@ -781,7 +839,7 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
     // zero, exactly like the sequential reader's unary guard. Well-formed
     // rows always parse 256 symbols, so this never runs in the engine.
     if (idx_total < kHqHeadDim && lane == 0) {
-        std::uint16_t* out16 = reinterpret_cast<std::uint16_t*>(out);
+        std::uint16_t* out16 = symbols;
 #pragma unroll 1
         for (int t = idx_total; t < kHqHeadDim; ++t) { out16[hq_swz_element(t, xor_chunk)] = 0; }
     }
@@ -803,17 +861,117 @@ __device__ __forceinline__ void hq_decode_row_group(const std::uint8_t* codes,
         const int word = lane + 8 * i;
         const int base = hq_swz_element(word * 8, xor_chunk);
         std::uint32_t z[8];
+        if constexpr (Packed) {
+            // Each lattice word occupies one aligned 16-byte vector. Keep the
+            // shared/global exchange vectorized instead of eight strided scalar loads.
+            const uint4 packed = *reinterpret_cast<const uint4*>(symbols + base);
+            const auto* lanes  = reinterpret_cast<const std::uint16_t*>(&packed);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            z[j] = reinterpret_cast<const std::uint16_t*>(out)[base + j];
+            for (int j = 0; j < 8; ++j) { z[j] = lanes[j]; }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { z[j] = symbols[base + j]; }
         }
         int y[8];
         hq_unstrip_word(z, y);
+        const std::uint64_t wseed = hq_dither_word_seed(dither_seed, word);
+        if constexpr (Packed) {
+            uint4 packed;
+            auto* values = reinterpret_cast<__nv_bfloat16*>(&packed);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            out[base + j] = __float2bfloat16(static_cast<float>(y[j]) * norm * inv_scale);
+            for (int j = 0; j < 8; ++j) {
+                values[j] = __float2bfloat16((static_cast<float>(y[j]) + hq_dither(wseed, j)) *
+                                             norm * inv_scale);
+            }
+            *reinterpret_cast<uint4*>(out + base) = packed;
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                out[base + j] = __float2bfloat16((static_cast<float>(y[j]) + hq_dither(wseed, j)) *
+                                                 norm * inv_scale);
+            }
         }
     }
+}
+
+// ---- residual side-plane rows -----------------------------------------------
+//
+// The residual window keeps exact bf16 K/V rows for the sink and recent positions in the codec's
+// ROTATED frame (both roles: every consumer runs QK and PV over rotated rows and un-rotates only
+// the output), laid out per (slot row) as [kCausalHqSinkKeys + kCausalHqRecentKeys][KVHeads][256].
+// One row is `key`'s side row: sink rows hold absolute key < kCausalHqSinkKeys directly; every
+// other key lives in the recent ring slot key & (kCausalHqRecentKeys - 1).
+
+inline constexpr int kHqRingWords = static_cast<int>(kCausalHqRecentKeys) / 32;
+// Per-slot validity words: [0, kHqRingWords) are the recent-ring bits (bit r = ring slot r holds
+// the row the next fetch will name); word kHqRingWords bit 0 marks the sink rows as populated for
+// the owning history (a lane's side rows can be stale across address-space handovers, so sink
+// validity is tracked instead of assumed).
+inline constexpr int kHqSideWords = kHqRingWords + 1;
+
+template <int KVHeads>
+__device__ __forceinline__ std::int64_t hq_residual_slot_stride() {
+    return static_cast<std::int64_t>(kCausalHqSinkKeys + kCausalHqRecentKeys) * KVHeads *
+           kHqHeadDim;
+}
+
+// Side-plane row pointer for one (slot, kv_head, key). `slot` is the side-plane row index; batch
+// views arrive pre-sliced to their layer and pass the batch's table row, single-sequence layer
+// views arrive pre-sliced to their slot and pass 0. The pointer type is deduced (const for
+// fetches, mutable for the dual-write appends).
+template <int KVHeads, typename Bf16>
+__device__ __forceinline__ Bf16* hq_residual_row(Bf16* plane, std::int32_t slot,
+                                                 std::int32_t kv_head, std::int32_t key) {
+    const std::int32_t row =
+        key < static_cast<std::int32_t>(kCausalHqSinkKeys)
+            ? key
+            : static_cast<std::int32_t>(kCausalHqSinkKeys) +
+                  (key & (static_cast<std::int32_t>(kCausalHqRecentKeys) - 1));
+    return plane + static_cast<std::int64_t>(slot) * hq_residual_slot_stride<KVHeads>() +
+           (static_cast<std::int64_t>(row) * KVHeads + kv_head) * kHqHeadDim;
+}
+
+// Recent-ring validity bit test. A null bitmap means every ring slot is valid (pre-filled planes;
+// the standalone gates).
+__device__ __forceinline__ bool hq_ring_slot_valid(const std::uint32_t* side_words,
+                                                   std::int32_t key) {
+    if (side_words == nullptr) { return true; }
+    const int r = key & (static_cast<int>(kCausalHqRecentKeys) - 1);
+    return (side_words[r >> 5] >> (r & 31)) & 1u;
+}
+
+// Sink-row validity test for one slot's words.
+__device__ __forceinline__ bool hq_sink_rows_valid(const std::uint32_t* side_words) {
+    return side_words == nullptr || (side_words[kHqRingWords] & 1u) != 0u;
+}
+
+// Store one exact bf16 row into a side plane in the rotated frame: bf16 -> FP32 FWHT(+signs) ->
+// bf16, the same single rounding the encode staging applies before quantization. One full warp per
+// row; 8 scattered 2-byte stores per lane (append paths only - not on the decode fetch path).
+__device__ __forceinline__ void hq_store_rotated_row_warp(const __nv_bfloat16* src,
+                                                          const std::int8_t* signs,
+                                                          __nv_bfloat16* dst) {
+    const int lane = static_cast<int>(threadIdx.x & 31u);
+    float reg[8];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) { reg[s] = __bfloat162float(src[s * 32 + lane]); }
+    hq_fwht256_sign(reg, signs, 0, lane);
+#pragma unroll
+    for (int s = 0; s < 8; ++s) { dst[s * 32 + lane] = __float2bfloat16(reg[s]); }
+}
+
+// Mark one appended key's ring slot valid, and the sink rows valid once a sink row is written
+// (idempotent; one atomic per row). Sink rows are immutable once written, so only the population
+// bit is needed.
+__device__ __forceinline__ void hq_ring_mark_valid(std::uint32_t* side_words,
+                                                   std::int32_t key) {
+    if (side_words == nullptr) { return; }
+    if (key < static_cast<std::int32_t>(kCausalHqSinkKeys)) {
+        atomicOr(&side_words[kHqRingWords], 1u);
+        return;
+    }
+    const int r = key & (static_cast<int>(kCausalHqRecentKeys) - 1);
+    atomicOr(&side_words[r >> 5], 1u << (r & 31));
 }
 
 } // namespace ninfer::ops

@@ -6,6 +6,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ninfer/ops/kv_cache_append.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -38,6 +39,9 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // The Text rope table for this run: the checkpoint-linear table, or the YaRN table when
+    // rope scaling is active. Vision and DFlash domains keep their own fixed tables.
+    const ops::RopeFrequencies& rope_frequencies;
 };
 
 struct PrefillContext {
