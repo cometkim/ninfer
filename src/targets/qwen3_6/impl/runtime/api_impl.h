@@ -18,9 +18,13 @@ SequencePlan<Variant>::SequencePlan(
     : impl_(std::move(impl)) {}
 
 template <>
-SequencePlan<Variant>::SequencePlan(SequencePlan&&) noexcept = default;
+SequencePlan<Variant>::SequencePlan(SequencePlan&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&&) noexcept = default;
+SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
 SequencePlan<Variant>::~SequencePlan() = default;
 
@@ -55,9 +59,13 @@ SequencePlanner<Variant>::SequencePlanner(
     : impl_(std::move(impl)) {}
 
 template <>
-SequencePlanner<Variant>::SequencePlanner(SequencePlanner&&) noexcept = default;
+SequencePlanner<Variant>::SequencePlanner(SequencePlanner&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&&) noexcept = default;
+SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
 SequencePlanner<Variant>::~SequencePlanner() = default;
 
@@ -80,9 +88,13 @@ RequestBasePlan<Variant>::RequestBasePlan(
     : impl_(std::move(impl)) {}
 
 template <>
-RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&&) noexcept = default;
+RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&&) noexcept = default;
+RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
 RequestBasePlan<Variant>::~RequestBasePlan() = default;
 
@@ -130,23 +142,31 @@ PressurePlanningSession<Variant>::PressurePlanningSession(
     : impl_(std::move(impl)) {}
 
 template <>
-PressurePlanningSession<Variant>::PressurePlanningSession(PressurePlanningSession&&) noexcept =
-    default;
+PressurePlanningSession<Variant>::PressurePlanningSession(PressurePlanningSession&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 
 template <>
 PressurePlanningSession<Variant>&
-PressurePlanningSession<Variant>::operator=(PressurePlanningSession&&) noexcept = default;
+PressurePlanningSession<Variant>::operator=(PressurePlanningSession&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 
 template <>
 PressurePlanningSession<Variant>::~PressurePlanningSession() = default;
 
 template <>
 CapturePressurePlanningSession<Variant>::CapturePressurePlanningSession(
-    CapturePressurePlanningSession&&) noexcept = default;
+    CapturePressurePlanningSession&& other) noexcept
+    : candidate_(std::move(other.candidate_)), session_(std::move(other.session_)) {}
 
 template <>
 CapturePressurePlanningSession<Variant>& CapturePressurePlanningSession<Variant>::operator=(
-    CapturePressurePlanningSession&&) noexcept = default;
+    CapturePressurePlanningSession&& other) noexcept {
+    candidate_ = std::move(other.candidate_);
+    session_   = std::move(other.session_);
+    return *this;
+}
 
 template <>
 CapturePressurePlanningSession<Variant>::~CapturePressurePlanningSession() = default;

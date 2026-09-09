@@ -3,7 +3,14 @@
 
 #include <spdlog/logger.h>
 
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#define NINFER_STDERR_FD ::_fileno(stderr)
+#else
 #include <unistd.h>
+#define NINFER_STDERR_FD STDERR_FILENO
+#endif
 
 #include <algorithm>
 #include <array>
@@ -20,9 +27,15 @@ namespace {
 class StderrCapture {
 public:
     StderrCapture() {
+#ifdef _WIN32
+        if (::_pipe(pipe_, 4096, _O_BINARY) != 0) {
+            throw std::runtime_error(std::strerror(errno));
+        }
+#else
         if (::pipe(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
-        saved_ = ::dup(STDERR_FILENO);
-        if (saved_ < 0 || ::dup2(pipe_[1], STDERR_FILENO) < 0) {
+#endif
+        saved_ = ::dup(NINFER_STDERR_FD);
+        if (saved_ < 0 || ::dup2(pipe_[1], NINFER_STDERR_FD) < 0) {
             throw std::runtime_error(std::strerror(errno));
         }
         ::close(pipe_[1]);
@@ -31,7 +44,7 @@ public:
 
     ~StderrCapture() {
         if (saved_ >= 0) {
-            (void)::dup2(saved_, STDERR_FILENO);
+            (void)::dup2(saved_, NINFER_STDERR_FD);
             ::close(saved_);
         }
         if (pipe_[0] >= 0) { ::close(pipe_[0]); }
@@ -39,14 +52,17 @@ public:
 
     std::string finish() {
         std::fflush(stderr);
-        if (::dup2(saved_, STDERR_FILENO) < 0) { throw std::runtime_error(std::strerror(errno)); }
+        if (::dup2(saved_, NINFER_STDERR_FD) < 0) {
+            throw std::runtime_error(std::strerror(errno));
+        }
         ::close(saved_);
         saved_ = -1;
 
         std::string output;
         std::array<char, 4096> buffer{};
         for (;;) {
-            const ssize_t count = ::read(pipe_[0], buffer.data(), buffer.size());
+            const int count = ::read(pipe_[0], buffer.data(),
+                                     static_cast<unsigned>(buffer.size()));
             if (count == 0) { break; }
             if (count < 0) {
                 if (errno == EINTR) { continue; }

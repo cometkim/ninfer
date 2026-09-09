@@ -1,4 +1,5 @@
 #include "qwen3_6_context_fixture.h"
+#include "core/uint128.h"
 
 #include "artifact/reader.h"
 #include "core/arena.h"
@@ -399,8 +400,8 @@ std::vector<TextCase> text_cases(std::uint32_t chunk) {
 }
 
 std::uint64_t attention_pairs(std::uint32_t prefix, std::uint32_t suffix) {
-    const unsigned __int128 pairs = static_cast<unsigned __int128>(prefix) * suffix +
-                                    static_cast<unsigned __int128>(suffix) * (suffix + 1ULL) / 2U;
+    const ninfer::Uint128 pairs    = ninfer::Uint128(prefix) * suffix +
+                                    ninfer::Uint128(suffix) * (suffix + 1ULL) / 2U;
     if (pairs > std::numeric_limits<std::uint64_t>::max()) {
         throw std::overflow_error("prefill attention-pair count exceeds uint64");
     }

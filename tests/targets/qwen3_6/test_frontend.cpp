@@ -30,6 +30,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#undef near
+#undef far
+#endif
+
 namespace {
 
 using Frontend          = ninfer::targets::qwen3_6::Frontend;
