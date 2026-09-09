@@ -48,6 +48,7 @@ Ongoing feature experimentation:
 
 | feat branch | stacked on | status | squashed on dev as |
 |---|---|---|---|
+| `feat/msvc-test-constexpr` | `master` | upstream PR candidate (constexpr to const test constants) | `squash(feat/msvc-test-constexpr)` |
 
 When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
 its row into the upstream lineage note.
@@ -161,6 +162,8 @@ Windows-port lineage:
 
 What this fork adds on top (one squashed commit per feature branch, per
 [About this fork](#about-this-fork)):
+
+
 
 
 Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
