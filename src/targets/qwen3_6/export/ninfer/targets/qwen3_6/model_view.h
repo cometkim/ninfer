@@ -100,8 +100,8 @@ struct DFlash2LayerWeights {
 
 struct DFlash2CandidateSelectorWeights {
     Weight hidden_projection;
-    Tensor predecessor_codebook;
-    Tensor successor_codebook;
+    Weight predecessor_codebook;
+    Weight successor_codebook;
 };
 
 struct DFlash2Weights {

@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_small_t.cuh"
+#include "ops/linear/nvfp4/nvfp4_small_t_launch.h"
 
 #include <array>
 #include <cstddef>
@@ -12,24 +13,6 @@ namespace ninfer::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-
-template <class Geometry, int ActiveTokens>
-void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Schedule = typename Nvfp4LinearSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
-    constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
-    constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
-
-    const Nvfp4ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data),
-                                       Geometry::kOutputRows};
-    const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
-    nvfp4_small_t_kernel<Geometry, ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
-            Nvfp4IdentityEpilogue{}, output);
-    CUDA_CHECK(cudaGetLastError());
-}
 
 template <class Geometry, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
@@ -63,6 +46,13 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
         return;
     case Nvfp4Problem::Residual17408:
         launchers<Nvfp4Residual17408Geometry>()[index](x, weight, out, stream);
+        return;
+    case Nvfp4Problem::DFlash2Feature:
+    case Nvfp4Problem::DFlash2Qkv:
+    case Nvfp4Problem::DFlash2AttnOut:
+    case Nvfp4Problem::DFlash2ConvProj:
+    case Nvfp4Problem::DFlash2Selector:
+        launch_nvfp4_small_t_dflash2(x, weight, out, stream);
         return;
     }
 }

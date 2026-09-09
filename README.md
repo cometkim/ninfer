@@ -54,6 +54,7 @@ Ongoing feature experimentation:
 | `feat/mtp7` | `master` | fork-only: MTP draft tokens to 7 | `squash(feat/mtp7)` |
 | `feat/hyperquant` | `feat/windows-port` | self-contained hq-e8-2b KV storage profile (codec, append/prompt/small-t routes, product surface) | `squash(feat/hyperquant)` |
 | `feat/1m-context` | `feat/hyperquant` | self-contained dither/residual window, YaRN, banded scratch, 1M envelope and retrieval gate | `squash(feat/1m-context)` |
+| `feat/dflash2` | `feat/windows-port` | fork-format NVFP4 DFlash2 draft module execution + unified binder; self-contained, also PR-able to nvfp4full-first forks | `squash(feat/dflash2)` |
 
 When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
 its row into the upstream lineage note.
@@ -192,6 +193,15 @@ What this fork adds on top (one squashed commit per feature branch, per
   prompt workspace independently of the envelope. BF16 sink/recent rows (32/512)
   and half-cell subtractive dither preserve the hq quality track. The independent
   1M-row codec retrieval gate requires all five needles at unique top-1.
+
+- **`feat/dflash2`** — the fork-format NVFP4 DFlash2 draft module: the v2 artifacts' 66-object
+  weight-only NVFP4 module executes end to end (five A16-only drafter linears, the 3-output
+  attn_input NVFP4 route, the dynamic-conv pair, the context_kv_materialize MMA family, and
+  the selector walk reading the K16M128x4 blocked scale plane), with one `bind_dflash2`
+  serving both the W8G32_F16S and NVFP4 module encodings through per-object format dispatch.
+  Self-contained on `feat/windows-port`, so it is also PR-able to forks that treat the
+  nvfp4full profile as first-class (upstream's DFlash2 schedule remains the semantic
+  authority; this branch carries only the module encoding's execution).
 
 Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
 requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from upstream.
