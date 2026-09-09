@@ -115,8 +115,8 @@ and measurement through the same public `.ninfer` Engine route. DFlash2 is upstr
 authority (stochastic selector walk, K1..15 x B1..8, full and optimized proposal heads) and rides
 the 27B artifacts as an optional 66-object `W8G32_F16S` companion bundle; the 35B-A3B target
 supports text-only DFlash. The fork's pre-rebase v2 images carry the same bundle in a
-weight-only NVFP4 encoding under fork object names: they load for Text/Vision/MTP, and selecting
-the DFlash2 lane on them is rejected until the NVFP4 draft execution port lands (HANDOFF.md).
+weight-only NVFP4 encoding. Their module directories now use the upstream section names, and
+the unified binder and NVFP4 draft execution routes support Text/Vision/MTP/DFlash2 on them.
 
 The current workload is one GPU and one resident model instance with a startup-fixed one to eight
 active requests. The Engine forms one compact decode batch at every round boundary and uses bounded
@@ -330,11 +330,13 @@ documented in README.md ("About this fork"). The rules that bind agent work:
   rebuild may drop or reorder (`git log --grep '^squash(feat/'`).
 - A feat branch merged by upstream is never squashed: sync `master`, rebase the
   remaining stack, drop its squash from the rebuild.
-- After every dev rebuild, verify content parity: `git diff feat/<tip> cometkim/dev
-  --name-only` must list only the fork-base files (README, .gitignore,
-  Directory.Build.props, build-live.ps1, HANDOFF.md, tests/fixtures/longcontext). A non-empty
-  extra diff means the re-apply lost or hybridized content — stop and fix before
-  continuing.
+- After every dev rebuild, verify content parity against the feature snapshots and the previous
+  integration tree. `git diff feat/<tip> cometkim/dev --name-only` includes fork-base files and
+  sibling-feature content because the stack has independent lineages; account for those differences
+  explicitly. Feature-owned differences require an intentional, validated integration form (for
+  example kernel-perf's fused/PDL forms of the plain hyperquant/1m paths). Stop and fix unexplained
+  lost or hybridized content. Each intermediate squash README must contain the skeleton plus the
+  union of feature rows and bullets integrated so far.
 - Pushing rewritten branches to origin always uses `--force-with-lease`.
 - `HANDOFF.md` (fork-base file) is the cross-session work-state document: read it at the
   start of a session before planning work, and update it before ending a session that

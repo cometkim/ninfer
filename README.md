@@ -67,7 +67,7 @@ charset flags — a CP949-locale build workaround owned by this environment, not
 
 ```
 git switch cometkim/dev
-git reset --hard a9c8e491               # the chore(dev) fork base, before any squash
+git reset --hard 83ddf726               # the chore(dev) fork base, before any squash
 git merge --squash feat/msvc-test-constexpr && git commit   # re-apply in stack order
 git merge --squash feat/windows-port        && git commit
 git merge --squash feat/webui               && git commit
