@@ -255,13 +255,42 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
         throw std::invalid_argument(std::string(op) + ": invalid KV cache head geometry");
     }
     const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
+    // U8 (hq-e8-2b) reaches the absolute envelope ceiling; the paged BF16/I8 decode kernels
+    // stage a fixed number of page ids per split, so their linear envelopes stay capped.
+    const std::uint32_t ceiling =
+        cache.storage == KvCacheStorage::HqE8Rice2B
+            ? kCausalAttentionMaximumVisibleKeys
+            : kCausalAttentionMaximumLinearVisibleKeys;
     if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
-        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > ceiling ||
         envelope.max_visible_keys > capacity ||
         (!masked && envelope.max_visible_keys < static_cast<std::uint32_t>(width))) {
         throw std::invalid_argument(std::string(op) + ": invalid execution envelope or table");
     }
+}
+
+
+// U8 prompt scratch: banded when the envelope exceeds one band. Fills the carry tensors (empty
+// for the single-band and non-U8 cases) and returns the visible-key bound to pass through.
+std::uint32_t allocate_hq_prompt_scratch(WorkspaceArena& workspace, std::int32_t kv_heads,
+                                         std::int32_t q_heads, std::int32_t width,
+                                         CausalAttentionExecutionEnvelope envelope,
+                                         KvCacheStorage storage, Tensor& scratch_k,
+                                         Tensor& scratch_v, Tensor& carry_acc, Tensor& carry_m,
+                                         Tensor& carry_l) {
+    if (storage != KvCacheStorage::HqE8Rice2B) { return envelope.max_visible_keys; }
+    const std::uint32_t span =
+        std::min(envelope.max_visible_keys, kCausalHqPromptScratchBandKeys);
+    const auto rows = static_cast<std::int32_t>(span);
+    scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, rows});
+    scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, rows});
+    if (span < envelope.max_visible_keys) {
+        carry_acc = workspace.alloc(DType::BF16, {kHeadDim, q_heads, width});
+        carry_m   = workspace.alloc(DType::FP32, {q_heads, width});
+        carry_l   = workspace.alloc(DType::FP32, {q_heads, width});
+    }
+    return envelope.max_visible_keys;
 }
 
 struct SmallTWorkspace {
@@ -424,10 +453,21 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             q_heads, width, batch_size, cache_storage, envelope);
         if (route == detail::CausalAttentionRoute::Prompt) {
             if (cache_storage == KvCacheStorage::HqE8Rice2B && batch_size == 1) {
-                // The rotated-frame scratch planes cover the visible history once per call.
+                // The rotated-frame scratch planes cover one band of the visible history; the
+                // banded carry state (bf16 acc + fp32 m/l over the query rows) rides beside it.
                 const std::int32_t kv_heads = q_heads == 24 ? 4 : 2;
-                return 2ULL * static_cast<std::size_t>(envelope.max_visible_keys) *
-                       static_cast<std::size_t>(kv_heads) * kHeadDim * sizeof(std::uint16_t);
+                const std::size_t band =
+                    std::min(envelope.max_visible_keys, kCausalHqPromptScratchBandKeys);
+                const std::size_t scratch =
+                    2ULL * band * static_cast<std::size_t>(kv_heads) * kHeadDim *
+                    sizeof(std::uint16_t);
+                const std::size_t carry =
+                    envelope.max_visible_keys > band
+                        ? static_cast<std::size_t>(kHeadDim) * q_heads *
+                              static_cast<std::size_t>(max_width) * sizeof(std::uint16_t) +
+                              2ULL * q_heads * static_cast<std::size_t>(max_width) * sizeof(float)
+                        : 0ULL;
+                return scratch + carry;
             }
             return std::size_t{0};
         }
@@ -498,14 +538,15 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     }
     Tensor scratch_k;
     Tensor scratch_v;
-    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
-        const auto span = static_cast<std::int32_t>(envelope.max_visible_keys);
-        const auto kv_heads = geometry.kv_heads;
-        scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, span});
-        scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, kv_heads, span});
-    }
+    Tensor carry_acc;
+    Tensor carry_m;
+    Tensor carry_l;
+    const std::uint32_t visible_keys =
+        allocate_hq_prompt_scratch(workspace, geometry.kv_heads, q.ne[1], q.ne[2], envelope,
+                                   cache.storage, scratch_k, scratch_v, carry_acc, carry_m,
+                                   carry_l);
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                           cache, scratch_k, scratch_v, out, stream);
+                                           cache, scratch_k, scratch_v, carry_acc, carry_m, carry_l, visible_keys, out, stream);
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
@@ -534,13 +575,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     }
     Tensor scratch_k;
     Tensor scratch_v;
-    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
-        const auto span = static_cast<std::int32_t>(envelope.max_visible_keys);
-        scratch_k       = workspace.alloc(DType::BF16, {kHeadDim, geometry.kv_heads, span});
-        scratch_v       = workspace.alloc(DType::BF16, {kHeadDim, geometry.kv_heads, span});
-    }
+    Tensor carry_acc;
+    Tensor carry_m;
+    Tensor carry_l;
+    const std::uint32_t visible_keys =
+        allocate_hq_prompt_scratch(workspace, geometry.kv_heads, q.ne[1], q.ne[2], envelope,
+                                   cache.storage, scratch_k, scratch_v, carry_acc, carry_m,
+                                   carry_l);
     detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, scratch_k,
-                                                     scratch_v, out, stream);
+                                                     scratch_v, carry_acc, carry_m, carry_l, visible_keys, out, stream);
 }
 
 } // namespace ninfer::ops

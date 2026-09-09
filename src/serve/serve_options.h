@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "product/speculative_options.h"
 #include "product/logging/logging.h"
 
 #include <cstddef>
@@ -43,6 +44,7 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    product::RopeScalingSpec rope_scaling;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     bool enable_vision      = false;

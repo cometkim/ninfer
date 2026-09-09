@@ -6,6 +6,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
@@ -634,6 +635,11 @@ public:
     const std::uint32_t shared_prefix_capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    const ops::RopeFrequencies rope_frequencies;
+    const float rope_scaling_factor;
+    const float rope_scaling_temperature;
+    const float rope_scaling_beta_fast;
+    const float rope_scaling_beta_slow;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;

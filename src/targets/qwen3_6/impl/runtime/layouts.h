@@ -7,6 +7,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/tensor.h"
+#include "ninfer/ops/rope.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/state_image.h>
@@ -83,6 +84,11 @@ struct SequencePlanningInputs {
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;
+    // 0 (default): linear rope at the checkpoint's native positions; > 1 selects YaRN scaling.
+    float rope_scaling_factor      = 0.0F;
+    float rope_scaling_temperature = 0.1F;
+    float rope_scaling_beta_fast   = 32.0F;
+    float rope_scaling_beta_slow   = 1.0F;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -106,6 +112,12 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;
+    float rope_scaling_factor      = 0.0F;
+    float rope_scaling_temperature = 0.1F;
+    float rope_scaling_beta_fast   = 32.0F;
+    float rope_scaling_beta_slow   = 1.0F;
+    // The resolved Text rope table (linear, or YaRN when rope_scaling_factor > 1).
+    ops::RopeFrequencies text_rope{};
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;

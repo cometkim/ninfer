@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/rope_scaling.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -646,6 +647,13 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
         throw std::invalid_argument("max_context exceeds the variant native context capacity");
     }
+    if (options.kv_cache != KvCacheStorage::HqE8Rice2B &&
+        options.max_context > ops::kCausalAttentionMaximumLinearVisibleKeys) {
+        throw std::invalid_argument(
+            "max_context beyond " +
+            std::to_string(ops::kCausalAttentionMaximumLinearVisibleKeys) +
+            " requires --kv-dtype hq-e8-2b: bf16/int8 KV envelopes stay at the linear limit");
+    }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
@@ -675,6 +683,27 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         break;
     default:
         throw std::invalid_argument("unknown kv_capacity policy");
+    }
+    if (options.rope_scaling_factor < 0.0F || options.rope_scaling_factor > 64.0F ||
+        (options.rope_scaling_factor > 0.0F && options.rope_scaling_factor < 1.0F) ||
+        !std::isfinite(options.rope_scaling_factor)) {
+        throw std::invalid_argument(
+            "rope_scaling_factor must be 0/1 (linear) or a YaRN factor in (1, 64]");
+    }
+    if (options.rope_scaling_factor > 1.0F) {
+        if (options.speculative.backend == SpeculativeBackend::DFlash) {
+            throw std::invalid_argument("DFlash does not support rope scaling");
+        }
+        if (!(options.rope_scaling_temperature > 0.0F) ||
+            !std::isfinite(options.rope_scaling_temperature)) {
+            throw std::invalid_argument("rope_scaling_temperature must be positive and finite");
+        }
+        if (!(options.rope_scaling_beta_fast > options.rope_scaling_beta_slow &&
+              options.rope_scaling_beta_slow > 0.0F) ||
+            !std::isfinite(options.rope_scaling_beta_fast) ||
+            !std::isfinite(options.rope_scaling_beta_slow)) {
+            throw std::invalid_argument("YaRN ramp requires beta_fast > beta_slow > 0");
+        }
     }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
@@ -728,6 +757,20 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
+    impl->rope_scaling_factor      = inputs.rope_scaling_factor;
+    impl->rope_scaling_temperature = inputs.rope_scaling_temperature;
+    impl->rope_scaling_beta_fast   = inputs.rope_scaling_beta_fast;
+    impl->rope_scaling_beta_slow   = inputs.rope_scaling_beta_slow;
+    impl->text_rope                = inputs.rope_scaling_factor > 1.0F
+                        ? qwen3_6::rope_yarn_frequencies(TextConfig::rope_theta,
+                                                TextConfig::rotary_dim,
+                                                TextConfig::original_positions,
+                                                inputs.rope_scaling_factor,
+                                                inputs.rope_scaling_temperature,
+                                                inputs.rope_scaling_beta_fast,
+                                                inputs.rope_scaling_beta_slow)
+                        : ops::rope_linear_frequencies(TextConfig::rope_theta,
+                                                       TextConfig::rotary_dim);
     impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
@@ -799,6 +842,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .device              = options.device,
         .context_cache       = options.context_cache,
+        .rope_scaling_factor      = options.rope_scaling_factor,
+        .rope_scaling_temperature = options.rope_scaling_temperature,
+        .rope_scaling_beta_fast   = options.rope_scaling_beta_fast,
+        .rope_scaling_beta_slow   = options.rope_scaling_beta_slow,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

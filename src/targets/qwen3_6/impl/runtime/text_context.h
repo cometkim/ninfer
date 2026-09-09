@@ -8,6 +8,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
@@ -163,6 +164,12 @@ public:
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
 
+    // The Text rope table for this run (checkpoint-linear by default; the YaRN table when rope
+    // scaling is active). Set once per construction from the schedule's ExecutionCore.
+    void set_rope_frequencies(const ops::RopeFrequencies& frequencies) noexcept {
+        rope_frequencies_ = frequencies;
+    }
+
     void set_proposal_head(const Weight* weight, const std::int32_t* ids, int count) noexcept {
         proposal_head_     = weight;
         proposal_head_ids_ = ids;
@@ -304,6 +311,7 @@ private:
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
     std::uint32_t text_kv_base_;
+    ops::RopeFrequencies rope_frequencies_{};
     const Tensor* active_cache_positions_                                          = nullptr;
     const Tensor* active_rope_positions_                                           = nullptr;
     const Tensor* active_kv_table_rows_                                            = nullptr;

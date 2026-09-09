@@ -102,24 +102,31 @@ void causal_attention_prompt_hq_launch(const Tensor& q, const Tensor& k, const T
                                        const Tensor& positions, const Tensor& valid_columns,
                                        const Tensor& table_rows, float scale,
                                        PagedKVBatchLayerView cache, const Tensor& scratch_k,
-                                       const Tensor& scratch_v, Tensor& out,
+                                       const Tensor& scratch_v, const Tensor& carry_acc,
+                                       const Tensor& carry_m, const Tensor& carry_l,
+                                       std::uint32_t visible_keys, Tensor& out,
                                        cudaStream_t stream);
 
 void causal_attention_prompt_hq_attention_launch(const Tensor& q, const Tensor& positions,
                                                  float scale, const PagedKVLayerView& cache,
                                                  const Tensor& scratch_k, const Tensor& scratch_v,
-                                                 Tensor& out, cudaStream_t stream);
+                                                 const Tensor& carry_acc, const Tensor& carry_m,
+                                                 const Tensor& carry_l,
+                                                 std::uint32_t visible_keys, Tensor& out,
+                                                 cudaStream_t stream);
 
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
                                     PagedKVBatchLayerView cache, const Tensor& scratch_k,
-                                    const Tensor& scratch_v, Tensor& out, cudaStream_t stream);
+                                    const Tensor& scratch_v, const Tensor& carry_acc, const Tensor& carry_m,
+                                    const Tensor& carry_l, std::uint32_t visible_keys, Tensor& out, cudaStream_t stream);
 
 void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                               const PagedKVLayerView& cache,
                                               const Tensor& scratch_k, const Tensor& scratch_v,
-                                              Tensor& out, cudaStream_t stream);
+                                              const Tensor& carry_acc, const Tensor& carry_m,
+                                    const Tensor& carry_l, std::uint32_t visible_keys, Tensor& out, cudaStream_t stream);
 
 void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                         const Tensor& positions, const Tensor& valid_columns,

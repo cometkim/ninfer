@@ -731,6 +731,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
+      rope_frequencies(plan.text_rope), rope_scaling_factor(plan.rope_scaling_factor),
+      rope_scaling_temperature(plan.rope_scaling_temperature),
+      rope_scaling_beta_fast(plan.rope_scaling_beta_fast),
+      rope_scaling_beta_slow(plan.rope_scaling_beta_slow),
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
@@ -1101,7 +1105,8 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             schedule::PrefillContext schedule_state{
                 {device, model, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head},
+                 prefill_chunk, proposal_head,
+                 rope_frequencies},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -8953,7 +8958,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 schedule::PrefillContext schedule_state{
                     {device, model, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head},
+                     proposal_head, rope_frequencies},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     decoder->text_kv,
@@ -11562,7 +11567,8 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     schedule::DFlashAppendContext state{{device, model, work, state_images->linear(),
                                          replay_records ? &*replay_records : nullptr, io,
-                                         prefill_hidden, prefill_chunk, proposal_head},
+                                         prefill_hidden, prefill_chunk, proposal_head,
+                                        rope_frequencies},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts,
@@ -11621,7 +11627,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         schedule::PrefillContext schedule_state{
             {device, model, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, rope_frequencies},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -11946,7 +11952,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                        replay_records ? &*replay_records : nullptr,
                                                        io, prefill_hidden, prefill_chunk,
-                                                       proposal_head},
+                                                       proposal_head, rope_frequencies},
                                                       decoder->text_kv,
                                                       *io.ordinary,
                                                       *ordinary_host_ingress,
@@ -12105,7 +12111,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                   replay_records ? &*replay_records : nullptr, io,
-                                                  prefill_hidden, prefill_chunk, proposal_head},
+                                                  prefill_hidden, prefill_chunk, proposal_head,
+                                        rope_frequencies},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -12300,7 +12307,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head},
+                                                     proposal_head, rope_frequencies},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,
@@ -12468,6 +12475,21 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.max_context      = capacity;
     out.kv_capacity      = kv_capacity;
     out.kv_cache         = kv_storage;
+    out.rope_scaling_factor      = rope_scaling_factor;
+    out.rope_scaling_temperature = rope_scaling_temperature;
+    out.rope_scaling_beta_fast   = rope_scaling_beta_fast;
+    out.rope_scaling_beta_slow   = rope_scaling_beta_slow;
+    constexpr std::uint32_t trained_positions = TextConfig::original_positions;
+    if (rope_scaling_factor > 1.0F) {
+        if (capacity <= trained_positions) {
+            out.rope_note =
+                "rope scaling is active below the checkpoint's native position range; this "
+                "costs short-prompt quality";
+        }
+    } else if (capacity > trained_positions) {
+        out.rope_note =
+            "max-context exceeds the checkpoint's trained positions without rope scaling";
+    }
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =
