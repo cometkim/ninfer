@@ -2,7 +2,8 @@
 
 Read with AGENTS.md before planning work. Earlier records remain recoverable from
 refs/backup/pre-sync-20260908/*, backup/20260908/all-refs.bundle, and
-refs/backup/post-rebase-20260909/{dev,1m-context}.
+refs/backup/post-rebase-20260909/{dev,1m-context}. The branch tips before these checks are retained in
+refs/backup/populated-20260909/{dev,1m-context}.
 
 ## Current state (2026-09-09)
 
@@ -19,7 +20,7 @@ previously claimed cumulative +77% gain.
 | feat/webui | 81e077f4 | windows-port |
 | feat/mtp7 | e3bf30db | master; MTP K1–K7 |
 | feat/hyperquant | 5be7eb60 | windows-port; self-contained, PDL-free HQ |
-| feat/1m-context | ae0eeb87 | hyperquant; plain rmsnorm → rope |
+| feat/1m-context | 7061557f | hyperquant; plain rmsnorm → rope; populated-cache bounds and HQ throughput fixed |
 | feat/dflash2 | 90fd8a3b | windows-port; unified NVFP4 draft execution |
 | feat/qwen3.8-nvfp4full | bc36e9c2 | dflash2 |
 | feat/qwen3.8-nvfp4qat | c17ccc30 | dflash2 |
@@ -30,8 +31,10 @@ msvc-test-constexpr, windows-port, webui, mtp7, hyperquant, 1m-context, dflash2,
 qwen3.8-nvfp4full, qwen3.8-nvfp4qat, kernel-perf. The integration fold retains PDL HQ/DFlash
 forms and the splice tool. Dev-only supporting commits add same-binary measurement controls,
 local preset budgets and session documentation; preserve these or fold their content deliberately.
-The runtime/preset tip is 209cf315, followed by the session-documentation commit containing this
-file. The validated standalone build remains in ../ninfer-1m-report on codex/1m-report;
+The populated-history follow-up folds the long-cache fixes and qualified HQ optimization into
+the 1M squash and preserves the subsequent integration forms (dev 01afc781 before the follow-up
+documentation commit). Feature content f30372e2 is followed by its README tip commit.
+The validated standalone build remains in ../ninfer-1m-report on codex/1m-report;
 its two untracked Ninja wrappers are local build aids, not feature content.
 
 Each feature has its own README tip commit. All ten intermediate squashes passed the README
@@ -61,7 +64,8 @@ tokens, compared 524288/yarn:2 and 1048576/yarn:4:
 | active workspace | 1.08 GiB | 1.08 GiB |
 | non-speculative graph allowance | 12 MiB | 12 MiB |
 
-27B attention split capacity is capped at 85. Per-round grids/splits follow live history and use
+At that measurement, 27B attention split capacity was capped at 85 (the later narrow HQ tile
+below raises the single-token cap to 170). Per-round grids/splits follow live history and use
 the same initial graph interval here; there is no current envelope-scaled decode explosion.
 Initial 128-token envelope pairs measured 81.2/81.1 and 80.6/79.6 tok/s (524k/1M), establishing
 that the old cliff is absent, not measuring long-history speed.
@@ -106,7 +110,178 @@ The corrected 1M server decoded 64 tokens at **80.1 tok/s** from a 60-token requ
 proves execution at the envelope; it does not establish quality or speed with a populated
 1M-token history. Synthetic codec retrieval is not an end-to-end long-context quality gate.
 
-## Idle paired measurements
+## Populated history validation
+
+The populated-history follow-up uses the corrected code above. Both runtime variant objects have
+valid Ninja header dependencies (116/117). Local scripts and evidence are under
+`profiles/bench/populated-20260909/`: prepare.py creates prompts from the frozen benchmark
+corpus using the artifact's embedded tokenizer/template; quality.ps1 runs the public CLI with
+MTP0; score.py checks exact registry values and Engine token counts. The paired.ps1 campaign
+uses combined prefill/decode, identical populated prompts, MTP0 and alternating KV profiles.
+
+The first 524032-token model request exposed a real HQ decode bug: a leftover shared page array
+had 64 entries, but long splits need more (about 97 pages at 524k with 85 splits). The HQ decoder
+already reads physical pages directly, so the unused staging and reads were removed. A focused
+operator reproducer failed at 524k before the change and passes through near-1M afterward.
+All 26 original HQ cases plus 11 new sparse, nonzero long-cache oracle cases pass on dev and
+the standalone 1M branch (worst new relative L2 0.002316). The new cases cover prompt carry,
+cached prompt and small-T decode with reversed page tables and both head geometries.
+Compute Sanitizer could not attach (launch timeout), so no sanitizer-clean claim is made.
+The same 64-entry allocation remained in all five linear KV kernels despite the documented
+524288-key/128-entry contract. Their staging is restored to 128 entries; cached, batched and
+workspace entry points now consistently enforce the storage-specific ceiling. A pre-fix BF16
+524288-key reproducer fails with cudaErrorIllegalAddress. All ten new sparse nonzero linear
+cases (cached T1 and append T6 for each format) pass on both branches, and the full dev softmax
+suite passes. The standalone linear test build used the existing MSVC constexpr-sqrt fixture
+correction locally; that unrelated fixture change was restored before committing the feature.
+
+The 524k, 786k and near-1M model requests complete with all four exact registry values on the
+bounds-corrected binary, before the HQ throughput optimization below. These individual quality
+requests are not paired KV comparisons or qualification of a later binary's exact token path.
+
+| actual prompt tokens | YaRN factor | exact registry values | bare JSON | prefill tok/s | decode tok/s |
+|---|---:|---:|---|---:|---:|
+| 8192 | 1 | 3/3 | yes | 9150 | 71.0 |
+| 262144 | 1 | 3/3 | code fence | 1820 | 25.9 |
+| 524032 | 2 | 4/4 | yes | 978.1 | 15.8 |
+| 786176 | 3 | 4/4 | yes | 669.9 | 10.6 |
+| 1048320 | 4 | 4/4 | yes | 511.3 | 8.4 |
+
+All needles are outside the BF16 residual window; higher-context prompts include a fourth
+needle just beyond the 262144-key scratch-band boundary. These are synthetic retrieval probes,
+not broad long-document reasoning scores. Active workspace remains 1.08 GiB from 262k through
+1M (3.61 GiB free after startup at 1M). Engine token counts match the embedded-tokenizer
+preparation exactly; no prompt reuse. The user's active follow-up is to assess single-5090
+headroom and improve HQ's practical populated-history throughput. A same-binary 262k INT8/HQ
+baseline is complete. The subsequent HQ optimization and populated KV comparisons are recorded
+below; do not combine their rates with the earlier quality-run timings.
+
+## HyperQuant throughput and single-5090 headroom
+
+Whole-Engine Nsight Systems profiling at P262144/G32, nvfp4full/MTP0, identified HQ attention
+as the relevant cost. HQ prompt attention accounts for 68.4% of GPU time and scratch decoding
+for another 17.1%; the corresponding INT8 prompt attention takes 66.3 s versus HQ's 97.4 s plus
+24.3 s scratch decoding. The model has 16 full-attention layers, 24 query heads, four KV heads,
+and head dimension 256. Weight-kernel times are comparable between those routes. These are
+attribution runs, not paired throughput baselines.
+
+Nsight Compute counters are now accessible. At a 261120-key cached single-token HQ operator,
+the old kernel uses 255 registers/thread, no spills, 5.08% DRAM throughput and 40.03% SM
+throughput. About 59% of scheduler cycles have no eligible warp; fixed-latency dependencies
+are a major stall source. It is not close to the 5090's memory-bandwidth ceiling. The prompt
+scratch decoder separately saturates L2 (86.3%) while using only 4.44% compute: temporary Rice
+symbols were being written to and reread from the global BF16 output plane.
+
+The selected implementation keeps the codec, dither and residual semantics intact:
+
+- Prompt decoding keeps temporary symbols in shared memory and uses aligned vector transfers
+  for complete lattice words. Only final BF16 values reach the caller's bounded scratch planes.
+- Single-token HQ attention uses a 16-key tile with four warps consuming disjoint 64-coordinate
+  PV slices. Queries remain in shared memory; each thread keeps 32 output accumulators instead
+  of 128. The 27B B1 split cap becomes 170; the alternate geometry is capped at 256. Active
+  splits and the reducer use the same policy. Wider speculative tiles retain their prior route.
+
+At the same profiler-controlled 2.40 GHz, the new single-token kernel takes 1.06 ms versus
+1.73 ms, with 110 registers/thread, no spills, 8.79% DRAM throughput and 59.06% SM throughput.
+This is a kernel-level improvement; substantial decode headroom remains. Heavy instantiations
+stay in the per-geometry translation units. The production path has no HQ experiment switch;
+the frozen local candidate binaries retain both variants for same-binary alternating A/B runs.
+
+The [NVIDIA Blackwell specification](https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf)
+gives 209.5 dense BF16 TFLOP/s with FP32 accumulation and 1792 GB/s memory bandwidth for the
+5090 at its rated boost clock. The current BF16 attention route needs approximately
+`2 * 16 * 24 * 256 * N^2` useful FLOPs for a cold causal prefill. At N=1048320 this is about
+216 PFLOPs: attention alone has an ideal lower bound near 17 minutes at rated boost, or
+14.5 minutes at the observed 2.85 GHz clock. The earlier 34-minute complete prefill therefore
+has useful attention work equivalent to roughly 42–50% of that compute ceiling. Several
+thousand tok/s for a cold 1M prompt exceeds this arithmetic path's theoretical peak; short
+prefills can reach several thousand tok/s because the attention work grows quadratically.
+These are roofline estimates, not measured optimized 1M throughput.
+
+[Upstream's published NVFP4-weight/INT8-KV result](https://github.com/Neroued/ninfer/blob/master/docs/performance/qwen3.8-27b.md#no-speculation-context-profile)
+is 2203.1 prefill / 52.9 decode tok/s at 260096 prompt tokens. It does not publish a 1M result.
+Its artifact, Linux serving workload and historical revision differ from this fork's Windows
+nvfp4full benchmark. The matched local KV comparisons isolate HQ's cost; the published tables
+alone cannot establish or exclude a fork-wide regression.
+
+Measurement caution: an initial candidate Engine pair was contaminated by DWM consuming
+35–38% of the 5090 after prelaunch idle checks had passed. That pair is inconclusive. Subsequent
+runs monitor DWM throughout each process as well as checking idle GPU utilization before launch.
+Do not reuse the contaminated `engine-narrow-*` rates as an optimization baseline.
+
+Two monitored same-binary alternating old/new pairs, nvfp4full, MTP0, P8192 or P262144,
+G128, chunk1024, fresh populated corpus, one measured request per process:
+
+| actual prompt tokens | old prefill tok/s | new prefill tok/s | paired prefill gain | old decode tok/s | new decode tok/s | paired decode gain |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8192 | 9515.2 | 9606.5 | +0.96% | 75.48 | 81.02 | +7.34% |
+| 262144 | 1925.9 | 2238.5 | +16.23% | 27.95 | 36.99 | +32.36% |
+
+The two 262k decode gains are +29.67% and +35.05%; its prefill gains are +15.83% and +16.63%.
+The 8k prefill difference is small and should not be treated as a robust gain. Prelaunch GPU
+checks pass; DWM's 95th-percentile utilization is at most 5% in all eight cells (at most 2% in
+the 262k cells). Two brief 19–23% spikes occur during artifact loading, before the measured
+prefill, with no such load during decode. This replaces the earlier apparent decode regression.
+Local evidence: `engine-idle-narrow-*` reports and desktop samples. These measurements establish
+the Engine-level improvement at the populated lengths shown; the optimized complete 1M request
+has not been timed, and the earlier 511.3/8.4 tok/s quality-run rates remain pre-optimization.
+
+At 1048320 populated keys, two additional same-binary cached W1 operator pairs measure
+6570.1 us before versus 4009.3 us after (1.64x throughput, 39.0% less time). These cold-cache
+CUDA-graph timings cover the whole append-free attention Op, including its reducer, with
+three warmups and 20 repetitions per cell. They establish that the decode improvement carries
+through the 1M range without claiming a new complete-model 1M generation rate.
+
+Final production-binary KV comparisons use the explicit nvfp4full v2 artifact, MTP0, G128,
+chunk1024, a fresh populated corpus and capacity P+256. Each comparator has its own adjacent
+HQ control: two alternating pairs at 8k and one pair at 262k, 18 successful process cells.
+Three consecutive prelaunch GPU samples are at most 5%; DWM remains at most 5% throughout
+every process. Rates below are cell means; the single long-context pair does not establish
+fine rankings between close prefill results. Evidence is in `optimized-paired/` and
+`optimized-summary.json` under the populated-history profile directory.
+
+| prompt tokens | comparator | comparator prefill tok/s | HQ prefill tok/s | comparator decode tok/s | HQ decode tok/s | comparator KV GiB | HQ KV GiB |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 8192 | int8 | 10066.0 | 9640.4 | 85.31 | 80.90 | 0.266 | 0.106 |
+| 8192 | k8v4 | 9984.1 | 9658.3 | 85.57 | 81.11 | 0.202 | 0.106 |
+| 8192 | nvfp4 | 9862.8 | 9583.3 | 85.73 | 81.07 | 0.145 | 0.106 |
+| 262144 | int8 | 3083.4 | 2246.7 | 59.24 | 37.73 | 8.258 | 2.285 |
+| 262144 | k8v4 | 2541.9 | 2234.2 | 63.47 | 37.53 | 6.287 | 2.285 |
+| 262144 | nvfp4 | 2318.8 | 2233.6 | 64.00 | 37.61 | 4.504 | 2.285 |
+
+The owner's recalled HQ/INT8 ratio of about 80–85% is recorded at **32k**, not as a constant
+across context lengths. The pre-reorganization HANDOFF (`70160d9e^`) records MTP0 P32768/G64
+at INT8 69.6 and HQ 58.05 tok/s (83.4%); the pre-sync roadmap also identifies 32k explicitly.
+Two current same-binary alternating pairs with P32768/G64 measure INT8 **81.66** and HQ
+**73.66 tok/s (90.2%)**. Prelaunch idle checks pass; DWM peaks at 6% in one HQ cell and at
+2–4% in the others, with consistent pair ratios. These current cells use nvfp4full, whereas
+the archived table describes the official NVFP4 artifact; they are not an exact historical
+artifact/corpus/toolchain rerun. The 63.7% ratio at 262k alone therefore does not demonstrate
+a post-rebase regression against that 32k record, and these checks do not prove the whole
+fork regression-free. Local evidence: `historical-shape-p32768-*`.
+
+Historical source inspection finds the same cooperative Rice decoder and serialized
+decode/barrier/MMA structure before the port; an asynchronous HQ pipeline was not lost.
+The current FP32 partials are an intentional, oracle-qualified numerical profile. HQ's
+remaining long-history gap is material: general-use performance remains the objective,
+and the capacity savings do not make that gap an accepted performance target.
+
+Production verification: both branch tips rebuild with the Ninja wrappers. HQ codec, all 44 HQ
+attention cases (32 ordinary/nonzero-query and 12 long-cache cases), RoPE, rope-scaling and the
+5/5 retrieval gate pass on the standalone branch and dev. The complete dev softmax-attention
+suite also passes. Dev CLI, server and benchmark are rebuilt; the standalone CLI is rebuilt.
+The optimized production CLI also returns all three exact registry values as bare JSON from
+the 8192-token prompt (56 generated tokens, exit 0). This is a short behavioral check; the
+earlier complete 1M retrieval result remains tied to the pre-optimization binary.
+The feature stays free of fused qk_norm_rope and PDL dependencies. The rebuilt dev retains all
+ten feature squashes and each intermediate README union. Final content changes relative to
+the preceding integration are the populated-cache bounds fixes and this HQ optimization;
+the plain/fused differences remain explicit, validated integration forms.
+
+## Earlier idle seed-token measurements
+
+The following tables record the prior dev 0d56ec5d binary, before the populated-cache fixes.
+They remain evidence for those short-history workloads, not measurements of the new binary.
 
 RTX 5090, sm_120a, Windows, MSVC 19.44.35228, nvcc 13.3.73, CMake 4.4.2, Ninja wrappers.
 JSON reports CUDA runtime/driver API 13.4. Exact artifacts: models/qwen3_8_27b_nvfp4full.ninfer
@@ -226,8 +401,13 @@ unpaired cells, width-cliff claims and old record comparisons must not be reused
 
 ## Next work and build discipline
 
-1. On the next kernel-perf rebase, drop its duplicated Windows TMA fix (already in windows-port).
-2. For long-context quality, use populated prompts on the corrected binary. Old coding/model-card
+1. Before publishing a new complete-model 1M rate, time the optimized populated request. The
+   current 1M optimization evidence is operator-level; complete-model paired evidence is at 8k
+   and 262k. Remaining HQ decode headroom is in its instruction-heavy entropy reconstruction;
+   raising the cold-prefill arithmetic ceiling requires a separately qualified precision/path
+   change, not a larger graph envelope or scratch allocation.
+2. On the next kernel-perf rebase, drop its duplicated Windows TMA fix (already in windows-port).
+3. For long-context quality, use populated prompts on the corrected binary. Old coding/model-card
    campaigns need a fresh lane choice and rerun before being advertised as post-rebase results.
 
 Use powershell -ExecutionPolicy Bypass -File configure-ninja.ps1 once per build directory and
