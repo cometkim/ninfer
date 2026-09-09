@@ -196,6 +196,12 @@ block length eight, while fifteen uses the maximum supported block length sixtee
 
 The table lists executable defaults. The examples above select FP8 KV and MTP3.
 
+The 27B runtime permits up to 1,048,576 logical tokens with `hq-e8-2b` and
+524,288 with the other KV profiles. These are execution envelopes, not checkpoint training
+lengths or guarantees of long-context answer quality. Use `--rope-scaling yarn:2`, `yarn:3`,
+or `yarn:4` for the 524288/786432/1048576 presets. Scaling is fixed at startup; query-side
+temperature is applied consistently during prefill, eager decode and CUDA Graph capture.
+
 | Option | Meaning | Default |
 |---|---|---:|
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
@@ -204,6 +210,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|hq-e8-2b` | KV-cache storage | `bf16` |
+| `--rope-scaling none\|yarn:F[,t=<c>][,bf=<n>][,bs=<n>]` | startup RoPE scaling and optional temperature/ramp parameters | `none` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |

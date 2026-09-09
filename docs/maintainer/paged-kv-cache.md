@@ -307,8 +307,13 @@ The codec also carries two long-window quality levers:
   stages the current chunk's bf16 rows into the scratch exact, so every prefill query sees its
   full in-chunk recent window exact.
 
-The codec planes stay complete — any side row can fall back to the codec path. The current
-context limit remains 262144; larger YaRN lanes are the separate 1M-context port.
+The codec planes stay complete — any side row can fall back to the codec path. The 27B hq
+envelope reaches 1048576 keys. Prompt attention materializes at most 262144 rotated keys per
+band and carries online-softmax state between bands, bounding the two BF16 scratch planes at
+1 GiB for 4 KV heads. Workspace planning and allocation use that same band limit; reserving
+full-envelope BF16 scratch at 1M would waste 3 GiB. Decode split launch capacity is capped by
+the geometry, while active split counts follow the current visible window. YaRN tables belong
+to the Program and every execution context, including graph capture, must bind that table.
 
 K/V 的 code 和 scale planes 具有各自的 dtype、leading extent 和 group size；它们仍共享 page-group
 identity、frontier 和 lifetime。Capacity curve、Device/Host replica、continuation transfer 和 memory
