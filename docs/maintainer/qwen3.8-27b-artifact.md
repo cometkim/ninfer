@@ -1056,3 +1056,95 @@ the artifact scores **89.39% (177 / 198)** against the official NVFP4 artifact's
 published 90.40% (179 / 198) - a two-question difference on single-sample runs, within the
 ~2.1% sampling error at n=198; the 198-sample run averaged 129.3 tok/s with 11,927 output
 tokens per question.
+
+
+## 15. Fork artifact: `nvfp4qat`
+
+This fork additionally builds a QAT-sourced Qwen3.8-27B artifact: the text weight stack is copied
+word-for-word from the QUASAR quantization-aware-trained NVFP4 checkpoint, replacing both the
+locally quantized parents and the nine BF16 exception parents of `nvfp4full` (Section 14). It is
+produced and verified by the fork-local tools
+`tools.convert.qwen3_8_27b.{convert_nvfp4qat, verify_nvfp4qat}` and binds through the same
+registered target as an additional weights contract. It carries the upstream DFlash2 companion
+bundle of Section 7 (66 objects, matrices `W8G32_F16S`) in the same complete image.
+
+### 15.1 Identity and contents
+
+```text
+filename   = qwen3_8_27b_nvfp4qat.ninfer
+model_id   = qwen3.8-27b
+weights_id = nvfp4qat
+target_key = qwen3_8_27b
+recipe_id  = qwen3_8_27b_nvfp4qat-v2
+converter  = tools.convert.qwen3_8_27b.convert_nvfp4qat
+```
+
+The artifact contains 1328 tensors and the same six frontend resources (1334 objects), including
+the DFlash2 companion bundle of Section 7. Its Text allocation has no BF16 exception parents:
+every `attention/query_key_gate_value`, `attention/output`, `gdn/query_key_value_z`, `gdn/output`,
+`mlp/gate_up`, and `mlp/down` is NVFP4 — 256 parents with 256 site-level FP32 input divisors.
+The token embedding and full output head keep `W8G32_F16S`; MTP, Vision, and the optimized
+draft head keep the registered formats of Section 13.
+
+| Format | Tensors |
+|---|---:|
+| `BF16` | 579 |
+| `FP32` | 352 |
+| `I32` | 1 |
+| `Q4G64_F16S` | 55 |
+| `Q5G64_F16S` | 54 |
+| `Q6G64_F16S` | 1 |
+| `W8G32_F16S` | 30 |
+| `NVFP4` | 256 |
+
+| Layout | Tensors |
+|---|---:|
+| `contiguous-le-v1` | 932 |
+| `row-split-k128-v1` | 140 |
+| `blockscale-k16-m128x4-v1` | 256 |
+
+### 15.2 Sources and provenance
+
+The quantized source is `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` revision
+`d8e6fbfa3e3a78899b440222b827430045a05b44` (compressed-tensors `nvfp4-pack-quantized`, group 16,
+E4M3 scale words): one epoch of loss-aware NVFP4 quantization-aware distillation against the
+frozen BF16 teacher (QUASAR, arXiv 2608.13966). Every text linear is quantized there — 496
+source sites — under one `weight_global_scale`/`input_global_scale` pair per quantization site,
+shared by every constituent tensor of a fused parent; the converter enforces that sharing through
+the same-divisor checks before any word is copied. Its only artifact inputs are the 256 fused
+NVFP4 parents' packed-code and scale words (copied bit-exactly through the Section 14 row
+transforms, including the attention q/gate per-head interleaving), the 256 site input divisors,
+and the GDN control `in_proj_a`/`in_proj_b` words decoded to the BF16 `gdn/a_b_projection`.
+
+Every other source is the official base `Qwen/Qwen3.8-27B` revision
+`1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` exactly as in Section 14: all direct tensors, both W8
+endpoints, the draft head, MTP, and Vision. The converter proves this routing complete at
+preflight by byte-comparing every unquantized QAT tensor against the official source (703 tensors,
+bit-identical; the QAT export's `linear_attn.convNd` maps to the official `linear_attn.conv1d`),
+so the QAT checkpoint differs from the official source only in its 496 quantized text linears.
+The DFlash2 companion source is the fixed `z-lab/Qwen3.8-27B-DFlash2` revision of Section 7,
+encoded through the same `dflash2_inventory`/`dflash2_recipe` machinery as the registered
+profiles. No local encoder run and no calibration corpus are involved.
+
+### 15.3 Production and verification
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.convert_nvfp4qat \
+  --model /path/to/Qwen3.8-27B \
+  --quantized-model /path/to/Qwen3.8-27B-QUASAR-NVFP4 \
+  --dflash2-model /path/to/Qwen3.8-27B-DFlash2 \
+  --out models/qwen3_8_27b_nvfp4qat.ninfer
+python3 -m tools.convert.qwen3_8_27b.verify_nvfp4qat models/qwen3_8_27b_nvfp4qat.ninfer \
+  --model /path/to/Qwen3.8-27B \
+  --quantized-model /path/to/Qwen3.8-27B-QUASAR-NVFP4 \
+  --dflash2-model /path/to/Qwen3.8-27B-DFlash2
+```
+
+`verify_nvfp4qat` revalidates the complete ordered directory, both W8 endpoints against base
+rows, all 256 QAT payloads word-for-word, all 256 input divisors against the source
+`input_global_scale` words, the 48 decoded control parents against the independent decode oracle,
+all 66 DFlash2 module objects against a reference re-encode of the companion source, the six
+resources, and the weight-divisor derivation cross-check `d_w = binary32(2688/amax)`:
+single-tensor site families match exactly and the residual envelope (median exactly 1.0, maximum
+1.1667) is explained by site-scale sharing with the decoded control tensors and one saturating
+E2M1 step at a site's top element.
