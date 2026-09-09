@@ -216,10 +216,10 @@ void run_long_cache(int keys, int width, bool cached, int H = 24) {
     std::fflush(stdout);
     if (cached)
         causal_softmax_attention_cached(tq, tp, geometry, .0625f, single, envelope,
-                                         workspace, out, nullptr);
+                                         workspace, out, nullptr, nullptr);
     else
         causal_softmax_attention(tq, tk, tv, tp, Tensor{}, tr, geometry, .0625f, cache,
-                                envelope, workspace, out, nullptr);
+                                envelope, workspace, out, nullptr, nullptr);
     CUDA_CHECK(cudaDeviceSynchronize());
     const auto actual = output.get();
     double worst_rel = 0;
@@ -374,10 +374,10 @@ void run(const Scenario& sc, unsigned seed) {
     auto invoke = [&](cudaStream_t stream) {
         if (sc.cached)
             causal_softmax_attention_cached(tq, tp, geometry, .0625f, single_cache(0), envelope,
-                                            workspace, out, stream);
+                                            workspace, out, nullptr, stream);
         else
             causal_softmax_attention(tq, tk, tv, tp, sc.masked ? tvalid : Tensor{}, tr, geometry,
-                                     .0625f, cache, envelope, workspace, out, stream);
+                                     .0625f, cache, envelope, workspace, out, nullptr, stream);
     };
     CUDA_CHECK(cudaDeviceSynchronize());
     invoke(nullptr);

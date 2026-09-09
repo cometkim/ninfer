@@ -19,6 +19,7 @@
 // helpers, the s8/f16 MMA helpers, the reducer) lives in causal_attention_small_t.cuh.
 
 #include <cuda_bf16.h>
+#include "core/pdl.cuh"
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
@@ -49,6 +50,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale, float* partial_acc,
         float* partial_m, float* partial_l) {
+    pdl::sync();
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -648,6 +650,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

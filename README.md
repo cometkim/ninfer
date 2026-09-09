@@ -57,6 +57,7 @@ Ongoing feature experimentation:
 | `feat/dflash2` | `feat/windows-port` | fork-format NVFP4 DFlash2 draft module execution + unified binder; self-contained, also PR-able to nvfp4full-first forks | `squash(feat/dflash2)` |
 | `feat/qwen3.8-nvfp4full` | `feat/dflash2` | fuller-NVFP4 weights profile + converter; upstream-PR candidate | `squash(feat/qwen3.8-nvfp4full)` |
 | `feat/qwen3.8-nvfp4qat` | `feat/dflash2` | QUASAR QAT re-source profile; upstream-PR candidate | `squash(feat/qwen3.8-nvfp4qat)` |
+| `feat/kernel-perf` | `master` | PDL publish-at-end chain, per-dtype TU splits, attention fusions, i8/BF16 prompt key-splits, per-request error boundary | `squash(feat/kernel-perf)` |
 
 When a row reaches *merged upstream*, remove its squash from the next dev rebuild and fold
 its row into the upstream lineage note.
@@ -211,6 +212,13 @@ What this fork adds on top (one squashed commit per feature branch, per
 
 - **`feat/qwen3.8-nvfp4qat`** — the QUASAR QAT re-source profile: word-for-word NVFP4 copy
   of the QUASAR-quantized checkpoint with its own conversion recipe and model card.
+
+- **`feat/kernel-perf`** — the general kernel-performance track on the non-hq paths:
+  programmatic dependent launch across the decode chain with the publish-at-end rule, the
+  per-dtype/per-geometry instantiation-TU split across the launcher families, a bit-exact
+  fused q/k rmsnorm+rope kernel, the sigmoid gate folded into the small-T reducer epilogue,
+  fp16-accumulated PV with a range guard plus key-range splitting in the i8 and BF16 prompt
+  kernels, and a per-request error boundary in the engine.
 
 Everything else — the Linux build path, the RTX 5090 (`sm_120a`) target, the CUDA 13.1
 requirement, and the NVFP4/W4A4 Blackwell execution paths — is unchanged from upstream.

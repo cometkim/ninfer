@@ -166,7 +166,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream);
+                              Tensor& out, const Tensor* gate, cudaStream_t stream);
 
 /**
  * Read-only single-sequence causal attention over an already populated cache.
@@ -180,7 +180,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
                                      const PagedKVLayerView& cache,
                                      CausalAttentionExecutionEnvelope envelope,
-                                     WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                                     WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                     cudaStream_t stream);
 
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The

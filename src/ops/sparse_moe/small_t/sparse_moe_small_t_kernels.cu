@@ -28,7 +28,6 @@ __global__ void sparse_moe_small_t_s1_kernel(const __nv_bfloat16* __restrict__ x
                                              float* __restrict__ partial_scores) {
     static_assert(Tokens >= 1 && Tokens <= kSparseMoeSmallTMax);
     __shared__ float partial[kRouterWarps][Tokens];
-    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     const int row       = static_cast<int>(blockIdx.x) / kRouterPartitions;
     const int partition = static_cast<int>(blockIdx.x) - row * kRouterPartitions;
     const int warp      = static_cast<int>(threadIdx.x) >> 5;
@@ -71,6 +70,7 @@ __global__ void sparse_moe_small_t_s1_kernel(const __nv_bfloat16* __restrict__ x
                            partition] = sum;
         }
     }
+    pdl::publish();
 }
 
 // S2 runs one CTA per token: the router scores of a single token take 1 060 B of shared
@@ -85,7 +85,6 @@ __global__ void sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_s
     __shared__ float selected_logits[kTopK];
     const int tid   = static_cast<int>(threadIdx.x);
     const int token = static_cast<int>(blockIdx.x);
-    if (tid == 0) { pdl::trigger_dependents(); }
     pdl::wait_for_dependencies();
     for (int row = tid; row < kRouterRows; row += kS2Threads) {
         float sum = 0.0f;
@@ -103,6 +102,7 @@ __global__ void sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_s
         sparse_moe_select_top8_warp(scores, token_ids + token * kTopK, token_alpha + token * kTopK,
                                     shared_scale + token, selected_logits);
     }
+    pdl::publish();
 }
 
 template <int Tokens>

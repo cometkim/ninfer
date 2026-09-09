@@ -7,6 +7,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 
+#include "core/pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -215,6 +216,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int cta_in_tile      = static_cast<int>(blockIdx.x) - m_tile * kCtasPerM128;
     const int rmod_base        = cta_in_tile * (Schedule::kRowsPerCta / 4);
     stage_nvfp4_scales<Geometry, Schedule>(scales, shared, m_tile, rmod_base);
+    // The staged scales are weights; the activation x is the first producer-dependent read.
+    pdl::wait_for_dependencies();
 
     const int lane      = static_cast<int>(threadIdx.x) & 31;
     const int warp      = static_cast<int>(threadIdx.x) >> 5;
@@ -245,6 +248,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             output.store(parent_row, 0, epilogue.apply(parent_row, 0, total));
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

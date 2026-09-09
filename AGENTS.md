@@ -105,12 +105,18 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 ## Current product contract
 
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance on
-a small set of explicitly registered checkpoint artifacts. The supported identities are
+a small set of explicitly registered checkpoint artifacts. The upstream identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
-`qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`. The current implementation is compiled
-for `sm_120a` and tuned and measured on NVIDIA GeForce RTX 5090. All identities execute Text,
-image/video Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the
-same public `.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
+`qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`; this fork additionally registers the
+`qwen3.8-27b/nvfp4full` and `qwen3.8-27b/nvfp4qat` profiles. The current implementation is
+compiled for `sm_120a` and tuned and measured on NVIDIA GeForce RTX 5090. All identities execute
+Text, image/video Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic serving, perplexity scoring,
+and measurement through the same public `.ninfer` Engine route. DFlash2 is upstream's semantic
+authority (stochastic selector walk, K1..15 x B1..8, full and optimized proposal heads) and rides
+the 27B artifacts as an optional 66-object `W8G32_F16S` companion bundle; the 35B-A3B target
+supports text-only DFlash. The fork's pre-rebase v2 images carry the same bundle in a
+weight-only NVFP4 encoding under fork object names: they load for Text/Vision/MTP, and selecting
+the DFlash2 lane on them is rejected until the NVFP4 draft execution port lands (HANDOFF.md).
 
 The current workload is one GPU and one resident model instance with a startup-fixed one to eight
 active requests. The Engine forms one compact decode batch at every round boundary and uses bounded
@@ -156,7 +162,7 @@ routing map, not a mandatory reading list:
 - `docs/cli.md`: CLI input, output, sampling, MTP, and runtime options;
 - `docs/serving.md`: OpenAI/Anthropic HTTP behavior;
 - `docs/performance.md`: published performance methodology and results;
-- `docs/maintainer/concurrent-inference-architecture.md`: bounded ingress, request/slot lifecycle,
+- `docs/maintainer/engine-architecture.md`: bounded ingress, request/slot lifecycle,
   scheduling, batched execution, CUDA Graph, and speculative-concurrency semantics;
 - `docs/maintainer/paged-kv-cache.md`: shared KV capacity, page ownership, retention, physical
   layouts, and paged consumer contracts;
@@ -305,6 +311,11 @@ documented in README.md ("About this fork"). The rules that bind agent work:
 - Remotes: `upstream` = Neroued/ninfer (reference implementation), `natpate` =
   natpate/ninfer-windows (Windows port lineage), `origin` = cometkim/ninfer (this fork).
   Never push to `upstream` or `natpate`.
+- OWNER DIRECTIVE (2026-09-08, post-rebase): fork improvements are never dropped for upstream
+  alignment. An upstream sync must land regression-free (every fork capability either intact,
+  ported, or measurably superseded with evidence); if a regression is inevitable, HALT the sync —
+  keeping the pre-sync fork state is preferred over accepting the loss. The pre-sync state is
+  always recoverable from refs/backup/pre-sync-<date>/* and backup/<date>/all-refs.bundle.
 - Branches: `master` follows `upstream/master`; `feat/*` are curated upstream-PR-able
   feature branches (no machine-specific files: no absolute toolchain paths, local bench
   prompts, or agent workspaces) stacked on `master` or on `feat/windows-port`;
@@ -335,6 +346,12 @@ documented in README.md ("About this fork"). The rules that bind agent work:
 
 Use unrestricted build-tool parallelism for repository compilation. Invoke CMake builds as
 `cmake --build <build-dir> -j`; do not supply a numeric job limit such as `-j2` or `-j32`.
+Heavy launcher template instantiations live in per-dtype/per-geometry instantiation TUs, never
+in their dispatcher TU: the template definition sits in a private `*_tc_launch.h` header with
+`extern template` declarations for every combination the dispatcher uses, and matching explicit
+instantiation TUs carry the kernel expansion (see the small-t attention and w8 small-T families
+for the pattern). A new KV storage family (e.g. the planned hq codec) follows the same
+structure from its first commit: dispatcher TU + instantiation TU per dtype.
 
 On this Windows checkout the fast path is the Ninja wrapper scripts (plain PowerShell, no
 developer prompt needed — they import the MSVC/vcvars environment themselves and resolve

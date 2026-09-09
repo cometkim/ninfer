@@ -1,8 +1,4 @@
-#include "ops/linear/w8/w8_launch.h"
-
-#include "core/device.h"
-#include "ops/linear/w8/w8_config.h"
-#include "ops/linear/w8/w8_small_t_mma.cuh"
+#include "ops/linear/w8/w8_small_t_launch.h"
 
 #include <array>
 #include <cstddef>
@@ -12,21 +8,6 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <class Geometry, int ActiveTokens>
-void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Schedule = typename W8LinearSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
-    static_assert((Geometry::kOutputRows % Schedule::kRowsPerCta) == 0);
-    static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
-
-    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
-    constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output);
-    CUDA_CHECK(cudaGetLastError());
-}
 
 template <class Geometry, int First, std::size_t... Offsets>
 constexpr auto make_launchers(std::index_sequence<Offsets...>) {
@@ -34,21 +15,6 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_exact<Geometry, First + static_cast<int>(Offsets)>...};
 }
 
-template <int Capacity>
-void launch_vocabulary_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Geometry = W8VocabularyProjectionGeometry;
-    using Schedule = W8SmallTMmaSchedule<Capacity <= 32 ? 8 : 4, Capacity, 2,
-                                         W8SmallTMmaScaleAccess::Shared>;
-    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
-    w8_small_t_mma_kernel<Geometry, Capacity, Schedule, W8ContiguousOutput,
-                          W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, true>
-        <<<Geometry::kOutputRows / 16, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaStoreEpilogue{},
-            W8SmallTMmaIdentityRows{}, x.ne[1]);
-    CUDA_CHECK(cudaGetLastError());
-}
 
 template <std::size_t... I>
 constexpr auto vocabulary_launchers(std::index_sequence<I...>) {
