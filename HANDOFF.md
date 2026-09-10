@@ -5,12 +5,14 @@ refs/backup/pre-sync-20260908/*, backup/20260908/all-refs.bundle, and
 refs/backup/post-rebase-20260909/{dev,1m-context}. The branch tips before these checks are retained in
 refs/backup/populated-20260909/{dev,1m-context}.
 
-## Current state (2026-09-09)
+## Current state (2026-09-10)
 
 Ports 1–11 are landed. The 1M-envelope investigation, standalone 1m-context re-port and dev
 rebuild are complete. Both 786k and 1M presets boot and serve with the local WebUI. The idle
 measurement campaign below supersedes old performance/acceptance records, including the
 previously claimed cumulative +77% gain.
+The optimized production engine now also completes a quiet, populated 1M request: 647.8
+prefill / 14.3 decode tok/s with all four exact retrieval values (details below).
 
 | branch | tip | base / role |
 |---|---|---|
@@ -196,7 +198,10 @@ gives 209.5 dense BF16 TFLOP/s with FP32 accumulation and 1792 GB/s memory bandw
 has useful attention work equivalent to roughly 42–50% of that compute ceiling. Several
 thousand tok/s for a cold 1M prompt exceeds this arithmetic path's theoretical peak; short
 prefills can reach several thousand tok/s because the attention work grows quadratically.
-These are roofline estimates, not measured optimized 1M throughput.
+The quiet optimized run below takes 26m 58.4s for prefill, equivalent to 133.5 TFLOP/s of
+useful attention work amortized over the whole prefill: about 54% of the clock-adjusted
+ceiling at its sustained 2.827 GHz, or 64% of rated-boost peak. This accounting is a roofline
+estimate, not a hardware-counter measurement or a claim that all remaining headroom is attainable.
 
 [Upstream's published NVFP4-weight/INT8-KV result](https://github.com/Neroued/ninfer/blob/master/docs/performance/qwen3.8-27b.md#no-speculation-context-profile)
 is 2203.1 prefill / 52.9 decode tok/s at 260096 prompt tokens. It does not publish a 1M result.
@@ -223,14 +228,32 @@ checks pass; DWM's 95th-percentile utilization is at most 5% in all eight cells 
 the 262k cells). Two brief 19–23% spikes occur during artifact loading, before the measured
 prefill, with no such load during decode. This replaces the earlier apparent decode regression.
 Local evidence: `engine-idle-narrow-*` reports and desktop samples. These measurements establish
-the Engine-level improvement at the populated lengths shown; the optimized complete 1M request
-has not been timed, and the earlier 511.3/8.4 tok/s quality-run rates remain pre-optimization.
+the Engine-level improvement at the populated lengths shown. The complete 1M request is timed
+separately below; the earlier 511.3/8.4 tok/s quality-run rates remain pre-optimization.
 
 At 1048320 populated keys, two additional same-binary cached W1 operator pairs measure
 6570.1 us before versus 4009.3 us after (1.64x throughput, 39.0% less time). These cold-cache
 CUDA-graph timings cover the whole append-free attention Op, including its reducer, with
 three warmups and 20 repetitions per cell. They establish that the decode improvement carries
-through the 1M range without claiming a new complete-model 1M generation rate.
+through the 1M range; this operator comparison is distinct from the absolute Engine measurement.
+
+On 2026-09-10, the owner made the desktop quiet and the unchanged optimized production CLI
+completed the actual **1048320-token** retrieval prompt with **647.8 prefill / 14.3 decode
+tok/s**. Cold prefill took **26m 58.4s**, followed by 5.0s of decode and 73 generated tokens,
+ending on the stop token. All **4/4 registry values** are exact, returned as bare JSON; prompt
+reuse is zero and the process exits 0. The workload is nvfp4full v2, HQ, MTP0, greedy,
+YaRN:4, capacity/envelope 1048576, and the same frozen prompt used by the earlier 1M check.
+Workspace remains **1.08 GiB**, with **3.76 GiB** free after startup.
+
+Three prelaunch GPU samples are at most 5%. Throughout the process, 861 DWM samples across
+all adapters have p95 **0%**, maximum **3%**. Sustained SM clocks are approximately
+2.82–2.84 GHz; NVIDIA's final thermal-slowdown counters remain zero. DWM PIDs and adapter
+LUIDs changed after reboot, so the monitor discovers current DWM processes instead of
+reusing the previous hardcoded PID/LUID. Evidence is
+`quality-c1048576-hq-e8-2b-graph-optimized-quiet20260910.*` and `quality-results.json` in
+the populated-history profile directory; the local runner is `quality-quiet.ps1`.
+This is one monitored absolute full-model baseline, not an alternating old/new pair. Do not
+attribute the whole difference from the earlier 511.3/8.4 rates to the code optimization.
 
 Final production-binary KV comparisons use the explicit nvfp4full v2 artifact, MTP0, G128,
 chunk1024, a fresh populated corpus and capacity P+256. Each comparator has its own adjacent
@@ -271,8 +294,8 @@ attention cases (32 ordinary/nonzero-query and 12 long-cache cases), RoPE, rope-
 5/5 retrieval gate pass on the standalone branch and dev. The complete dev softmax-attention
 suite also passes. Dev CLI, server and benchmark are rebuilt; the standalone CLI is rebuilt.
 The optimized production CLI also returns all three exact registry values as bare JSON from
-the 8192-token prompt (56 generated tokens, exit 0). This is a short behavioral check; the
-earlier complete 1M retrieval result remains tied to the pre-optimization binary.
+the 8192-token prompt (56 generated tokens, exit 0), and all four values in the quiet populated
+1M request above. These retrieval probes do not establish broad long-document reasoning quality.
 The feature stays free of fused qk_norm_rope and PDL dependencies. The rebuilt dev retains all
 ten feature squashes and each intermediate README union. Final content changes relative to
 the preceding integration are the populated-cache bounds fixes and this HQ optimization;
@@ -401,11 +424,12 @@ unpaired cells, width-cliff claims and old record comparisons must not be reused
 
 ## Next work and build discipline
 
-1. Before publishing a new complete-model 1M rate, time the optimized populated request. The
-   current 1M optimization evidence is operator-level; complete-model paired evidence is at 8k
-   and 262k. Remaining HQ decode headroom is in its instruction-heavy entropy reconstruction;
-   raising the cold-prefill arithmetic ceiling requires a separately qualified precision/path
-   change, not a larger graph envelope or scratch allocation.
+1. Further HQ throughput work should target its instruction-heavy entropy reconstruction.
+   Complete-model paired optimization evidence is at 8k and 262k; 1M now has both an operator
+   A/B comparison and an absolute quiet full-model baseline. Raising the cold-prefill arithmetic
+   ceiling requires a separately qualified precision/path change, not a larger graph envelope
+   or scratch allocation. Do not repeat the completed 1M baseline without a change or a live
+   comparison that could alter the implementation decision.
 2. On the next kernel-perf rebase, drop its duplicated Windows TMA fix (already in windows-port).
 3. For long-context quality, use populated prompts on the corrected binary. Old coding/model-card
    campaigns need a fresh lane choice and rerun before being advertised as post-rebase results.
