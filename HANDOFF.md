@@ -5,6 +5,109 @@ refs/backup/pre-sync-20260908/*, backup/20260908/all-refs.bundle, and
 refs/backup/post-rebase-20260909/{dev,1m-context}. The branch tips before these checks are retained in
 refs/backup/populated-20260909/{dev,1m-context}.
 
+## Model-card rewrite and HF publish state (2026-09-10, later session)
+
+Both model-card sources (`model-cards/Qwen3.8-27B-nvfp4full-NInfer/README.md` and the qat
+one) were fully rewritten in the working tree (uncommitted) for DFlash2 support: a dedicated
+DFlash2 section (module facts, NVFP4 payload 1,082,882,820 B vs W8 2,226,805,248 B,
+acceptance 5.50/64.3% vs W8 5.75/67.9% nvfp4full, qat 2.50/21.4%), a new Engine support
+section documenting the two required patches (hardcoded `resolve_weights` ID registration;
+NVFP4-encoded DFlash2 module vs upstream W8G32_F16S) with the minimal patch-set table
+(`feat/dflash2` + `feat/qwen3.8-nvfp4{full,qat}`, additive registration), minimal-set vs
+full-fork capability scoping (hq-e8-2b/YaRN/WebUI are NOT in the minimal set), restored
+provenance tables (z-lab/Qwen3.8-27B-DFlash2 @ 50307d4c — the old cards wrongly cited
+"incoai"), QUASAR @ d8e6fbfa, and corrections: LongBench long envelope 786,432 (cards said
+786,144), serve examples dropped `--webui` (feat/webui is outside the minimal set). Branch
+analysis: the current stack is already the minimal patch set — no restructuring needed;
+registration commits are purely additive (~140/~150 engine lines). Pending owner review of
+the card text, then HF publish. HF state at check time: nvfp4full repo public with the
+pre-DFlash2 v1 artifact (18,324,059,648 B, Aug 20) + v1 card; qat repo does not exist;
+local v2 artifacts ready (`models/qwen3_8_27b_nvfp4full.ninfer` 19,406,942,468 B abb1e120,
+`models/qwen3_8_27b_nvfp4qat.ninfer` 18,638,209,796 B 3bd37e03) plus conversion JSONs.
+Publishing means ~38 GB of uploads (v1 stays retrievable at its revision) and creating the
+qat repo; an OAuth token was in `~/.cache/huggingface/token` (export HF_TOKEN=$(cat …)).
+Feature-branch card copies (feat/qwen3.8-nvfp4full/qat tips) still carry the pre-rewrite
+cards; refresh them when committing the rewrite.
+
+Owner follow-up (same session): drafter loading is optional, so the cards state the
+per-option memory in the simple "Device weights" form the owner prefers. Six fresh bench
+cells (`profiles/bench/modelcard-20260910/`, production ninfer_bench, Vision off; the JSONs
+carry exact weights used_bytes) measured nvfp4full none/mtp3/dflash2-K7 device weights =
+16.02/16.44/17.03 GiB (bytes 17,206,931,200 / 17,658,198,784 / 18,289,801,732) and qat =
+15.31/15.73/16.32 GiB; steps +0.42 (MTP) and +1.01 (DFlash2 = the NVFP4 module payload).
+The old cards' single "Device weights 16.03/15.31 GiB" rows correspond to the no-spec lane
+(measured 16.02/15.31), so the quality tables now carry three "Device weights, <option>"
+rows plus one explanatory sentence; the hq notes keep the ≈16/≈15.3 GiB constraint
+framing. An earlier free-memory-after-weights table form was replaced at owner request.
+
+Second owner follow-up: the cards' absolute tok/s rows (MTP3/DFlash2 decode, prefill;
+99.05/161.49/5,895 and 96.27/119.12/6,147) were dropped as environment-specific and
+non-comparable; the cards keep only same-workload relative figures (NVFP4 vs W8 module
+5.50/64.3% vs 5.75/67.9%; qat 2.50/21.4% anchored against nvfp4full's 5.50/64.3%). If
+absolute throughput is wanted in the cards, the comparable campaign design is: quiet desktop
+per the measurement discipline, same binary, paired against the official
+models/qwen3_8_27b_nvfp4.ninfer (MTP lane; it is the pre-suffix core form with no DFlash2
+module) and against models/qwen3_8_27b_nvfp4full_w8.ninfer (DFlash2 lane, W8 module
+encoding).
+
+That campaign ran the same day (owner said "measure them" and the desktop went quiet;
+first-cell idle gate 0/0/0%). 16 cells under
+`profiles/bench/modelcard-20260910/paired/` (bench JSON + meta with idle samples and
+during-run GPU util per cell, median 98–99% during decode; the throwaway campaign/sampler
+scripts were removed after the run): tg128, greedy,
+INT8, 8192 envelope, -r 3 --warmup 1, fusions/PDL on, two alternating pairs per
+comparison. Decode tok/s means: MTP3 official 115.5/115.3, nvfp4full 141.3 (+22.4%,
+pairs +22.5/+22.2), qat 125.3 (+8.7%, pairs +8.7/+8.6); DFlash2-K7 w8-splice 125.1,
+nvfp4full 126.2 (+0.9%, +1.0/+0.8), qat 121.2 (−4.0% vs full, −4.0/−4.0). Acceptance is
+deterministic per artifact and nvfp4full MTP3 41.76% exactly reproduces the earlier
+campaign; DFlash2-K7 acceptance: w8 12.90%, full 12.74%, qat 10.96%, official MTP3 35.33%,
+qat MTP3 32.12%. prefill_tok_s_mean is null in tg128 cells, so only decode and acceptance were tabulated.
+At the owner's direction these paired results live HERE only — the cards carry no
+throughput tables; their measurement section keeps artifact size, the per-option device
+weights, and the note that absolute throughput is host/revision-specific, and the DFlash2
+sections keep the same-workload acceptance comparisons. The frontmatter model-index
+carries the three measured baseline rows (GPQA-Diamond, AIME 2026, LongBench v2 short)
+for both cards; agentic suites stay out until measured and hq cells remain body-only.
+
+Owner self-organizes the nvfp4full "Model Size" docs; session supplied the data (cells
+under `profiles/bench/modelcard-20260910/{kv,vision}/`, scripts removed after the run):
+device weights with `--vision` = lane + 295,711,648 B (vision/* section, 333 objects,
+0.275 GiB) → none/mtp3/dflash2-K7 +vision = 16.30/16.72/17.30 GiB (CLI prints 3
+significant digits; section sums reconcile the lane deltas to the byte: mtp/* 451,267,584
+= the +0.42 step, dflash2/* 1,082,862,216 = the +1.01 step, text/* 16.358 GiB incl. the
+optimized proposal head, frontend 12,837,177). KV payload at capacity 262,144, exact
+bytes: int8 8,858,370,048 (33,792 B/token), fp8 8,657,043,456 (33,024), k8v4
+6,744,440,832 (25,728), nvfp4 4,831,838,208 (18,432), hq-e8-2b 2,451,570,756 (9,352) —
+int8/k8v4/nvfp4/hq match the populated-campaign figures. bf16 measured via CLI
+`--no-cuda-graph` at 131,072 (bench bf16 hits cudaGraphExecUpdateFailure, the known
+clean-upstream graph bug on this box): 8.00 GiB = exactly 65,536 B/token, so 16.0 GiB at
+262,144 (does not fit beside the weights; ~186k-token practical bf16 ceiling).
+
+The owner then hand-reorganized the nvfp4full card (own structure: condensed
+Engine support, `## Size and quality` with subsections) and asked for the data in-card:
+`### Model size` renamed to `### Device weights`, now carrying the vision-column weights
+table and the KV-per-dtype table (a 24 GB-laptop highlight was added, then removed again at
+owner request — no laptop mentions in the cards). The qat card still has the older
+`## Quality and size` structure with the small measurement table; mirror the Device weights
+section there on request (qat numbers: 15.31/15.73/16.32 + 0.275 vision; full stack ≈18.9
+GiB at hq). Throughput tables remain out of both cards per the earlier owner decision.
+
+Finalization (2026-09-11): the owner hand-tightened the nvfp4full card (condensed engine
+support, `## Size and quality`, HyperQuant arXiv link + bibtex cite, full explicit eval
+commands — `run_card_quality.sh` takes the kv-dtype as its optional third argument and
+`run_card_lbv2.sh` takes explicit seeds; the lbv2 script encodes dtype per cell:
+short=int8/262k, medium=hq/524k/yarn:2, long=hq/786k/yarn:3, with `lbv2_short_hq` in the
+config but not the default cells array). The qat card was rewritten to the identical
+structure (91f8a447) and nvfp4full finalized (55152a4f), both committed on their feat tips.
+cometkim/dev was rebuilt by tree-replaying the previous validated squash commits (identical
+trees, new parents) with the two card blobs overlaid from the tips, then cherry-picking the
+dev-only fold/bench/presets/handoff commits; `git diff 03d7d377 cometkim/dev` shows only
+the two card files. A from-scratch merge replay was abandoned: the old intermediate squash
+trees carry deliberate whole-file resolutions (later-branch content pulled forward), so
+clean replay reproduces different conflicts — reuse the validated trees instead. HF publish
+(finalized cards + v2 artifacts + conversion JSONs, qat repo created) launched after the
+pushes.
+
 ## Current state (2026-09-10)
 
 Ports 1–11 are landed. The 1M-envelope investigation, standalone 1m-context re-port and dev
