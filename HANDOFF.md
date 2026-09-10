@@ -108,6 +108,18 @@ clean replay reproduces different conflicts — reuse the validated trees instea
 (finalized cards + v2 artifacts + conversion JSONs, qat repo created) launched after the
 pushes.
 
+ninfer-windows minimal-patch PR (2026-09-11): natpate's master already carries the
+nvfp4full registration (their PR #7, v1 artifact row) and upstream W8 DFlash2 (PR #8),
+and documents DFlash2 as unsupported on nvfp4full — the gap is exactly our NVFP4 module
+execution. PR #13 (https://github.com/natpate/ninfer-windows/pull/13) from origin branch
+pr/natpate-dflash2-nvfp4-module: master@aa64ee53 + fb141405/085f3343/96acf990/23d34c77
+cherry-picked + a README docs commit (v2 row, flipped note). Verified on their tree:
+routes test OK, their ninfer.exe runs the published v2 artifact with --spec dflash2 K7
+(exit 0, 7.50 tok/round on a greedy smoke prompt). The 23d34c77 bindings.cpp conflict
+(nvfp4full binder vs the module helper) needed care: diff3 base sections tripped the
+first resolution; final file = our post-23d34c77 version + their nvfp4full function and
+dispatch case (verified: braces balanced, delta nvfp4full-only).
+
 ## Current state (2026-09-10)
 
 Ports 1–11 are landed. The 1M-envelope investigation, standalone 1m-context re-port and dev
