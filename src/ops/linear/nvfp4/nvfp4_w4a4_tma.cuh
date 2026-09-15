@@ -182,10 +182,24 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
                  : "memory");
 }
 
+
+// Windows/MSVC a by-value alignas(128) kernel parameter cannot be laid out by the MSVC ABI
+// (C2719 in the cudafe1 host launcher), so the launcher copies the descriptor block to a
+// device buffer and passes a pointer. On other hosts the __grid_constant__ by-value parameter
+// keeps the map in parameter space. All kernel translation units must share this spelling, so
+// it is a macro rather than a constexpr type.
+#ifndef NINFER_NVFP4_TMA_DESCRIPTOR_PARAM
+#ifdef _WIN32
+#define NINFER_NVFP4_TMA_DESCRIPTOR_PARAM const Nvfp4W4a4TmaDescriptors* __restrict__
+#else
+#define NINFER_NVFP4_TMA_DESCRIPTOR_PARAM const __grid_constant__ Nvfp4W4a4TmaDescriptors
+#endif
+#endif
+
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
-    const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
+    NINFER_NVFP4_TMA_DESCRIPTOR_PARAM descriptors, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output) {
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
@@ -216,6 +230,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" : : : "memory");
         }
         if (threadIdx.x == 0) {
+#ifdef _WIN32
+            const Nvfp4W4a4TmaDescriptors* descriptor_block = descriptors;
+#else
+            const Nvfp4W4a4TmaDescriptors* descriptor_block = &descriptors;
+#endif
 #pragma unroll 1
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
                 const int stage                 = k_tile % Schedule::kStages;
@@ -236,10 +255,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                                                           : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
-                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
+                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptor_block->a_codes,
                                   k_tile * Schedule::kCodeRowBytes, token_begin,
                                   &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
+                nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptor_block->b_codes,
                                   k_tile * Schedule::kCodeRowBytes, row_begin, &shared.full[stage]);
                 if (load_scales) {
                     // The box is tile-contiguous, so its address is a tile index rather than a
@@ -249,13 +268,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                         Geometry::kGroupsPerRow / kNvfp4ScaleTileGroups;
                     const int scale_tile =
                         (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile / 2;
-                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1], &descriptors.a_scales, 0,
-                                      scale_tile * 16, &shared.full[stage]);
+                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1],
+                                      &descriptor_block->a_scales, 0, scale_tile * 16,
+                                      &shared.full[stage]);
                 }
                 const int b_scale_row = ((row_begin / 128) * Geometry::kScaleTilesPerRow +
                                          k_tile * Schedule::kK64PerStage) *
                                         32;
-                nvfp4_tma_load_2d(tensors.b_scales[stage], &descriptors.b_scales, 0, b_scale_row,
+                nvfp4_tma_load_2d(tensors.b_scales[stage], &descriptor_block->b_scales, 0, b_scale_row,
                                   &shared.full[stage]);
             }
         }
