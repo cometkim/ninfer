@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <iostream>
 
+// <windows.h> era macros still leak through the CRT on MSVC.
+#ifdef _WIN32
+#undef near
+#undef far
+#endif
+
 namespace {
 
 int check(bool condition, const char* message) {

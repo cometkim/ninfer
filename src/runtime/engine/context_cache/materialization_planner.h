@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/engine/context_cache/context_cost.h"
+#include "core/uint128.h"
 #include "runtime/engine/context_cache/context_portfolio_value.h"
 #include "runtime/engine/context_cache/materialization_budget.h"
 #include "runtime/engine/context_cache/resource_search.h"
@@ -924,8 +925,8 @@ private:
                            ? item.estimated_total_ns - parent.estimated_total_ns
                            : 0;
             };
-            const __uint128_t left  = static_cast<__uint128_t>(delta(cost)) * b;
-            const __uint128_t right = static_cast<__uint128_t>(delta(prior)) * a;
+            const ninfer::Uint128 left  = ninfer::Uint128(delta(cost)) * b;
+            const ninfer::Uint128 right = ninfer::Uint128(delta(prior)) * a;
             if (left != right) { return left < right; }
         }
         return cost.key() < prior.key();
