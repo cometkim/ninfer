@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
+#include "ops/common/math.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 
 namespace ninfer::ops::detail {
@@ -19,10 +20,21 @@ __device__ __forceinline__ void causal_store_output(__nv_bfloat16* out, float va
     *out = __float2bfloat16(value);
 }
 
+// Sigmoid-gated output store: out[i] = bf16(value * sigmoid(gate[i])). The attention value is not
+// materialized in BF16 before the gate multiplies it (one rounding; op-development section 6.1).
+// A null gate stores the plain value.
+__device__ __forceinline__ void causal_store_gated_output(__nv_bfloat16* out,
+                                                          const __nv_bfloat16* gate,
+                                                          std::int64_t index, float value) {
+    if (gate != nullptr) value *= sigmoid(__bfloat162float(gate[index]));
+    out[index] = __float2bfloat16(value);
+}
+
 // A warp converts one normalized row from the represented rotated V coordinates.
 template <class G>
 __device__ __forceinline__ void
-causal_store_inverse_rotated_row(const float* row, __nv_bfloat16* out, int head, int token) {
+causal_store_inverse_rotated_row(const float* row, __nv_bfloat16* out, int head, int token,
+                                 const __nv_bfloat16* gate = nullptr) {
     static_assert(G::kHeadDim == kCausalHeadDim);
     const int lane = threadIdx.x & 31;
     float values[8];
@@ -31,7 +43,8 @@ causal_store_inverse_rotated_row(const float* row, __nv_bfloat16* out, int head,
     normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
     for (int r = 0; r < 8; ++r)
-        causal_store_output(out + causal_q_index<G>(head, lane + 32 * r, token), values[r]);
+        causal_store_gated_output(out, gate, causal_q_index<G>(head, lane + 32 * r, token),
+                                  values[r]);
 }
 
 } // namespace ninfer::ops::detail

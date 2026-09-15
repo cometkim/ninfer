@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/grouped_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tiled_mma.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/merge.cuh"
@@ -59,11 +60,11 @@ void launch_bf16_kv_grouped_mma(const CausalAttentionOperands& p, Bf16KvCacheVie
         if constexpr (bytes > 48 * 1024) dynamic = bf16_kv_dynamic_shared<bytes, kernel>();
         const dim3 grid(G::KVHeads * div_up(p.width * G::GroupSize, S::kQueryRows),
                         partition.capacity, p.batch);
-        kernel<<<grid, S::kThreads, dynamic, stream>>>(
-            p.q, input, p.positions, cache.keys, cache.values, cache.tables, cache.valid_columns,
-            cache.table_rows, cache.table_stride, p.width, p.scale, partition, partials);
+        CUDA_CHECK(pdl::launch_dependent(
+            {grid, dim3(S::kThreads), static_cast<std::size_t>(dynamic), stream}, kernel, p.q,
+            input, p.positions, cache.keys, cache.values, cache.tables, cache.valid_columns,
+            cache.table_rows, cache.table_stride, p.width, p.scale, partition, partials));
     }
-    CUDA_CHECK(cudaGetLastError());
 }
 
 template <class G, class S, bool MultiBatch, bool Masked, bool Writable>
@@ -73,10 +74,10 @@ void launch_bf16_kv_merge(const CausalAttentionOperands& p, Bf16KvCacheView<Writ
     if (partition.capacity > S::kThreads)
         throw std::invalid_argument("BF16 merge capacity exceeds the reduction block");
     const dim3 grid(G::QHeads, div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
-    bf16_kv_merge_kernel<G, S, MultiBatch, Masked><<<grid, S::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {grid, dim3(S::kThreads), 0, stream}, bf16_kv_merge_kernel<G, S, MultiBatch, Masked>,
         partials.acc, partials.maximum, partials.sum, p.positions, cache.valid_columns, p.width,
-        p.batch, partition, p.out);
-    CUDA_CHECK(cudaGetLastError());
+        p.batch, partition, p.out, p.gate));
 }
 
 template <class Geometry, class Schedule>

@@ -152,6 +152,9 @@ struct Scenario {
     // Graph scenarios only: re-capture with this wider envelope maximum and update the
     // executable in place. Calls with W<=16 must keep one topology across envelopes.
     std::uint32_t update_envelope = 0;
+    // Pass a sigmoid output gate ([D,H,W*B], the model's aggregate shape); the oracle multiplies
+    // each expected row element by sigmoid(gate).
+    bool gated = false;
 };
 
 // Sparse represented V rows and zero Q make attention the uniform mean over the logical
@@ -371,6 +374,16 @@ void run(const Scenario& sc, unsigned seed) {
     Tensor tv(v.data, DType::BF16, {D, KV, W, B}), tp(pos.data, DType::I32, {W, B});
     Tensor tr(rows.data, DType::I32, {B}), tvalid(valid.data, DType::I32, {B});
     Tensor out(output.data, DType::BF16, {D, H, W, B});
+    DeviceArray<__nv_bfloat16> gate(sc.gated ? std::size_t(D) * H * W * B : 0);
+    std::vector<__nv_bfloat16> hgate;
+    if (sc.gated) {
+        std::uniform_real_distribution<float> gate_values(-4.0f, 4.0f);
+        hgate.resize(gate.count);
+        for (auto& x : hgate) x = __float2bfloat16(gate_values(rng));
+        gate.put(hgate);
+    }
+    Tensor tgate(gate.data, DType::BF16, {D, H, W * B});
+    const Tensor* gate_input = sc.gated ? &tgate : nullptr;
     const AttentionHeadGeometry geometry{D, H, KV};
     const CausalAttentionExecutionEnvelope envelope{
         sc.broad_envelope ? 1u : std::uint32_t(sc.window),
@@ -389,11 +402,11 @@ void run(const Scenario& sc, unsigned seed) {
     auto invoke = [&](cudaStream_t stream, CausalAttentionExecutionEnvelope call_envelope) {
         if (sc.cached)
             causal_softmax_attention_cached(tq, tp, geometry, .0625f, single_cache(0),
-                                            call_envelope, workspace, out,
+                                            call_envelope, workspace, out, gate_input,
                                             DeviceExecutionView{stream, sms});
         else
             causal_softmax_attention(tq, tk, tv, tp, sc.masked ? tvalid : Tensor{}, tr, geometry,
-                                     .0625f, cache, call_envelope, workspace, out,
+                                     .0625f, cache, call_envelope, workspace, out, gate_input,
                                      DeviceExecutionView{stream, sms});
     };
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -521,7 +534,11 @@ void run(const Scenario& sc, unsigned seed) {
                 hadamard(expected);
                 double dot = 0, na = 0, nb = 0, error = 0;
                 for (int d = 0; d < D; ++d) {
-                    const double ref    = expected[d] * sign(d) / 16,
+                    const double gate_scale =
+                        sc.gated
+                            ? 1.0 / (1.0 + std::exp(-double(__bfloat162float(hgate[index + d]))))
+                            : 1.0;
+                    const double ref    = expected[d] * sign(d) / 16 * gate_scale,
                                  actual = __bfloat162float(got[index + d]);
                     dot += ref * actual;
                     na += ref * ref;
@@ -597,6 +614,13 @@ int main(int argc, char** argv) {
             {"H16 narrow cached graph", 16, 1, 1, 8193, false, true, true, false, true},
             {"narrow masked graph", 24, 3, 1, 2049, true, false, true, true, true},
             {"narrow b8", 24, 8, 1, 1025, false, false, false, true, true},
+            // Sigmoid-gated forms: the small-T reducer applies the gate in its store; the prompt
+            // route applies it as a separate sigmoid_mul.
+            {"gated w2560 t8", 24, 1, 8, 2560, false, false, false, false, false, 0, true},
+            {"gated b3 masked graph", 24, 3, 13, 200, true, false, true, false, false, 0, true},
+            {"gated narrow b2", 24, 2, 1, 4097, false, false, false, true, true, 0, true},
+            {"gated H16 cached chunks", 16, 1, 13, 400, false, true, false, false, false, 0, true},
+            {"gated prompt t96", 24, 1, 96, 300, false, false, false, false, false, 0, true},
         };
         unsigned seed = 7;
         for (const auto& sc : scenarios) {

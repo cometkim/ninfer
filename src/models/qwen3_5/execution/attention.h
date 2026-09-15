@@ -22,4 +22,11 @@ void text_rope(const Tensor& positions, const RopeConfig& config,
                const ops::RopeFrequencies& frequencies, Tensor& query, Tensor& key,
                DeviceExecutionView execution);
 
+// Fused Q/K preparation: offset-weight RMSNorm of q and k followed by text_rope, as one Op
+// (ops::qk_norm_rope) with the same axis-mapping requirement.
+void text_qk_norm_rope(const Tensor& query, const Tensor& key, const Tensor& query_norm,
+                       const Tensor& key_norm, float eps, const Tensor& positions,
+                       const RopeConfig& config, const ops::RopeFrequencies& frequencies,
+                       Tensor& query_out, Tensor& key_out, cudaStream_t stream);
+
 } // namespace ninfer::models::qwen3_5::execution

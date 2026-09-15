@@ -23,6 +23,8 @@ struct CausalSmallTInvocation {
     std::int32_t batch_size     = 1;
     // Physical SM count of the executing device; bounds the split grid (see hq/plan.cpp).
     std::int32_t multiprocessor_count = 0;
+    // Optional sigmoid output gate with out's layout, applied by the reducer's store.
+    const Tensor* gate = nullptr;
 };
 
 // Split-grid capacity of one small-T launch over an execution envelope. The device-side active
@@ -37,13 +39,16 @@ void causal_attention_small_t_hq_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, const Tensor* gate,
     std::int32_t multiprocessor_count, cudaStream_t stream);
 
-void causal_attention_cached_small_t_hq_launch(
-    const Tensor& q, const Tensor& positions, float scale, const PagedKVLayerView& cache,
-    CausalAttentionExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m,
-    Tensor& partial_l, Tensor& out, std::int32_t multiprocessor_count, cudaStream_t stream);
+void causal_attention_cached_small_t_hq_launch(const Tensor& q, const Tensor& positions,
+                                               float scale, const PagedKVLayerView& cache,
+                                               CausalAttentionExecutionEnvelope envelope,
+                                               Tensor& partial_acc, Tensor& partial_m,
+                                               Tensor& partial_l, Tensor& out, const Tensor* gate,
+                                               std::int32_t multiprocessor_count,
+                                               cudaStream_t stream);
 
 // Prompt route over a banded rotated-frame scratch: scratch_k/v hold one band of
 // min(visible_keys, kCausalHqPromptScratchBandKeys) keys; with more than one band the carry

@@ -14,7 +14,8 @@ template <class G, bool InverseRotation>
 __launch_bounds__(256) __global__
     void causal_tiled_merge_kernel(CausalPartialView partial, const std::int32_t* positions,
                                    const std::int32_t* valid_columns, int width,
-                                   CausalKvPartition partition, __nv_bfloat16* out) {
+                                   CausalKvPartition partition, __nv_bfloat16* out,
+                                   const __nv_bfloat16* gate) {
     const int lane  = threadIdx.x & 31;
     const int row   = blockIdx.x * 8 + (threadIdx.x >> 5);
     const int head  = row % G::QHeads;
@@ -46,7 +47,8 @@ __launch_bounds__(256) __global__
     if constexpr (InverseRotation) normalized_hadamard_d256_inplace(values, lane);
 #pragma unroll
     for (int i = 0; i < 8; ++i)
-        causal_store_output(out + causal_q_index<G>(head, lane + i * 32, token), values[i]);
+        causal_store_gated_output(out, gate, causal_q_index<G>(head, lane + i * 32, token),
+                                  values[i]);
 }
 
 template <class G, bool InverseRotation>
@@ -55,7 +57,7 @@ void launch_causal_tiled_merge(const CausalAttentionOperands& p, const std::int3
                                cudaStream_t stream) {
     causal_tiled_merge_kernel<G, InverseRotation>
         <<<div_up(p.width * G::QHeads, 8), 256, 0, stream>>>(partial, p.positions, valid_columns,
-                                                             p.width, partition, p.out);
+                                                             p.width, partition, p.out, p.gate);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_operands.h"
@@ -258,6 +259,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     __shared__ Nvfp4A16GemvSharedStorage<Geometry, Schedule> shared;
     const int block = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     nvfp4_stage_a16_scales<Geometry, Schedule>(scales, shared, block, rows, policy);
+    // The staged scales are weights; the activation x is the first producer-dependent read.
+    pdl::wait_for_dependencies();
     const int local0 = warp * Schedule::kRowsPerWarp;
     int parent[Schedule::kRowsPerWarp];
 #pragma unroll
@@ -285,5 +288,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             }
         }
     }
+    pdl::publish();
 }
 } // namespace ninfer::ops::detail

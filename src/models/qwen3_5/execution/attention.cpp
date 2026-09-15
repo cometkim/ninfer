@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/attention.h"
 
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/qk_norm_rope.h"
 #include "ninfer/ops/rope.h"
 
 #include <stdexcept>
@@ -56,6 +57,18 @@ void text_rope(const Tensor& positions, const RopeConfig& config,
                DeviceExecutionView execution) {
     require_rope_axes(positions, config);
     ops::rope(positions, dimension(config.rotary_dim), frequencies, query, key, execution);
+}
+
+void text_qk_norm_rope(const Tensor& query, const Tensor& key, const Tensor& query_norm,
+                       const Tensor& key_norm, float eps, const Tensor& positions,
+                       const RopeConfig& config, const ops::RopeFrequencies& frequencies,
+                       Tensor& query_out, Tensor& key_out, cudaStream_t stream) {
+    require_rope_axes(positions, config);
+    if (dimension(config.rotary_dim) != 64) {
+        throw std::invalid_argument("text Q/K preparation: the fused route requires rotary_dim 64");
+    }
+    ops::qk_norm_rope(query, key, query_norm, key_norm, eps, positions, frequencies, query_out,
+                      key_out, stream);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

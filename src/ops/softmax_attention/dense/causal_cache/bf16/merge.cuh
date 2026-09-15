@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/pdl.cuh"
+#include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/tile_io.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
@@ -41,7 +43,9 @@ __launch_bounds__(Schedule::kThreads) __global__
                               const float* partial_l, const std::int32_t* positions,
                               const std::int32_t* valid_columns, std::int32_t tokens,
                               std::int32_t batch_size, Bf16KvPartition partition,
-                              __nv_bfloat16* out) {
+                              __nv_bfloat16* out, const __nv_bfloat16* gate) {
+    // Every input is the preceding grouped kernel's partial state or call metadata.
+    pdl::wait_for_dependencies();
     const int split_count = partition.capacity;
     constexpr int DChunk  = Schedule::kDChunk;
     static_assert(DChunk <= Geometry::kHeadDim);
@@ -104,7 +108,8 @@ __launch_bounds__(Schedule::kThreads) __global__
     }
 
     const float value = (head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    causal_store_gated_output(out, gate, causal_q_index<Geometry>(q_head, d, output_column), value);
+    pdl::publish();
 }
 
 

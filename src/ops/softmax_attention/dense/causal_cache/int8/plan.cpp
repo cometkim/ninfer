@@ -1,4 +1,5 @@
 #include "ops/softmax_attention/dense/causal_cache/int8/plan.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/operands.h"
 #include <algorithm>
 #include <stdexcept>
@@ -6,7 +7,27 @@
 namespace ninfer::ops::detail {
 namespace {
 constexpr int kGroupedPrefillMaxWidth = 256;
+constexpr int kTiledQueryRows         = Int8KvTiledInstance::kQueryRows;
 } // namespace
+
+int int8_kv_tiled_splits(int heads, int width, int multiprocessor_count) {
+    const std::int64_t items =
+        static_cast<std::int64_t>((width + kTiledQueryRows - 1) / kTiledQueryRows) * heads;
+    const std::int64_t sms = multiprocessor_count;
+    // A single pass that fits one wave gains nothing from splitting keys.
+    if (items <= sms) return 1;
+    const double single = static_cast<double>((items + sms - 1) / sms);
+    double best_ratio   = single;
+    int best            = 1;
+    for (int splits = 2; splits <= 4; ++splits) {
+        const double ratio = static_cast<double>((items * splits + sms - 1) / sms) / splits;
+        if (ratio < best_ratio) {
+            best_ratio = ratio;
+            best       = splits;
+        }
+    }
+    return best_ratio > 0.9 * single ? 1 : best;
+}
 
 Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
                                           CausalAttentionExecutionEnvelope envelope,
@@ -31,9 +52,12 @@ Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
             : sms;
     CausalKvPartition partition{1, causal_partition_target(budget, independent_tiles)};
     // Bound partial traffic by keeping enough KV work in each split.
-    partition.key_shift = (width == 1 ? 7 : 8) - (heads == 16 ? 1 : 0);
-    partition.capacity  = partition.active(envelope.max_visible_keys);
-    return {family, heads, width, batch, envelope, partition};
+    partition.key_shift    = (width == 1 ? 7 : 8) - (heads == 16 ? 1 : 0);
+    partition.capacity     = partition.active(envelope.max_visible_keys);
+    const int tiled_splits = family == Int8KvFamily::Tiled
+                                 ? int8_kv_tiled_splits(heads, width, multiprocessor_count)
+                                 : 1;
+    return {family, heads, width, batch, envelope, partition, tiled_splits};
 }
 
 std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
@@ -48,6 +72,21 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
         WorkspaceLayoutBuilder layout;
         (void)allocate_causal_partials(layout, heads, width, splits, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));
+    }
+    // The tiled key split keeps one split count per query-tile interval of widths, with partial
+    // storage growing in width, and the count is not monotone across intervals (a 948-column
+    // tail can split four ways where a 1024-column chunk splits three), so every interval's last
+    // width is evaluated.
+    for (int begin = std::max(min_width, kGroupedPrefillMaxWidth + 1); begin <= max_width;) {
+        const int last =
+            std::min(max_width, (begin + kTiledQueryRows - 1) / kTiledQueryRows * kTiledQueryRows);
+        const int splits = int8_kv_tiled_splits(heads, last, multiprocessor_count);
+        if (splits > 1) {
+            WorkspaceLayoutBuilder layout;
+            (void)allocate_causal_partials(layout, heads, last, splits, 1);
+            maximum = std::max(maximum, layout.peak_bytes(1));
+        }
+        begin = last + 1;
     }
     return maximum;
 }

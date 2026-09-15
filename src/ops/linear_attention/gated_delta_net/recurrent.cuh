@@ -1,4 +1,5 @@
 #pragma once
+#include "core/pdl.cuh"
 
 #include "ops/common/bf16_vector.cuh"
 #include "ops/linear_attention/gated_delta_net/common.cuh"
@@ -654,38 +655,45 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                  const float* __restrict__ state_read,
                                  float* __restrict__ state_write, __nv_bfloat16* __restrict__ out,
                                  std::int32_t width, head_map heads, float scale) {
+    pdl::sync();
     const DirectAccess access{q, k, v, g, beta, state_read, state_write, out, heads, width, scale};
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<NormalizeInputs, OutputEffects>(state, access, coord, width);
     store_state_tile(state, access.state_write_base(coord), coord);
+    pdl::publish();
 }
 
 template <bool NormalizeInputs>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_batch_update_kernel(BatchUpdateAccess access) {
+    pdl::sync();
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<NormalizeInputs, OutputEffects>(state, access, coord, 1);
     store_state_tile(state, access.state_write_base(coord), coord);
+    pdl::publish();
 }
 
 template <bool Masked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_record_kernel(RecordAccess<Masked> access) {
+    pdl::sync();
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<true, RecordEffects>(state, access, coord, valid);
     zero_output_suffix(access, coord, valid, access.width);
+    pdl::publish();
 }
 
 template <class Geometry>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
+    pdl::sync();
     const RecurrentCoordinates coord = access.coordinates();
     const std::int32_t valid         = access.active_columns(coord);
     if (valid == 0) { return; }
@@ -694,6 +702,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     run_recurrent_sequence<true, FoldEffects>(state, access, coord, valid);
     access.store_final_state(coord, state);
     access.publish_final_conv_history(coord, valid);
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail::gated_delta_net

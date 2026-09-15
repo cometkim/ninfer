@@ -1,4 +1,5 @@
 #pragma once
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/tile_io.cuh"
 
 #include "ops/softmax_attention/dense/causal_cache/int8/schedule.cuh"
@@ -23,6 +24,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t logical_capacity, CausalKvPartition partition, float scale, float* partial_acc,
         float* partial_m, float* partial_l) {
+    // Queries, new K/V rows, positions and row metadata are all producer-dependent.
+    pdl::wait_for_dependencies();
     constexpr int TokenTile            = Schedule::kTokenTile;
     constexpr int WarpsPerCta          = Schedule::kWarps;
     constexpr int KeyBlock             = Schedule::kKeyRows;
@@ -584,6 +587,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             causal_store_partial_pair(&partial_acc[dst], acc[n][2], acc[n][3]);
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

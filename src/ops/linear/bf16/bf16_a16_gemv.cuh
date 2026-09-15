@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/linear/bf16/bf16_schedule.cuh"
 #include "ops/common/math.cuh"
 #include "ops/linear/common/epilogue.cuh"
@@ -198,6 +199,7 @@ __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_gemv_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
     Epilogue epilogue, int input_rows) {
+    pdl::sync();
     const int K = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
 
     __shared__ Bf16GemvSharedStorage<Schedule> shared;
@@ -264,6 +266,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
             }
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

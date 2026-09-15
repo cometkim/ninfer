@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/nvfp4/nvfp4_a16_gemv.cuh"
@@ -18,10 +19,12 @@ void launch_nvfp4_a16_gemv(const Nvfp4A16Operands& p, Output output, Epilogue ep
         p.k % (32 * Schedule::kValuesPerLane))
         throw std::invalid_argument("NVFP4 GEMV requires T=1 and complete row/K tiles");
     static_assert(Schedule::kStaticK > 0, "SIMT phase specialization requires a static K instance");
-    nvfp4_a16_gemv_kernel<Schedule>
-        <<<p.rows / Schedule::kBlockRows, Schedule::kThreads, 0, stream>>>(
-            p.x, p.codes, p.scales, p.alpha, output, epilogue, rows, p.rows);
-    CUDA_CHECK(cudaGetLastError());
+    // The A16 decode/small-T families wait on their producer after staging weight data, so they
+    // launch as programmatic dependents (no-op attribute when NINFER_BENCH_PDL=0).
+    CUDA_CHECK(pdl::launch_dependent({dim3(static_cast<unsigned>(p.rows / Schedule::kBlockRows)),
+                                      dim3(Schedule::kThreads), 0, stream},
+                                     nvfp4_a16_gemv_kernel<Schedule, Output, Epilogue, Rows>, p.x,
+                                     p.codes, p.scales, p.alpha, output, epilogue, rows, p.rows));
 }
 
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
@@ -41,9 +44,10 @@ void launch_nvfp4_a16_simt(const Nvfp4A16Operands& p, Output output, Epilogue ep
     static_assert(Schedule::kStaticK > 0 && Schedule::kTokenCapacity > 0);
     const int capacity = Schedule::kTokenCapacity;
     const int blocks   = p.rows / Schedule::kBlockRows * div_up(capacity, Schedule::kBlockTokens);
-    nvfp4_a16_simt_kernel<Schedule><<<blocks, Schedule::kThreads, 0, stream>>>(
-        p.x, p.codes, p.scales, p.alpha, output, epilogue, rows, p.rows, p.tokens);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(static_cast<unsigned>(blocks)), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_a16_simt_kernel<Schedule, Output, Epilogue, Rows>, p.x, p.codes, p.scales, p.alpha,
+        output, epilogue, rows, p.rows, p.tokens));
 }
 
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
@@ -85,8 +89,9 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
     const int bytes              = nvfp4_prepare_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
-        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(pdl::launch_dependent(
+            {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream}, kernel, p,
+            output, epilogue, rows, offset));
     });
 }
 

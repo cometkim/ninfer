@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
@@ -49,6 +50,8 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                                     const int* tables, const int* validity, const int* table_rows,
                                     int table_stride, int runtime_width, float scale,
                                     Bf16KvPartition partition, CausalPartialView partial) {
+    // Queries, new K/V rows, positions and row metadata are all producer-dependent.
+    pdl::wait_for_dependencies();
     const int width = S::kFixedWidth ? S::kFixedWidth : runtime_width;
     constexpr int D = G::kHeadDim, M = S::kQueryRows, N = S::kKeyRows;
     constexpr int NK = N / S::kWarpsKV, QKNt = NK / 8, QKKs = D / 16;
@@ -319,6 +322,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                                             split, acc[n][2 * j], acc[n][2 * j + 1], m[j], sums[j]);
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

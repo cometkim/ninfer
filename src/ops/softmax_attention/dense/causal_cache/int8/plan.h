@@ -13,7 +13,13 @@ struct Int8KvCausalPlan {
     int query_heads, width, batch;
     CausalAttentionExecutionEnvelope envelope;
     CausalKvPartition partition;
+    // Tiled family only: key-range splits of each query tile (1 = single pass, direct output).
+    int tiled_splits = 1;
 };
+
+// Wave-fill key split of the tiled route (the fork's WI-K1a): S in 1..4, chosen only when the
+// predicted waves per unit of work improve by at least 10% over the single pass.
+int int8_kv_tiled_splits(int heads, int width, int multiprocessor_count);
 
 Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
                                           CausalAttentionExecutionEnvelope envelope,

@@ -131,6 +131,8 @@ struct AttentionCase {
     bool zero_q        = false;
     bool graph_replay  = false;
     float qk_amplitude = 0.25f;
+    // Pass a sigmoid output gate (gated op form); the oracle multiplies by sigmoid(gate).
+    bool gated = false;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -1703,7 +1705,7 @@ std::string case_label(const char* entry, const Geometry& geometry, KvCacheStora
            " keys=" + std::to_string(test_case.base + test_case.tokens) +
            " envelope_max=" + std::to_string(test_case.envelope_max) +
            " qk_amplitude=" + std::to_string(test_case.qk_amplitude) +
-           (test_case.graph_replay ? " graph-replay" : "");
+           (test_case.graph_replay ? " graph-replay" : "") + (test_case.gated ? " gated" : "");
 }
 
 template <class Launch>
@@ -1762,6 +1764,17 @@ std::vector<T> select_query_columns(const std::vector<T>& values, std::size_t st
     return result;
 }
 
+// Sigmoid output gate inputs: represented BF16 values in [-4, 4] with out's layout. The gated
+// oracle is the ideal attention times sigmoid(gate), evaluated in FP64.
+std::vector<float> make_gate_values(std::size_t elements, std::uint32_t seed) {
+    return make_bf16_values(elements, seed, -4.0f, 4.0f);
+}
+
+void apply_gate(std::vector<double>& reference, const std::vector<float>& gate) {
+    for (std::size_t i = 0; i < reference.size(); ++i)
+        reference[i] *= 1.0 / (1.0 + std::exp(-static_cast<double>(gate[i])));
+}
+
 int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                 const AttentionCase& test_case, MappingPattern mapping,
                 std::span<const int> oracle_queries         = {},
@@ -1793,14 +1806,23 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
         make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude);
     HostCache expected = initial;
     append_cache(expected, k, v, positions);
-    const std::vector<double> reference =
+    std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
                         expected, select_query_columns(positions, 1, oracle_queries));
+    const std::vector<float> gate =
+        test_case.gated ? make_gate_values(q_elements, test_case.seed + 7u) : std::vector<float>{};
+    if (test_case.gated)
+        apply_gate(reference,
+                   select_query_columns(gate, kHeadDim * geometry.q_heads, oracle_queries));
     DeviceCache cache(initial, mapping, max_context);
 
-    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
-    const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
-    const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
+    const std::vector<std::uint16_t> q_bits    = to_bf16_bits(q);
+    const std::vector<std::uint16_t> k_bits    = to_bf16_bits(k);
+    const std::vector<std::uint16_t> v_bits    = to_bf16_bits(v);
+    const std::vector<std::uint16_t> gate_bits = to_bf16_bits(gate);
+    GuardedDeviceBuffer dgate(std::max<std::size_t>(gate_bits.size(), 1) * sizeof(std::uint16_t));
+    if (test_case.gated)
+        dgate.copy_from_host(gate_bits.data(), gate_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer dk(k_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer dv(v_bits.size() * sizeof(std::uint16_t));
@@ -1822,6 +1844,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     Tensor tp(dp.data(), DType::I32, {test_case.tokens});
     Tensor ttable_row(dtable_row.data(), DType::I32, {1});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    Tensor tgate(dgate.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
         op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens, execution);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
@@ -1830,8 +1853,9 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     int graph_failures = 0;
     const auto launch  = [&](cudaStream_t stream) {
         ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row, op_geometry(geometry),
-                                       kAttentionScale, cache.batch_view(), envelope, workspace,
-                                       tout, execution.on_stream(stream));
+                                      kAttentionScale, cache.batch_view(), envelope, workspace,
+                                      tout, test_case.gated ? &tgate : nullptr,
+                                      execution.on_stream(stream));
     };
     if (graph_limits.empty()) {
         launch_attention_case(launch, test_case.graph_replay);
@@ -1881,6 +1905,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_input(label + " k unchanged", dk, k_bits);
     failures += verify_input(label + " v unchanged", dv, v_bits);
+    if (test_case.gated) failures += verify_input(label + " gate unchanged", dgate, gate_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
     failures += verify_positions(label + " table row unchanged", dtable_row, {table_row});
     failures += dout.verify_guards((label + " output").c_str());
@@ -1914,12 +1939,21 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
 
     const HostCache cache_host =
         make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude);
-    const std::vector<double> reference =
+    std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
                         cache_host, select_query_columns(positions, 1, oracle_queries));
+    const std::vector<float> gate =
+        test_case.gated ? make_gate_values(q.size(), test_case.seed + 7u) : std::vector<float>{};
+    if (test_case.gated)
+        apply_gate(reference,
+                   select_query_columns(gate, kHeadDim * geometry.q_heads, oracle_queries));
     DeviceCache cache(cache_host, mapping, max_context);
 
-    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    const std::vector<std::uint16_t> q_bits    = to_bf16_bits(q);
+    const std::vector<std::uint16_t> gate_bits = to_bf16_bits(gate);
+    GuardedDeviceBuffer dgate(std::max<std::size_t>(gate_bits.size(), 1) * sizeof(std::uint16_t));
+    if (test_case.gated)
+        dgate.copy_from_host(gate_bits.data(), gate_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
@@ -1931,6 +1965,7 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     Tensor tp(dp.data(), DType::I32, {test_case.tokens});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+    Tensor tgate(dgate.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
         op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens, execution);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
@@ -1938,9 +1973,9 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
 
     launch_attention_case(
         [&](cudaStream_t stream) {
-            ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
-                                                 cache.view(), envelope, workspace, tout,
-                                                 execution.on_stream(stream));
+            ops::causal_softmax_attention_cached(
+                tq, tp, op_geometry(geometry), kAttentionScale, cache.view(), envelope, workspace,
+                tout, test_case.gated ? &tgate : nullptr, execution.on_stream(stream));
         },
         test_case.graph_replay);
 
@@ -1954,6 +1989,7 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
                                     reference, attention_criterion(storage));
     failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host);
     failures += verify_input(label + " q unchanged", dq, q_bits);
+    if (test_case.gated) failures += verify_input(label + " gate unchanged", dgate, gate_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
@@ -1975,6 +2011,8 @@ struct BatchAttentionCase {
     bool graph_replay = false;
     // Optional per-replay contexts exercise large live-length changes with stable device views.
     std::vector<std::vector<std::int32_t>> replay_contexts;
+    // Pass a sigmoid output gate with out's [D,Hq,W,B] layout.
+    bool gated = false;
 };
 
 std::vector<float> extract_request_columns(const std::vector<float>& source,
@@ -2043,6 +2081,10 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
     auto k = make_bf16_values(kv_column_elements * columns, test_case.seed + 1u, -.25f, .25f);
     auto v = make_bf16_values(kv_column_elements * columns, test_case.seed + 2u, -1.f, 1.f);
     inject_codec_edges(geometry, columns, k, v);
+    const auto gate      = test_case.gated
+                               ? make_gate_values(q_column_elements * columns, test_case.seed + 7u)
+                               : std::vector<float>{};
+    const auto gate_bits = to_bf16_bits(gate);
     std::vector<HostCache> initial;
     // Cover every replay's live prefix plus a writable-tail guard; future table capacity does
     // not require generating, encoding or copying nonexistent KV rows.
@@ -2062,6 +2104,10 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
     Tensor tp(dp.data(), DType::I32, {width, batch}), tvalid(dvalid.data(), DType::I32, {batch}),
         tlanes(dlanes.data(), DType::I32, {batch});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+    GuardedDeviceBuffer dgate(std::max<std::size_t>(gate_bits.size(), 1) * 2);
+    if (test_case.gated) dgate.copy_from_host(gate_bits.data(), gate_bits.size() * 2);
+    // The gate keeps the model's aggregate [D,Hq,W*B] shape; the Op reads it in out's layout.
+    Tensor tgate(dgate.data(), DType::BF16, {kHeadDim, geometry.q_heads, width * batch});
     const auto capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
         op_geometry(geometry), storage, envelope, batch, width, width, execution);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
@@ -2072,7 +2118,8 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
     const auto launch = [&] {
         ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
                                       op_geometry(geometry), kAttentionScale, cache.view(),
-                                      envelope, workspace, tout, execution);
+                                      envelope, workspace, tout, test_case.gated ? &tgate : nullptr,
+                                      execution);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -2121,6 +2168,7 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
                 insert_request_columns(ideal_attention(row_q, expected[lanes[b]], row_positions),
                                        q_column_elements, width, b, reference);
             }
+        if (test_case.gated) apply_gate(reference, gate);
         if (test_case.graph_replay && (phase == 0 || !graph_limits.empty())) {
             launch();
             cuda_synchronize(
@@ -2139,9 +2187,10 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         else
             launch();
         cuda_synchronize(execution.stream);
-        const std::string label = std::string("causal batch ") + geometry.name + " " +
-                                  cache_name(storage) + " W=" + std::to_string(width) +
-                                  " B=" + std::to_string(batch) + " phase=" + std::to_string(phase);
+        const std::string label =
+            std::string("causal batch ") + geometry.name + " " + cache_name(storage) +
+            " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
+            " phase=" + std::to_string(phase) + (test_case.gated ? " gated" : "");
         const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
                                      attention_criterion(storage));
@@ -2171,6 +2220,7 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         failures += verify_input(label + " q unchanged", dq, q_bits) +
                     verify_input(label + " k unchanged", dk, k_bits) +
                     verify_input(label + " v unchanged", dv, v_bits);
+        if (test_case.gated) failures += verify_input(label + " gate unchanged", dgate, gate_bits);
         failures += verify_positions(label + " positions unchanged", dp, positions) +
                     verify_positions(label + " counts unchanged", dvalid, valid) +
                     verify_positions(label + " lanes unchanged", dlanes, lanes);
@@ -2839,8 +2889,40 @@ int run_long_linear_cases(DeviceExecutionView execution, KvCacheStorage storage)
            run_long_linear_case(execution, storage, 6, false);
 }
 
+// Sigmoid-gated forms across the route families: grouped decode/verify widths and batched
+// rows (merge epilogue), the chunked and parallel prefill widths, and a wide prompt whose route
+// writes directly (separate sigmoid_mul) or merges key partitions, depending on the cache type.
+int run_gate_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    int failures = 0;
+    for (const auto& geometry : kGeometries) {
+        for (const int width : {1, 6, 16, 40}) {
+            AttentionCase test_case{width, 700, 4096, 1401u + static_cast<unsigned>(width)};
+            test_case.gated = true;
+            failures +=
+                run_a1_case(execution, geometry, storage, test_case, MappingPattern::Fragmented);
+            test_case.seed += 100u;
+            failures +=
+                run_a3_case(execution, geometry, storage, test_case, MappingPattern::Fragmented);
+        }
+        const std::array<int, 3> prompt_queries{0, 129, 299};
+        AttentionCase prompt{300, 400, 2048, 1451u};
+        prompt.gated = true;
+        failures += run_a1_case(execution, geometry, storage, prompt, MappingPattern::Fragmented,
+                                prompt_queries);
+        BatchAttentionCase batch{4,         {100, 900, 2000},           {4, 2, 3},
+                                 {2, 0, 1}, MappingPattern::Fragmented, 1461u};
+        batch.gated = true;
+        failures += run_batch_case(execution, geometry, storage, batch);
+        BatchAttentionCase verify{16, {500, 1200}, {16, 16}, {0, 1}, MappingPattern::Offset, 1471u};
+        verify.gated = true;
+        failures += run_batch_case(execution, geometry, storage, verify);
+    }
+    return failures;
+}
+
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures = verify_workspace_capacity_contract(execution, storage);
+    failures += run_gate_cases(execution, storage);
     failures += run_long_linear_cases(execution, storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
         failures += run_nvfp4_cases(execution);
@@ -2875,6 +2957,25 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
 }
 
 } // namespace
+
+// Gate cases only (--gate-only): the sigmoid-gated forms for every selected cache type.
+int run_softmax_attention_gate_tests(std::optional<KvCacheStorage> selected) {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    DeviceContext device;
+    const auto execution = device.execution_view();
+    int failures         = 0;
+    for (const auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        if (selected && storage != *selected) continue;
+        failures += run_gate_cases(execution, storage);
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " causal_softmax_attention sigmoid gate\n";
+    return failures ? 1 : 0;
+}
 
 // Long-envelope cases only (--long-cache-only): every selected linear cache type at its
 // visible-key ceiling.

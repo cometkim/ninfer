@@ -238,6 +238,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     const int token0 = tt * Schedule::kBlockTokens;
     __shared__ Nvfp4A16SimtSharedStorage<Geometry, ActiveTokens, Schedule> shared;
     nvfp4_stage_a16_scales<Geometry, Schedule>(scales, shared.gemv, rb, rows, policy);
+    // The staged scales are weights; the activation x is the first producer-dependent read.
+    pdl::wait_for_dependencies();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int rg = warp / Schedule::kWarpsPerRow, wr = warp % Schedule::kWarpsPerRow;
     const int local0 = rg * Schedule::kRowsPerWarp;
@@ -290,5 +292,6 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
                                   min(Schedule::kBlockTokens, live - token0));
         }
     }
+    pdl::publish();
 }
 } // namespace ninfer::ops::detail
