@@ -25,6 +25,10 @@ The `dev` configure preset also enables all benchmarks, alongside products and t
 [Build system](../docs/maintainer/build-system.md) for presets and dependencies. Tests use a
 Python interpreter; a benchmark-only configuration does not require one.
 
+Engine: `NINFER_BENCH_PDL=0` removes programmatic serialization from dependent launches;
+`NINFER_BENCH_FUSIONS=0` uses separate Q/K RMSNorm and RoPE and separate attention sigmoid
+gating, for same-binary attribution runs.
+
 ## Product benchmark
 
 The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls

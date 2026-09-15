@@ -124,10 +124,6 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
                   "split-output Q5 GEMV requires an interior compile-time seam");
     static_assert(!kResidual || !kSplitOutput, "the Q5 residual GEMV epilogue is contiguous-only");
 
-    if constexpr (TriggerPdl) {
-        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
-    }
-
     // __align__(16) so the uint4 staging below is well-defined by construction.
     __shared__ __align__(16) __nv_bfloat16 x_sh[kStageX ? kK : 1];
     __shared__ uint4 s_nib[kRowsPerBlock][kStages][32];
@@ -196,6 +192,7 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
     if (lane == 0) {
         epilogue.template operator()<kSplitOutput, kSplitRow>(out, out_tail, row, acc);
     }
+    if constexpr (TriggerPdl) { pdl::publish(); }
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 

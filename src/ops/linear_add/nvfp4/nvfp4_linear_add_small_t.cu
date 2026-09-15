@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
+#include "core/pdl.cuh"
 
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -27,11 +28,16 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaS
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
     const float inverse       = 1.0F / weight.weight_scale_divisor;
     auto* output              = static_cast<__nv_bfloat16*>(residual.data);
-    nvfp4_simt_kernel<Geometry, ActiveTokens, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), inverse,
-        Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},
-        Nvfp4ContiguousOutput{output, Geometry::kOutputRows});
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_simt_kernel<Geometry, ActiveTokens, Schedule, Nvfp4AddResidualEpilogue,
+                            Nvfp4ContiguousOutput>,
+
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), inverse,
+            Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},
+            Nvfp4ContiguousOutput{output, Geometry::kOutputRows}, ActiveTokens));
     CUDA_CHECK(cudaGetLastError());
 }
 

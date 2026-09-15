@@ -12,6 +12,7 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 
+#include "core/pdl.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/append/hq_kernel.cuh"
 #include "ops/kv_cache/hq_e8_rice_codec.cuh"
@@ -37,6 +38,7 @@ __launch_bounds__(128, Narrow ? 4 : 2) __global__
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
         std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
         float scale, float* partial_acc, float* partial_m, float* partial_l) {
+    pdl::sync();
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -572,6 +574,7 @@ __launch_bounds__(128, Narrow ? 4 : 2) __global__
             __syncwarp();
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

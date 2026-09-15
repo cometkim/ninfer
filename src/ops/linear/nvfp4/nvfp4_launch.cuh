@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 #include "ops/linear/nvfp4/nvfp4_simt.cuh"
@@ -26,12 +27,14 @@ template <class Geometry, class Schedule>
 void launch_nvfp4_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const Nvfp4ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data),
                                        Geometry::kOutputRows};
-    nvfp4_gemv_kernel<Geometry, Schedule>
-        <<<Geometry::kOutputRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), 1.0f / weight.weight_scale_divisor,
-            Nvfp4IdentityEpilogue{}, output);
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(static_cast<unsigned>(Geometry::kOutputRows / Schedule::kRowsPerCta)),
+         dim3(Schedule::kThreads), 0, stream},
+        nvfp4_gemv_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4ContiguousOutput>,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), 1.0f / weight.weight_scale_divisor,
+        Nvfp4IdentityEpilogue{}, output));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -41,13 +44,15 @@ void launch_nvfp4_simt(const Tensor& x, const Weight& weight, Tensor& out, cudaS
                            ((Capacity + Schedule::kTokenTile - 1) / Schedule::kTokenTile);
     const Nvfp4ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data),
                                        Geometry::kOutputRows};
-    nvfp4_simt_kernel<Geometry, Capacity, Schedule, Nvfp4IdentityEpilogue, Nvfp4ContiguousOutput,
-                      Nvfp4SimtFinalization::Elementwise, !FullColumns>
-        <<<blocks, Schedule::kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                                    static_cast<const std::uint8_t*>(weight.qdata),
-                                                    static_cast<const std::uint8_t*>(weight.scales),
-                                                    1.0f / weight.weight_scale_divisor, {}, output,
-                                                    x.ne[1]);
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(static_cast<unsigned>(blocks)), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_simt_kernel<Geometry, Capacity, Schedule, Nvfp4IdentityEpilogue,
+                          Nvfp4ContiguousOutput, Nvfp4SimtFinalization::Elementwise,
+                          !FullColumns>,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), 1.0f / weight.weight_scale_divisor,
+        Nvfp4IdentityEpilogue{}, output, x.ne[1]));
     CUDA_CHECK(cudaGetLastError());
 }
 

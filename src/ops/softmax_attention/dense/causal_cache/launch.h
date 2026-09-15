@@ -34,17 +34,23 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
 
 const char* causal_attention_route_name(CausalAttentionRoute route);
 
+std::int32_t causal_prompt_i8_split_count(std::int32_t width, std::int32_t q_heads);
+
+// gate: optional sigmoid-gated-output input fused into the generic (BF16/INT8) reducer
+// epilogue; the storage-specific routes below do not take it.
 void causal_attention_small_t_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream);
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, const Tensor* gate,
+    cudaStream_t stream);
 
 void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
                                             const PagedKVLayerView& cache,
                                             CausalAttentionExecutionEnvelope envelope,
                                             Tensor& partial_acc, Tensor& partial_m,
-                                            Tensor& partial_l, Tensor& out, cudaStream_t stream);
+                                            Tensor& partial_l, Tensor& out, const Tensor* gate,
+                                            cudaStream_t stream);
 
 void causal_attention_small_t_fp8_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -118,15 +124,21 @@ void causal_attention_prompt_hq_attention_launch(const Tensor& q, const Tensor& 
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
-                                    PagedKVBatchLayerView cache, const Tensor& scratch_k,
-                                    const Tensor& scratch_v, const Tensor& carry_acc, const Tensor& carry_m,
-                                    const Tensor& carry_l, std::uint32_t visible_keys, Tensor& out, cudaStream_t stream);
+                                    PagedKVBatchLayerView cache, Tensor& out, Tensor& partial_acc,
+                                    Tensor& partial_m, Tensor& partial_l,
+                                    std::int32_t split_count, const Tensor& scratch_k,
+                                    const Tensor& scratch_v, const Tensor& carry_acc,
+                                    const Tensor& carry_m, const Tensor& carry_l,
+                                    std::uint32_t visible_keys, cudaStream_t stream);
 
 void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                              const PagedKVLayerView& cache,
+                                              const PagedKVLayerView& cache, Tensor& out,
+                                              Tensor& partial_acc, Tensor& partial_m,
+                                              Tensor& partial_l, std::int32_t split_count,
                                               const Tensor& scratch_k, const Tensor& scratch_v,
                                               const Tensor& carry_acc, const Tensor& carry_m,
-                                    const Tensor& carry_l, std::uint32_t visible_keys, Tensor& out, cudaStream_t stream);
+                                              const Tensor& carry_l, std::uint32_t visible_keys,
+                                              cudaStream_t stream);
 
 void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                         const Tensor& positions, const Tensor& valid_columns,

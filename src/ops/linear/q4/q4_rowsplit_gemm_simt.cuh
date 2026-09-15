@@ -207,10 +207,6 @@ __global__ __launch_bounds__(
     static_assert(!SplitOutput || SplitRow > 0,
                   "split-output Q4 SIMT requires a positive compile-time seam");
 
-    if constexpr (TriggerPdl) {
-        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
-    }
-
     constexpr bool kFull              = Full;
     constexpr int kRowsPerCta         = Schedule::kRowsPerCta;
     constexpr int kColsPerTile        = Schedule::kColsPerTile;
@@ -319,6 +315,7 @@ __global__ __launch_bounds__(
                                                                 row, col0, active_cols, sums);
         }
     }
+    if constexpr (TriggerPdl) { pdl::publish(); }
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 

@@ -3,6 +3,7 @@
 
 #include "ops/kernel/rmsnorm.cuh"
 #include "core/device.h"
+#include "core/pdl.cuh"
 
 #include <cstdint>
 #include <limits>
@@ -38,11 +39,13 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         if (aligned2 && d == 5120) {
             // Fixed width removes the dynamic pair-count predicates. Ten pairs per thread
             // with hoisted gains wins the hidden-row sweep through prefill.
-            rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 10, true, 5120>
-                <<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+            CUDA_CHECK(pdl::launch_dependent(
+            {dim3(static_cast<unsigned>(rows)), dim3(256), 0, stream},
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 10, true, 5120>,
+
                     reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                     reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
-                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
             return;
         }
     }
@@ -50,11 +53,13 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         if (aligned2 && d == 256) {
             // One warp per row, four rows per CTA across both query and key projections.
             constexpr int block = 128;
-            rmsnorm_warp_bf16x2_kernel<Epilogue, block, true, 256>
-                <<<static_cast<unsigned>((rows + 3) / 4), block, 0, stream>>>(
+            CUDA_CHECK(pdl::launch_dependent(
+            {dim3(static_cast<unsigned>((rows + 3) / 4)), dim3(block), 0, stream},
+            rmsnorm_warp_bf16x2_kernel<Epilogue, block, true, 256>,
+
                     reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                     reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
-                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
             return;
         }
     }
@@ -64,68 +69,88 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         constexpr int kBlock         = 128;
         constexpr int kWarpsPerBlock = kBlock / kWarpSize;
         const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
-        rmsnorm_d128_bf16x2_kernel<Epilogue, kBlock>
-            <<<blocks, kBlock, 0, stream>>>(reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(blocks), dim3(kBlock), 0, stream},
+            rmsnorm_d128_bf16x2_kernel<Epilogue, kBlock>,
+reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                                             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
                                             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                                            reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
+                                            reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps));
     } else if (aligned2 && d >= 64 && d <= 256 && d % 64 == 0) {
         constexpr int kBlock         = 512;
         constexpr int kWarpsPerBlock = kBlock / kWarpSize;
         const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
         if constexpr (kGateOnGrid) {
             if (blocks > kRmsPrefetchBlocks) {
-                rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, false><<<blocks, kBlock, 0, stream>>>(
+                CUDA_CHECK(pdl::launch_dependent(
+            {dim3(blocks), dim3(kBlock), 0, stream},
+            rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, false>,
+
                     reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                     reinterpret_cast<const __nv_bfloat162*>(w_bf16),
                     reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
                 return;
             }
         }
-        rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, true><<<blocks, kBlock, 0, stream>>>(
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(blocks), dim3(kBlock), 0, stream},
+            rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, true>,
+
             reinterpret_cast<const __nv_bfloat162*>(x_bf16),
             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-            reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+            reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
     } else if (aligned2 && d == 2048 && Epilogue == RmsEpilogue::Plain) {
         // The 512-thread CTA is faster than 128/256-thread alternatives at every measured DFlash
         // extent and reaches the same-topology payload floor at the prefill endpoint.
-        rmsnorm_d2048_bf16x2_kernel<Epilogue><<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(static_cast<unsigned int>(rows)), dim3(512), 0, stream},
+            rmsnorm_d2048_bf16x2_kernel<Epilogue>,
+
             reinterpret_cast<const __nv_bfloat162*>(x_bf16),
             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-            reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
+            reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps));
     } else if (aligned2 && d >= 512 && d <= 3072 && d % 512 == 0) {
         // 30 -> 34 registers at Block=256, which is 6 blocks per SM either way under the
         // 1536-thread cap, so this route pays no occupancy for the prefetch and is not gated.
-        rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 6, true>
-            <<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(static_cast<unsigned int>(rows)), dim3(256), 0, stream},
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 6, true>,
+
                 reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(w_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
     } else if (aligned2 && d > 3072 && d <= 8192 && d % 1024 == 0) {
         if constexpr (kGateOnGrid) {
             if (rows > kRmsPrefetchBlocks) {
-                rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, false>
-                    <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
+                CUDA_CHECK(pdl::launch_dependent(
+            {dim3(static_cast<unsigned int>(rows)), dim3(512), 0, stream},
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, false>,
+
                         reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                         reinterpret_cast<const __nv_bfloat162*>(w_bf16),
                         reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                        reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                        reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
                 return;
             }
         }
-        rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, true>
-            <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(static_cast<unsigned int>(rows)), dim3(512), 0, stream},
+            rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, true>,
+
                 reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(w_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps));
     } else {
-        rmsnorm_generic_kernel<Epilogue><<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
-            x_bf16, w_bf16, z_bf16, out_bf16, d, rows, eps);
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(static_cast<unsigned int>(rows)), dim3(256), 0, stream},
+            rmsnorm_generic_kernel<Epilogue>,
+
+            x_bf16, w_bf16, z_bf16, out_bf16, d, rows, eps));
     }
 }
 

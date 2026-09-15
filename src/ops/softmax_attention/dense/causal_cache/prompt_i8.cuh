@@ -53,12 +53,13 @@ __device__ __forceinline__ int4 causal_prompt_i8_dequant_f16x8(const std::int8_t
     const int2 raw       = load_vec<int2>(codes8);
     const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
     const __half2 s2     = __halves2half2(scale, scale);
+    const __half2 guard  = __float2half2_rn(0.015625f); // 2^-6
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const __half2 code2 =
             __floats2half2_rn(static_cast<float>(c[2 * i]), static_cast<float>(c[2 * i + 1]));
-        const __half2 value2 = __hmul2(code2, s2);
+        const __half2 value2 = __hmul2(__hmul2(code2, s2), guard);
         packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
@@ -66,12 +67,13 @@ __device__ __forceinline__ int4 causal_prompt_i8_dequant_f16x8(const std::int8_t
 }
 
 template <typename Geometry, typename Metadata>
-__global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
+__global__ __maxnreg__(128) void causal_attention_prompt_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width) {
+    float* __restrict__ partial_acc, float* __restrict__ partial_m,
+    float* __restrict__ partial_l, std::int32_t split_count, std::int32_t width) {
     constexpr int D             = kCausalPromptHeadDim;
     constexpr int Br            = kCausalPromptI8Br;
     constexpr int Bc            = kCausalPromptI8Bc;
@@ -109,6 +111,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
+    const int split   = static_cast<int>(blockIdx.z);
     const int tid     = static_cast<int>(threadIdx.x);
     const int warp    = tid >> 5;
     const int lane    = tid & 31;
@@ -117,8 +120,18 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
     const int tokens  = metadata.valid_tokens(width);
     if (q_head >= Geometry::QHeads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        causal_prompt_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                                 kCausalPromptI8Threads);
+        if (split_count > 1) {
+            // Dead rows carry neutral merge state (m = -inf) so the reducer emits zeros.
+            for (int row = q0 + tid; row < min(q0 + Br, width); row += kCausalPromptI8Threads) {
+                partial_m[causal_prompt_partial_stat_index<Geometry>(q_head, row, split, width)] =
+                    -CUDART_INF_F;
+                partial_l[causal_prompt_partial_stat_index<Geometry>(q_head, row, split, width)] =
+                    0.0f;
+            }
+        } else {
+            causal_prompt_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
+                                                     kCausalPromptI8Threads);
+        }
         return;
     }
     const int base_pos              = positions[0];
@@ -127,6 +140,13 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
     const int key_blocks    = max_query_abs / Bc + 1;
+
+    // Key-range split (the fork's WI-K1a): grid.z partitions the tile range into contiguous
+    // segments; each segment runs the full online-softmax pipeline over its keys and stores
+    // unnormalized (acc, m, l) partials for causal_attention_prompt_reduce_kernel.
+    const int tiles_per = (key_blocks + split_count - 1) / split_count;
+    const int kb_begin  = split * tiles_per;
+    const int kb_end    = min(kb_begin + tiles_per, key_blocks);
 
     // Quantize Q cooperatively. One full warp rotates and encodes one D256 row at a time.
     for (int row = warp; row < Br; row += kCausalPromptI8Warps) {
@@ -196,9 +216,11 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
         ninfer::ops::cp_commit();
     };
 
-    issue_kv_tile(0);
-    ninfer::ops::cp_wait<0>();
-    __syncthreads();
+    if (kb_begin < kb_end) {
+        issue_kv_tile(kb_begin * Bc);
+        ninfer::ops::cp_wait<0>();
+        __syncthreads();
+    }
 
     const int gid      = lane >> 2;
     const int lid      = lane & 3;
@@ -236,7 +258,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
     float running_l0     = 0.0f;
     float running_l1     = 0.0f;
     const float scale_l2 = scale * Log2E;
-    for (int kb = 0; kb < key_blocks; ++kb) {
+    for (int kb = kb_begin; kb < kb_end; ++kb) {
         const int k0 = kb * Bc;
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
@@ -393,7 +415,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
         }
         __syncthreads();
 
-        const bool has_next = kb + 1 < key_blocks;
+        const bool has_next = kb + 1 < kb_end;
         if (has_next) { issue_kv_tile((kb + 1) * Bc); }
 
         const int row_tile = warp % kCausalPromptI8RowTiles;
@@ -409,6 +431,17 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
             acc[n][3] *= alpha1;
         }
 
+        // PV runs on the f16-accumulate MMA (2x the f32-accumulate issue rate on
+        // GeForce): each 64-key tile accumulates into f16 fragments and promotes once into
+        // the f32 running sum. The staged V carries the 2^-6 dequant guard, so a tile partial
+        // stays within max|v| of the fp16 range however peaked the tile's p mass is; the
+        // promotion scales the exact 64 back in the same FFMA that adds into the running sum.
+        unsigned hacc[PVNtPerWarp][2];
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            hacc[n][0] = 0u;
+            hacc[n][1] = 0u;
+        }
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
             unsigned pf[4];
@@ -424,9 +457,19 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + causal_prompt_swz(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                        vf[0], vf[1]);
+                mma_f16_f16acc(hacc[n][0], hacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
+        }
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const float2 h0 =
+                __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][0]));
+            const float2 h1 =
+                __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][1]));
+            acc[n][0] = fmaf(64.0f, h0.x, acc[n][0]);
+            acc[n][1] = fmaf(64.0f, h0.y, acc[n][1]);
+            acc[n][2] = fmaf(64.0f, h1.x, acc[n][2]);
+            acc[n][3] = fmaf(64.0f, h1.y, acc[n][3]);
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
@@ -439,6 +482,63 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
         final_l_s[row1] = running_l1;
     }
     __syncthreads();
+
+    if (split_count > 1) {
+        // Split mode: producer warps own each row's (m, l). Rows past tile_rows are dead for
+        // this block and MUST still write their own slot (rows in [tokens, width) would
+        // otherwise leave garbage for the reducer) — but never rows past width: an unclamped
+        // row aliases a different (token, split) slot and races its real writer. Dead rows and
+        // causally-empty segments carry m = -inf / l = 0, which the reducer maps to zero rows.
+        if (warp < ProducerWarps && lid == 0) {
+            const int row0       = warp * 16 + gid;
+            const int row1       = row0 + 8;
+            const bool row0_live = row0 < tile_rows;
+            const bool row1_live = row1 < tile_rows;
+            if (q0 + row0 < width) {
+                partial_m[causal_prompt_partial_stat_index<Geometry>(q_head, q0 + row0, split,
+                                                                     width)] =
+                    row0_live ? running_m0 : -CUDART_INF_F;
+                partial_l[causal_prompt_partial_stat_index<Geometry>(q_head, q0 + row0, split,
+                                                                     width)] =
+                    row0_live ? running_l0 : 0.0f;
+            }
+            if (q0 + row1 < width) {
+                partial_m[causal_prompt_partial_stat_index<Geometry>(q_head, q0 + row1, split,
+                                                                     width)] =
+                    row1_live ? running_m1 : -CUDART_INF_F;
+                partial_l[causal_prompt_partial_stat_index<Geometry>(q_head, q0 + row1, split,
+                                                                     width)] =
+                    row1_live ? running_l1 : 0.0f;
+            }
+        }
+        const int row_tile = warp % kCausalPromptI8RowTiles;
+        const int d_slice  = warp / kCausalPromptI8RowTiles;
+        const int row_base = row_tile * 16;
+        const int row0     = row_base + gid;
+        const int row1     = row0 + 8;
+        // Store the partial ALREADY normalized by its own l (0 when l == 0): fp32 rounding then
+        // lands on O(1) values exactly like the single-pass output path, and the reducer
+        // re-weights by l*exp2((m - m*)*scale*log2e), which is algebraically the plain merge.
+        const float inv_l0 = final_l_s[row0] > 0.0f ? __frcp_rn(final_l_s[row0]) : 0.0f;
+        const float inv_l1 = final_l_s[row1] > 0.0f ? __frcp_rn(final_l_s[row1]) : 0.0f;
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const int d0 = (d_slice * PVNtPerWarp + n) * 8 + 2 * lid;
+            if (row0 < tile_rows) {
+                float2* slot = reinterpret_cast<float2*>(
+                    &partial_acc[causal_prompt_partial_acc_index<Geometry>(q_head, d0, q0 + row0,
+                                                                           split, width)]);
+                *slot        = make_float2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+            }
+            if (row1 < tile_rows) {
+                float2* slot = reinterpret_cast<float2*>(
+                    &partial_acc[causal_prompt_partial_acc_index<Geometry>(q_head, d0, q0 + row1,
+                                                                           split, width)]);
+                *slot        = make_float2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+            }
+        }
+        return;
+    }
 
     const int row_tile = warp % kCausalPromptI8RowTiles;
     const int d_slice  = warp / kCausalPromptI8RowTiles;
