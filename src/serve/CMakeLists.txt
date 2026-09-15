@@ -20,8 +20,12 @@ add_library(ninfer_serve STATIC
   http_server.cpp
   openai_responses_http.cpp
   serve_options.cpp
+  webui_update.cpp
 )
 ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve
   PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
   PRIVATE ninfer_media_acquire ninfer_product_logging CUDA::cudart)
+if(WIN32)
+  target_link_libraries(ninfer_serve PRIVATE winhttp)
+endif()
