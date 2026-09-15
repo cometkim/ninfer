@@ -65,6 +65,14 @@ std::int32_t device_split_bound(std::int32_t multiprocessor_count, std::int32_t 
     return std::max<std::int32_t>(1, 2 * multiprocessor_count / kv_heads);
 }
 
+// W=1 above 1024 visible keys runs the narrow tile (four CTAs per SM), whose device split
+// policy (causal_hq_narrow_active_splits) doubles the grid up to the 256-split reducer limit.
+std::int32_t narrow_decode_capacity(std::int32_t capacity, std::int32_t tokens,
+                                    CausalAttentionExecutionEnvelope envelope) {
+    if (tokens == 1 && envelope.max_visible_keys > 1024) { return std::min(256, 2 * capacity); }
+    return capacity;
+}
+
 } // namespace
 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
@@ -91,11 +99,13 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                 div_up(static_cast<std::int32_t>(envelope.max_visible_keys), 3968);
             return std::min(capacity, std::max({4, grid_limit, page_limit}));
         }
-        return capacity;
+        return narrow_decode_capacity(capacity, tokens, envelope);
     }
     if (q_heads == CausalD256H16Kv2::QHeads) {
-        return std::min(launch_capacity<CausalD256H16Kv2>(envelope),
-                        device_split_bound(multiprocessor_count, CausalD256H16Kv2::KVHeads));
+        const std::int32_t capacity =
+            std::min(launch_capacity<CausalD256H16Kv2>(envelope),
+                     device_split_bound(multiprocessor_count, CausalD256H16Kv2::KVHeads));
+        return narrow_decode_capacity(capacity, tokens, envelope);
     }
     throw std::invalid_argument("hq-e8-2b attention split capacity: unsupported head geometry");
 }
@@ -136,9 +146,10 @@ std::size_t hq_kv_workspace_bytes(int heads, int batch, int min_width, int max_w
     }
     if (max_width > hq::kMaximumSmallTWidth) {
         (void)make_hq_kv_causal_plan(heads, max_width, batch, envelope, multiprocessor_count);
+        // The band carry grows with the query width, so the widest prompt call bounds it.
         WorkspaceLayoutBuilder layout;
-        (void)hq::allocate_prompt_scratch(layout, heads == 24 ? 4 : 2,
-                                          static_cast<std::int32_t>(envelope.max_visible_keys));
+        (void)hq::allocate_prompt_scratch(layout, heads == 24 ? 4 : 2, heads, max_width,
+                                          envelope.max_visible_keys);
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
     return maximum;

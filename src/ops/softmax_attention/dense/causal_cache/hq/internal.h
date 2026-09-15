@@ -45,15 +45,23 @@ void causal_attention_cached_small_t_hq_launch(
     CausalAttentionExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m,
     Tensor& partial_l, Tensor& out, std::int32_t multiprocessor_count, cudaStream_t stream);
 
+// Prompt route over a banded rotated-frame scratch: scratch_k/v hold one band of
+// min(visible_keys, kCausalHqPromptScratchBandKeys) keys; with more than one band the carry
+// tensors hold the online-softmax state (BF16 acc, FP32 m/l per query row) between bands.
 void causal_attention_prompt_hq_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                        const Tensor& positions, const Tensor& valid_columns,
                                        const Tensor& table_rows, float scale,
                                        PagedKVBatchLayerView cache, const Tensor& scratch_k,
-                                       const Tensor& scratch_v, Tensor& out, cudaStream_t stream);
+                                       const Tensor& scratch_v, const Tensor& carry_acc,
+                                       const Tensor& carry_m, const Tensor& carry_l,
+                                       std::uint32_t visible_keys, Tensor& out,
+                                       cudaStream_t stream);
 
 void causal_attention_prompt_hq_attention_launch(const Tensor& q, const Tensor& positions,
                                                  float scale, const PagedKVLayerView& cache,
                                                  const Tensor& scratch_k, const Tensor& scratch_v,
+                                                 const Tensor& carry_acc, const Tensor& carry_m,
+                                                 const Tensor& carry_l, std::uint32_t visible_keys,
                                                  Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail::hq

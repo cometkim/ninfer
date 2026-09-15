@@ -44,16 +44,18 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
     }
 }
 
-void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
+void text_rope(const Tensor& positions, const RopeConfig& config,
+               const ops::RopeFrequencies& frequencies, Tensor& x, ops::RopeSide side,
                DeviceExecutionView execution) {
     require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, execution);
+    ops::rope(positions, dimension(config.rotary_dim), frequencies, x, side, execution);
 }
 
-void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
+void text_rope(const Tensor& positions, const RopeConfig& config,
+               const ops::RopeFrequencies& frequencies, Tensor& query, Tensor& key,
                DeviceExecutionView execution) {
     require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, key, execution);
+    ops::rope(positions, dimension(config.rotary_dim), frequencies, query, key, execution);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

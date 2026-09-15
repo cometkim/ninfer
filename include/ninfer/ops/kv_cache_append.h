@@ -55,12 +55,20 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * HQ-E8-Rice-2B stores both K and V as 64 U8 code bytes and 8 U8 metadata bytes per D256 row.
  * The fixed transform is R=H256*diag(signs)/16 with signs from seed 0x5EED01 (the codec's
  * engine-global hash). Normalize R*x by ||x||/16 and quantize 8-D words to the nearest point
- * of 2*E8 at alpha=1.45f. Strip the shared coset/parity and Rice-code the signed coordinates.
- * Halve alpha until the row fits 512 bits, at most twice, then use the zero-lattice fallback.
- * Metadata stores the FP16_RNE norm, Rice k, escalation, used-bit count and segment offsets;
- * unused code words are zero. A represented rotated coordinate is the signed lattice code
- * times the exact stored norm times 2^escalation/(alpha*16). The codec header defines the
- * exact word packing and metadata fields. No dither or residual window is part of this profile.
+ * of 2*E8 at alpha=1.45f after subtracting the row's hash-derived half-cell dither in
+ * [-0.5, 0.5)^8 per (kv_head, position, role, word); the decoders add the dither back, making
+ * the reconstruction error zero-mean across rows. Strip the shared coset/parity and Rice-code
+ * the signed coordinates. Halve alpha until the row fits 512 bits, at most twice, then use the
+ * zero-lattice fallback. Metadata stores the FP16_RNE norm, Rice k, escalation, used-bit count
+ * and segment offsets; unused code words are zero. A represented rotated coordinate is the
+ * signed lattice code plus its dither, times the exact stored norm times 2^escalation/(alpha*16).
+ * The codec header defines the exact word packing and metadata fields.
+ *
+ * The hq profile additionally maintains a residual window: when the cache views carry non-empty
+ * residual/side-word planes, append also stores the row EXACTLY (rotated bf16, one rounding) into
+ * per-slot side planes for the first kCausalHqSinkKeys and the last kCausalHqRecentKeys positions
+ * and marks the slot's validity bit; consumers of such views read those keys from the side planes.
+ * Views with empty residual tensors leave the codec-only behavior.
  *
  * INT8 and FP8 apply the fixed normalized D256 Hadamard preparation to K; NVFP4 and K8V4 apply it
  * to both K and V. HQ applies its signed transform to both K and V. Every transform is evaluated

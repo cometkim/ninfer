@@ -39,6 +39,23 @@ constexpr int kVisionHeadDim       = 72;
 constexpr int kVisionHeads         = 16;
 constexpr float kVisionTheta       = 10'000.0F;
 
+const ops::RopeFrequencies& text_frequencies() {
+    static const ops::RopeFrequencies value =
+        ops::rope_linear_frequencies(kTextTheta, kTextRotaryDim);
+    return value;
+}
+
+const ops::RopeFrequencies& dflash_frequencies() {
+    static const ops::RopeFrequencies value =
+        ops::rope_linear_frequencies(kTextTheta, kDflashRotaryDim);
+    return value;
+}
+
+const ops::RopeFrequencies& vision_frequencies() {
+    static const ops::RopeFrequencies value = ops::rope_vision_frequencies(kVisionTheta);
+    return value;
+}
+
 std::vector<int> parse_csv(const char* value) {
     std::vector<int> values;
     const std::string text(value);
@@ -131,8 +148,9 @@ __device__ __forceinline__ void copy_bf16x8(__nv_bfloat16* data, std::int64_t in
 
 template <ops::RopeKernelMode Mode, int HeadDim, int RotaryDim, int QHeads, int KHeads>
 __global__ void
-rope_payload_control_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
-                            int tokens, std::int64_t q_token_stride, std::int64_t k_token_stride) {
+rope_payload_control_kernel(const std::int32_t* positions, ops::RopeFrequencies frequencies,
+                            __nv_bfloat16* q, __nv_bfloat16* k, int tokens,
+                            std::int64_t q_token_stride, std::int64_t k_token_stride) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     constexpr int half = RotaryDim / 2;
@@ -141,7 +159,7 @@ rope_payload_control_kernel(const std::int32_t* positions, __nv_bfloat16* q, __n
     if (threadIdx.x < half) {
         const int pair = static_cast<int>(threadIdx.x);
         float sine, cosine;
-        ops::fixed_sincos<Mode>(positions, tokens, token, pair, &sine, &cosine);
+        ops::fixed_sincos<Mode>(positions, tokens, token, pair, frequencies, &sine, &cosine);
         cos_cache[pair] = cosine;
         sin_cache[pair] = sine;
     }
@@ -170,8 +188,9 @@ rope_payload_control_kernel(const std::int32_t* positions, __nv_bfloat16* q, __n
 
 template <ops::RopeKernelMode Mode, int HeadDim, int RotaryDim, int QHeads, int KHeads,
           int HeadsPerBlock>
-__global__ void rope_split_payload_control_kernel(const std::int32_t* positions, __nv_bfloat16* q,
-                                                  __nv_bfloat16* k, int tokens,
+__global__ void rope_split_payload_control_kernel(const std::int32_t* positions,
+                                                  ops::RopeFrequencies frequencies,
+                                                  __nv_bfloat16* q, __nv_bfloat16* k, int tokens,
                                                   std::int64_t q_token_stride,
                                                   std::int64_t k_token_stride) {
     constexpr int kHalf       = RotaryDim / 2;
@@ -184,7 +203,7 @@ __global__ void rope_split_payload_control_kernel(const std::int32_t* positions,
     if (threadIdx.x < kHalf) {
         const int pair = static_cast<int>(threadIdx.x);
         float sine, cosine;
-        ops::fixed_sincos<Mode>(positions, tokens, token, pair, &sine, &cosine);
+        ops::fixed_sincos<Mode>(positions, tokens, token, pair, frequencies, &sine, &cosine);
         cos_cache[pair] = cosine;
         sin_cache[pair] = sine;
     }
@@ -236,18 +255,20 @@ void launch_text_control(const Tensor& positions, Tensor& q, Tensor& k,
     const auto stream = execution.stream;
     if (positions.ne[1] == 1) {
         rope_payload_control_kernel<ops::RopeKernelMode::Text1D, kTextHeadDim, kTextRotaryDim,
-                                    QHeads, KHeads><<<tokens, block, 0, stream>>>(
-            static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
-            static_cast<__nv_bfloat16*>(k.data), tokens,
-            q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
-            k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
+                                    QHeads, KHeads>
+            <<<tokens, block, 0, stream>>>(
+                static_cast<const std::int32_t*>(positions.data), text_frequencies(),
+                static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data), tokens,
+                q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+                k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
     } else {
         rope_payload_control_kernel<ops::RopeKernelMode::TextMrope, kTextHeadDim, kTextRotaryDim,
-                                    QHeads, KHeads><<<tokens, block, 0, stream>>>(
-            static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
-            static_cast<__nv_bfloat16*>(k.data), tokens,
-            q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
-            k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
+                                    QHeads, KHeads>
+            <<<tokens, block, 0, stream>>>(
+                static_cast<const std::int32_t*>(positions.data), text_frequencies(),
+                static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data), tokens,
+                q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+                k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -257,8 +278,8 @@ void launch_text_candidate_mode(const Tensor& positions, Tensor& q, Tensor& k, i
                                 cudaStream_t stream) {
     const int tokens = q.ne[2];
     ops::rope_fixed_kernel<Mode, QHeads, KHeads><<<tokens, block, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
-        static_cast<__nv_bfloat16*>(k.data), tokens,
+        static_cast<const std::int32_t*>(positions.data), text_frequencies(),
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data), tokens,
         q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
         k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaGetLastError());
@@ -281,8 +302,8 @@ void launch_dflash_fixed_control(const Tensor& positions, Tensor& q, Tensor& k, 
     const int tokens = q.ne[2];
     rope_payload_control_kernel<ops::RopeKernelMode::DflashText1D, kDflashHeadDim, kDflashRotaryDim,
                                 kDflashQHeads, kDflashKHeads><<<tokens, block, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
-        static_cast<__nv_bfloat16*>(k.data), tokens,
+        static_cast<const std::int32_t*>(positions.data), dflash_frequencies(),
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data), tokens,
         q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
         k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaGetLastError());
@@ -296,8 +317,8 @@ void launch_dflash_split_control(const Tensor& positions, Tensor& q, Tensor& k,
     rope_split_payload_control_kernel<ops::RopeKernelMode::DflashText1D, kDflashHeadDim,
                                       kDflashRotaryDim, kDflashQHeads, kDflashKHeads, HeadsPerBlock>
         <<<q.ne[2] * kGroups, kBlock, 0, stream>>>(
-            static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
-            static_cast<__nv_bfloat16*>(k.data), q.ne[2],
+            static_cast<const std::int32_t*>(positions.data), dflash_frequencies(),
+            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data), q.ne[2],
             q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
             k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaGetLastError());
@@ -332,8 +353,8 @@ void launch_dflash_split_candidate(const Tensor& positions, Tensor& q, Tensor& k
     constexpr int kBlock  = HeadsPerBlock <= 2 ? 64 : HeadsPerBlock * 32;
     ops::rope_fixed_split_kernel<ops::RopeKernelMode::DflashText1D, kDflashQHeads, kDflashKHeads,
                                  HeadsPerBlock><<<q.ne[2] * kGroups, kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
-        static_cast<__nv_bfloat16*>(k.data), q.ne[2],
+        static_cast<const std::int32_t*>(positions.data), dflash_frequencies(),
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data), q.ne[2],
         q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
         k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaGetLastError());
@@ -378,6 +399,9 @@ void run_text_single(DeviceExecutionView execution, int tokens, int axes, bool c
     const auto restore = [&](cudaStream_t stream) { initial_x.restore(stream); };
     Tensor tpos(positions.p, DType::I32, {tokens, axes});
     Tensor tx(x.p, DType::BF16, {kTextHeadDim, Heads, tokens});
+    const ops::RopeFrequencies& frequencies = text_frequencies();
+    const ops::RopeSide side =
+        role == std::string_view("q") ? ops::RopeSide::Query : ops::RopeSide::Key;
     const double bytes =
         2.0 * static_cast<double>(Heads * kTextRotaryDim) * tokens * sizeof(__nv_bfloat16);
     const Result result = bench_loop_prepared(
@@ -386,7 +410,7 @@ void run_text_single(DeviceExecutionView execution, int tokens, int axes, bool c
             if (control) {
                 launch_text_control<Heads, 0>(tpos, tx, tx, execution.on_stream(stream));
             } else {
-                ops::rope(tpos, kTextRotaryDim, kTextTheta, tx, execution.on_stream(stream));
+                ops::rope(tpos, kTextRotaryDim, frequencies, tx, side, execution.on_stream(stream));
             }
         },
         bytes);
@@ -402,8 +426,8 @@ void launch_vision_control(const Tensor& positions, Tensor& q, Tensor& k, cudaSt
     constexpr int block = 128;
     rope_payload_control_kernel<ops::RopeKernelMode::Vision2D, kVisionHeadDim, kVisionHeadDim,
                                 kVisionHeads, kVisionHeads><<<q.ne[2], block, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
-        static_cast<__nv_bfloat16*>(k.data), q.ne[2],
+        static_cast<const std::int32_t*>(positions.data), vision_frequencies(),
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data), q.ne[2],
         q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
         k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
     CUDA_CHECK(cudaGetLastError());
@@ -436,7 +460,8 @@ void run_text(DeviceExecutionView execution, int tokens, int axes, bool control,
             } else if (candidate_block != 0) {
                 launch_text_candidate<QHeads, KHeads>(tpos, tq, tk, candidate_block, stream);
             } else {
-                ops::rope(tpos, kTextRotaryDim, kTextTheta, tq, tk, execution.on_stream(stream));
+                ops::rope(tpos, kTextRotaryDim, text_frequencies(), tq, tk,
+                          execution.on_stream(stream));
             }
         },
         bytes);
@@ -481,7 +506,8 @@ void run_dflash(DeviceExecutionView execution, int tokens, bool control, int can
         } else if (candidate_block != 0) {
             launch_dflash_candidate(tpos, tq, tk, block, stream);
         } else {
-            ops::rope(tpos, kDflashRotaryDim, kTextTheta, tq, tk, execution.on_stream(stream));
+            ops::rope(tpos, kDflashRotaryDim, dflash_frequencies(), tq, tk,
+                      execution.on_stream(stream));
         }
     };
     if (profile) {
@@ -528,12 +554,13 @@ void run_dflash_single_k(DeviceExecutionView execution, int tokens, bool control
                 rope_payload_control_kernel<ops::RopeKernelMode::DflashText1D, kDflashHeadDim,
                                             kDflashRotaryDim, kDflashKHeads, 0>
                     <<<tokens, block, 0, stream>>>(
-                        static_cast<const std::int32_t*>(tpos.data),
+                        static_cast<const std::int32_t*>(tpos.data), dflash_frequencies(),
                         static_cast<__nv_bfloat16*>(tx.data), nullptr, tokens,
                         tx.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)), 0);
                 CUDA_CHECK(cudaGetLastError());
             } else {
-                ops::rope(tpos, kDflashRotaryDim, kTextTheta, tx, execution.on_stream(stream));
+                ops::rope(tpos, kDflashRotaryDim, dflash_frequencies(), tx, ops::RopeSide::Key,
+                          execution.on_stream(stream));
             }
         },
         bytes);
@@ -563,7 +590,8 @@ void run_vision(DeviceExecutionView execution, int patches, bool control) {
             if (control) {
                 launch_vision_control(tpos, tq, tk, stream);
             } else {
-                ops::rope(tpos, kVisionHeadDim, kVisionTheta, tq, tk, execution.on_stream(stream));
+                ops::rope(tpos, kVisionHeadDim, vision_frequencies(), tq, tk,
+                          execution.on_stream(stream));
             }
         },
         bytes);

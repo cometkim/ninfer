@@ -743,9 +743,25 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         options.max_context > parameters.model.config().draft->max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the selected draft position capacity");
     }
-    if (options.max_context == 0 ||
-        options.max_context > parameters.model.config().text.max_position_embeddings) {
-        throw std::invalid_argument("max_context exceeds the configured position capacity");
+    if (options.max_context == 0) { throw std::invalid_argument("max_context must be nonzero"); }
+    const std::uint32_t native_positions = parameters.model.config().text.max_position_embeddings;
+    // The execution envelope ceiling is reachable only with the U8 (hq-e8-2b) cache: the hq
+    // decode kernel computes row addresses from the global block table and the prompt route
+    // materializes linear scratch, so neither stages fixed-size page tables.
+    constexpr std::uint32_t kMaximumExecutionEnvelope = 1048576;
+    if (options.max_context > kMaximumExecutionEnvelope) {
+        throw std::invalid_argument("max_context exceeds the execution envelope ceiling");
+    }
+    if (options.rope_scaling_factor > 1.0F) {
+        if (options.max_context > native_positions &&
+            static_cast<std::uint64_t>(native_positions) *
+                    static_cast<std::uint64_t>(options.rope_scaling_factor) <
+                options.max_context) {
+            throw std::invalid_argument("max_context exceeds the YaRN-scaled position capacity");
+        }
+    } else if (options.max_context > native_positions) {
+        throw std::invalid_argument(
+            "max_context exceeds the checkpoint's trained positions without rope scaling");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
@@ -822,20 +838,24 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_capacity          = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
         "resolved Paged KV capacity exceeds int32"));
-    impl->max_concurrency      = inputs.max_concurrency;
-    impl->prefill_chunk        = inputs.prefill_chunk;
-    impl->draft_window         = inputs.draft_window;
-    impl->speculative_backend  = inputs.speculative_backend;
-    impl->proposal_head        = inputs.proposal_head;
-    impl->features             = inputs.features;
-    impl->use_cuda_graph       = inputs.use_cuda_graph;
-    impl->causal_scoring       = inputs.causal_scoring;
-    impl->device               = inputs.device;
-    impl->multiprocessor_count = inputs.multiprocessor_count;
-    impl->context_cache        = inputs.context_cache;
-    impl->kv_storage           = inputs.kv_storage;
-    impl->persistent           = persistent_layout(*impl);
-    impl->workspace            = build_workspace_plan(*impl);
+    impl->max_concurrency          = inputs.max_concurrency;
+    impl->prefill_chunk            = inputs.prefill_chunk;
+    impl->draft_window             = inputs.draft_window;
+    impl->speculative_backend      = inputs.speculative_backend;
+    impl->proposal_head            = inputs.proposal_head;
+    impl->features                 = inputs.features;
+    impl->use_cuda_graph           = inputs.use_cuda_graph;
+    impl->causal_scoring           = inputs.causal_scoring;
+    impl->device                   = inputs.device;
+    impl->multiprocessor_count     = inputs.multiprocessor_count;
+    impl->context_cache            = inputs.context_cache;
+    impl->kv_storage               = inputs.kv_storage;
+    impl->rope_scaling_factor      = inputs.rope_scaling_factor;
+    impl->rope_scaling_temperature = inputs.rope_scaling_temperature;
+    impl->rope_scaling_beta_fast   = inputs.rope_scaling_beta_fast;
+    impl->rope_scaling_beta_slow   = inputs.rope_scaling_beta_slow;
+    impl->persistent               = persistent_layout(*impl);
+    impl->workspace                = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
@@ -886,20 +906,24 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
     SequencePlanningInputs inputs{
-        .parameters           = &parameters,
-        .capacity             = options.max_context,
-        .max_concurrency      = options.max_concurrency,
-        .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
-        .draft_window         = options.speculative.draft_tokens,
-        .speculative_backend  = options.speculative.backend,
-        .kv_storage           = options.kv_cache,
-        .proposal_head        = options.speculative.proposal_head,
-        .features             = models::load_options(options),
-        .use_cuda_graph       = options.use_cuda_graph,
-        .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
-        .device               = options.device,
-        .multiprocessor_count = device.multiprocessor_count(),
-        .context_cache        = options.context_cache,
+        .parameters               = &parameters,
+        .capacity                 = options.max_context,
+        .max_concurrency          = options.max_concurrency,
+        .prefill_chunk            = std::min(options.prefill_chunk, options.max_context),
+        .draft_window             = options.speculative.draft_tokens,
+        .speculative_backend      = options.speculative.backend,
+        .kv_storage               = options.kv_cache,
+        .rope_scaling_factor      = options.rope_scaling_factor,
+        .rope_scaling_temperature = options.rope_scaling_temperature,
+        .rope_scaling_beta_fast   = options.rope_scaling_beta_fast,
+        .rope_scaling_beta_slow   = options.rope_scaling_beta_slow,
+        .proposal_head            = options.speculative.proposal_head,
+        .features                 = models::load_options(options),
+        .use_cuda_graph           = options.use_cuda_graph,
+        .causal_scoring           = options.purpose == EnginePurpose::CausalScoring,
+        .device                   = options.device,
+        .multiprocessor_count     = device.multiprocessor_count(),
+        .context_cache            = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
