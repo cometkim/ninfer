@@ -308,4 +308,5 @@ under `third_party/`.
 | [`feat/qwen3.8-nvfp4full`](model-cards/Qwen3.8-27B-nvfp4full-NInfer/README.md) | `feat/qwen3.8-profile-base` | Full mixed-source NVFP4 recipe, explicit calibration prerequisite and reproduction commands. | — |
 | [`feat/qwen3.8-nvfp4qat`](model-cards/Qwen3.8-27B-nvfp4qat-NInfer/README.md) | `feat/qwen3.8-profile-base` | Independent QAT packed-weight import recipe, BF16 control decode and reproduction commands. | — |
 | [`feat/kernel-perf`](docs/features/kernel-perf.md) | `feat/dflash2` | Runtime QK/RoPE and attention-gate fusion, PDL/GDN launch chains, Small-T cache routes and INT8 prompt split reduction. | `squash(feat/kernel-perf)` |
+| [`feat/build-speed-integration`](docs/features/build-speed-integration.md) | `feat/kernel-perf` | Cumulative compilation splits preserving INT8 split reduction and including HQ carry/residual geometry routes. | `squash(feat/build-speed-integration)` |
 <!-- ninfer:features:end -->
