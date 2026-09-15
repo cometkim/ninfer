@@ -93,7 +93,14 @@ std::size_t positional_read(HANDLE file, std::uint64_t offset, std::span<std::by
     DWORD read           = 0;
     if (!::ReadFile(file, destination.data(), static_cast<DWORD>(destination.size()), &read,
                     &operation)) {
-        fail(path, "ReadFile", ::GetLastError());
+        const auto error = ::GetLastError();
+        if (error == ERROR_HANDLE_EOF) { return 0; }
+        // An overlapped-opened handle reports asynchronous completion as ERROR_IO_PENDING even
+        // for a synchronous caller; the wait completes it into `read`.
+        if (error != ERROR_IO_PENDING ||
+            !::GetOverlappedResult(file, &operation, &read, TRUE)) {
+            fail(path, "ReadFile", error == ERROR_IO_PENDING ? ::GetLastError() : error);
+        }
     }
     return read;
 }
