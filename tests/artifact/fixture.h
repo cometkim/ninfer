@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -15,6 +16,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace ninfer::test::artifact_fixture {
 
@@ -46,13 +53,27 @@ struct Fixture {
     std::vector<std::byte> payload;
 
     Fixture() : payload(1344) {
-        auto pattern = (std::filesystem::temp_directory_path() / "ninfer-artifact-XXXXXX").string();
+#ifdef _WIN32
+        // MSVC's CRT has no mkdtemp; a per-process unique directory under %TEMP%
+        // serves the same isolation purpose for these single-process fixtures.
+        directory = std::filesystem::temp_directory_path() /
+                    ("ninfer-artifact-" +
+                     std::to_string(static_cast<long long>(::_getpid())) + "-" +
+                     std::to_string(std::chrono::steady_clock::now()
+                                        .time_since_epoch()
+                                        .count()));
+        std::filesystem::create_directories(directory);
+        const auto entry_path = directory / "model.ninfer";
+        entry                 = entry_path;
+#else
+        auto pattern          = (std::filesystem::temp_directory_path() / "ninfer-artifact-XXXXXX").string();
         std::vector<char> buffer(pattern.begin(), pattern.end());
         buffer.push_back('\0');
         const char* path = ::mkdtemp(buffer.data());
         if (!path) { throw std::runtime_error("cannot create fixture directory"); }
-        directory = path;
-        entry     = directory / "model.ninfer";
+        directory        = path;
+        entry            = directory / "model.ninfer";
+#endif
         root      = {
             {"components",
                   {{"text", {{"config", Json::object()}, {"resources", {{"tokenizer.json", "asset"}}}}},
