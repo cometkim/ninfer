@@ -185,7 +185,9 @@ std::string make_models_list(const std::string& model_id, std::int64_t created,
                                                      {"object", "model"},
                                                      {"created", created},
                                                      {"owned_by", "ninfer"},
-                                                     {"max_model_len", max_model_len}}})}};
+                                                     {"max_model_len", max_model_len},
+                                                     {"status", Json{{"value", "loaded"}}},
+                                                     {"meta", Json{{"n_ctx", max_model_len}}}}})}};
     return payload.dump();
 }
 
@@ -196,7 +198,9 @@ std::string make_model_object(const std::string& model_id, std::int64_t created,
                           {"object", "model"},
                           {"created", created},
                           {"owned_by", "ninfer"},
-                          {"max_model_len", max_model_len}};
+                          {"max_model_len", max_model_len},
+                          {"status", Json{{"value", "loaded"}}},
+                          {"meta", Json{{"n_ctx", max_model_len}}}};
     return payload.dump();
 }
 
