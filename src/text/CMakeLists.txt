@@ -3,6 +3,7 @@ add_library(ninfer_text STATIC
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c
 )
 ninfer_internal_includes(ninfer_text)
+target_compile_definitions(ninfer_text PUBLIC UTF8PROC_STATIC)
 target_include_directories(ninfer_text PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
 
 # Language evaluation reuses the engine's Unicode and JSON dependencies.
