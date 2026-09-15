@@ -1,3 +1,4 @@
+#include <cstring>
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
 #include "core/device.h"
@@ -62,9 +63,42 @@ static_assert((kGateRows % TmaM256N128::kBlockN) == 0);
 // nothing when the compute stream is cudaStreamNonBlocking, and the pool can recycle the
 // block while the GEMM's TMA unit is still reading the tensor map (a half-overwritten map
 // deadlocks the kernel's mbarrier transaction wait - the 786432 prefill live-lock).
+
+// Graph-capture-safe descriptor staging. A cudaMemcpyAsync from the launcher's stack cannot
+// serve a captured launch: the graph bakes the host pointer and replays read a dead frame, and
+// cudaMallocHost is itself illegal under capture. This one-thread kernel carries the descriptor
+// block in its BY-VALUE parameter - sixteen-byte-aligned uint4 words, because the struct's
+// 128-byte alignment cannot cross an MSVC kernel-parameter boundary (C2719) - and stores it to
+// the stream-ordered device block. Kernel parameters are snapshotted into the graph node, so
+// every replay re-stores the exact descriptors the capture saw.
+struct Nvfp4TmaDescriptorWords {
+    uint4 words[32];
+};
+
+__global__ void nvfp4_store_tma_descriptors(Nvfp4W4a4TmaDescriptors* __restrict__ destination,
+                                            const __grid_constant__ Nvfp4TmaDescriptorWords payload) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) { return; }
+    *reinterpret_cast<Nvfp4W4a4TmaDescriptors*>(destination) =
+        *reinterpret_cast<const Nvfp4W4a4TmaDescriptors*>(&payload.words[0]);
+}
+
+__host__ __device__ inline void nvfp4_launch_tma_store_descriptors(
+    Nvfp4W4a4TmaDescriptors* destination, const Nvfp4W4a4TmaDescriptors& descriptors,
+    cudaStream_t stream) {
+#ifdef __CUDA_ARCH__
+    (void)destination;
+    (void)descriptors;
+    (void)stream;
+#else
+    Nvfp4TmaDescriptorWords payload;
+    std::memcpy(payload.words, &descriptors, sizeof(payload.words));
+    nvfp4_store_tma_descriptors<<<1, 1, 0, stream>>>(destination, payload);
+#endif
+}
+
 struct Nvfp4TmaDescriptorBlock {
     Nvfp4W4a4TmaDescriptors* device = nullptr;
-    cudaStream_t stream             = nullptr;
+    cudaStream_t stream = nullptr;
 
     explicit Nvfp4TmaDescriptorBlock(cudaStream_t allocation_stream) : stream(allocation_stream) {
         CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&device),
@@ -75,8 +109,7 @@ struct Nvfp4TmaDescriptorBlock {
     Nvfp4TmaDescriptorBlock& operator=(const Nvfp4TmaDescriptorBlock&) = delete;
 
     ~Nvfp4TmaDescriptorBlock() {
-        if (device == nullptr) { return; }
-        CUDA_CHECK(cudaFreeAsync(device, stream));
+        if (device != nullptr) { CUDA_CHECK(cudaFreeAsync(device, stream)); }
     }
 };
 #endif
@@ -102,8 +135,7 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, tokens / Schedule::kBlockM);
 #ifdef _WIN32
     Nvfp4TmaDescriptorBlock block(stream);
-    CUDA_CHECK(cudaMemcpyAsync(block.device, &descriptors, sizeof(descriptors),
-                               cudaMemcpyHostToDevice, stream));
+    nvfp4_launch_tma_store_descriptors(block.device, descriptors, stream);
     nvfp4_w4a4_tma_kernel<Geometry, Schedule>
         <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(block.device, alpha, epilogue, output);
 #else

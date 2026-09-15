@@ -1,3 +1,4 @@
+#include <cstring>
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
 
 #include "core/device.h"
@@ -57,6 +58,21 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
 #ifdef _WIN32
 // MSVC cannot pass an alignas(128) struct by value as a kernel parameter (C2719); keep the
 // descriptor block in a stream-ordered device buffer instead (see nvfp4_w4a4_tma.cu).
+
+// Graph-capture-safe descriptor staging: see nvfp4_w4a4_tma.cu. The by-value parameter words
+// are snapshotted into the graph node, so replays re-store the captured descriptors exactly.
+struct Nvfp4SwiGluTmaDescriptorWords {
+    uint4 words[32];
+};
+
+__global__ void nvfp4_store_swiglu_tma_descriptors(
+    Nvfp4W4a4TmaDescriptors* __restrict__ destination,
+    const __grid_constant__ Nvfp4SwiGluTmaDescriptorWords payload) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) { return; }
+    *reinterpret_cast<Nvfp4W4a4TmaDescriptors*>(destination) =
+        *reinterpret_cast<const Nvfp4W4a4TmaDescriptors*>(&payload.words[0]);
+}
+
 struct Nvfp4LinearSwiGluTmaDescriptorBlock {
     Nvfp4W4a4TmaDescriptors* device = nullptr;
     cudaStream_t stream             = nullptr;
@@ -72,8 +88,7 @@ struct Nvfp4LinearSwiGluTmaDescriptorBlock {
     operator=(const Nvfp4LinearSwiGluTmaDescriptorBlock&) = delete;
 
     ~Nvfp4LinearSwiGluTmaDescriptorBlock() {
-        if (device == nullptr) { return; }
-        CUDA_CHECK(cudaFreeAsync(device, stream));
+        if (device != nullptr) { CUDA_CHECK(cudaFreeAsync(device, stream)); }
     }
 };
 #endif
@@ -106,8 +121,11 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
     const dim3 grid((Geometry::kOutputRows / 2) / kPairN, tokens / M256N128S3::kBlockM);
 #ifdef _WIN32
     Nvfp4LinearSwiGluTmaDescriptorBlock block(stream);
-    CUDA_CHECK(cudaMemcpyAsync(block.device, &descriptors, sizeof(descriptors),
-                               cudaMemcpyHostToDevice, stream));
+    {
+        Nvfp4SwiGluTmaDescriptorWords payload;
+        std::memcpy(payload.words, &descriptors, sizeof(payload.words));
+        nvfp4_store_swiglu_tma_descriptors<<<1, 1, 0, stream>>>(block.device, payload);
+    }
     nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
         <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(block.device, alpha, output);
 #else
