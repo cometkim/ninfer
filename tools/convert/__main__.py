@@ -42,9 +42,17 @@ class SourceInputs(Mapping):
     def __len__(self):
         return len(set(self._sources) | set(self._paths))
 
+    def path(self, name):
+        """Resolve non-tensor recipe inputs (for example calibration JSON)."""
+        if name in self._sources:
+            return self._sources[name].path
+        if name not in self._paths:
+            raise ValueError(f"provide --source {name}=PATH")
+        return self._paths[name]
+
     def provenance(self):
         return {
-            name: {"path": str(source.path)} for name, source in self._sources.items()
+            name: {"path": str(self.path(name))} for name in self
         }
 
 

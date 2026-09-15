@@ -4,7 +4,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/linear/q8/q8_ksplit_mma.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/common/dflash_rope.cuh"
+#include "ops/context_kv_materialize/context_kv_common.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -13,56 +13,6 @@ namespace {
 constexpr int kLayers  = static_cast<int>(kContextKVMaterializeLayers);
 constexpr int kRows    = 1024;
 constexpr int kHeadDim = 128;
-
-__device__ __forceinline__ int context_column(int column, int width, int prefix) {
-    return width == prefix ? column : column / prefix * width + column % prefix;
-}
-
-struct DeviceLayerView {
-    const std::uint8_t* key_codes;
-    const std::uint8_t* key_scales;
-    const std::uint8_t* value_codes;
-    const std::uint8_t* value_scales;
-    const __nv_bfloat16* key_norm;
-    __nv_bfloat16* cache_k;
-    __half* cache_v;
-    std::int32_t padded_capacity;
-};
-
-struct DeviceLayers {
-    DeviceLayerView layer[kContextKVMaterializeLayers];
-};
-
-__device__ __forceinline__ void store_key_head(const float* input, DeviceLayerView layer,
-                                               const int* positions, const int* slots, int column,
-                                               int width, int head) {
-    const int lane = threadIdx.x & 31;
-    const int j    = lane * 2;
-    float x0 = input[j], x1 = input[j + 1], y0 = input[j + 64], y1 = input[j + 65];
-    float sum           = warp_reduce_sum(x0 * x0 + x1 * x1 + y0 * y0 + y1 * y1);
-    const float inverse = rsqrtf(__shfl_sync(0xffffffffU, sum, 0) / 128.0f + 1.e-6f);
-    x0 *= inverse * __bfloat162float(layer.key_norm[j]);
-    x1 *= inverse * __bfloat162float(layer.key_norm[j + 1]);
-    y0 *= inverse * __bfloat162float(layer.key_norm[j + 64]);
-    y1 *= inverse * __bfloat162float(layer.key_norm[j + 65]);
-    float sin0, cos0, sin1, cos1;
-    dflash_rope_sincos(positions, column, j, &sin0, &cos0);
-    dflash_rope_sincos(positions, column, j + 1, &sin1, &cos1);
-    const auto dst = 128LL * ((positions[column] & 2047) + (long long)layer.padded_capacity *
-                                                               (head + 8 * slots[column / width]));
-    auto* out      = reinterpret_cast<__nv_bfloat162*>(layer.cache_k + dst);
-    out[lane]      = __floats2bfloat162_rn(x0 * cos0 - y0 * sin0, x1 * cos1 - y1 * sin1);
-    out[lane + 32] = __floats2bfloat162_rn(y0 * cos0 + x0 * sin0, y1 * cos1 + x1 * sin1);
-}
-
-union alignas(16) Bf16x8 {
-    uint4 raw;
-    __nv_bfloat162 pair[4];
-};
-
-__device__ __forceinline__ int swizzle_128(int row, int column) {
-    return (((column >> 3) ^ (row & 7)) << 3) | (column & 7);
-}
 
 template <int Rows, int Columns, int BlockK>
 union alignas(16) MaterializeStorage {
@@ -154,7 +104,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                 const int chunk    = item - row * kChunksPerRow;
                 const int col      = chunk * 8;
                 const uint2 packed = *reinterpret_cast<const uint2*>(&mainloop.codes[row][col]);
-                Bf16x8 decoded;
+                ContextKVBf16x8 decoded;
 #pragma unroll
                 for (int pair = 0; pair < 4; ++pair) {
                     const unsigned word = (pair < 2 ? packed.x : packed.y) >> ((pair & 1) * 16);
@@ -393,45 +343,6 @@ void launch_grouped(const Tensor& x, const Tensor& positions, const Tensor& coun
     CUDA_CHECK(cudaGetLastError());
 }
 
-__global__ __launch_bounds__(256) void context_kv_key_post_kernel(
-    const float* __restrict__ key_scratch, const std::int32_t* __restrict__ positions,
-    const std::int32_t* __restrict__ counts, const std::int32_t* __restrict__ state_slots,
-    DeviceLayers layers, std::int32_t batch_size, std::int32_t width, std::int32_t min_count,
-    std::int32_t max_count) {
-    const int packed_column   = static_cast<int>(blockIdx.x);
-    const int physical_column = context_column(packed_column, width, max_count);
-    const int layer_index     = static_cast<int>(blockIdx.y);
-    const int batch           = physical_column / width;
-    const int local           = physical_column % width;
-    const int count           = counts[batch];
-    if (count < min_count || count > max_count || local >= count) return;
-    const auto layer   = layers.layer[layer_index];
-    const int head     = threadIdx.x >> 5;
-    const float* input = key_scratch +
-                         kRows * (packed_column + max_count * batch_size * layer_index) +
-                         head * kHeadDim;
-    store_key_head(input, layer, positions, state_slots, physical_column, width, head);
-}
-
-DeviceLayers make_device_layers(
-    const std::array<ContextKVMaterializeLayerView, kContextKVMaterializeLayers>& layers) {
-    DeviceLayers result{};
-    for (int index = 0; index < kLayers; ++index) {
-        const ContextKVMaterializeLayerView& source = layers[static_cast<std::size_t>(index)];
-        result.layer[index]                         = {
-            static_cast<const std::uint8_t*>(source.key_weight.qdata),
-            static_cast<const std::uint8_t*>(source.key_weight.scales),
-            static_cast<const std::uint8_t*>(source.value_weight.qdata),
-            static_cast<const std::uint8_t*>(source.value_weight.scales),
-            static_cast<const __nv_bfloat16*>(source.key_norm_weight.data),
-            static_cast<__nv_bfloat16*>(source.cache.k.data),
-            static_cast<__half*>(source.cache.v.data),
-            static_cast<std::int32_t>(source.cache.padded_capacity),
-        };
-    }
-    return result;
-}
-
 } // namespace
 
 void context_kv_materialize_launch(
@@ -471,12 +382,8 @@ void context_kv_materialize_launch(
                                   key_scratch, stream);
         break;
     }
-    context_kv_key_post_kernel<<<dim3(envelope.max_count * context.ne[2], kLayers), 256, 0,
-                                 stream>>>(
-        static_cast<const float*>(key_scratch.data), static_cast<const int*>(positions.data),
-        static_cast<const int*>(counts.data), static_cast<const int*>(state_slots.data),
-        device_layers, context.ne[2], context.ne[1], envelope.min_count, envelope.max_count);
-    CUDA_CHECK(cudaGetLastError());
+    context_kv_key_post_launch(key_scratch, positions, counts, state_slots, device_layers,
+                               context.ne[2], context.ne[1], envelope, stream);
 }
 
 } // namespace ninfer::ops::detail
