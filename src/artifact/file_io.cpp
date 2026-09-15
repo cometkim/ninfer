@@ -49,7 +49,11 @@ off_t file_offset(std::uint64_t offset) {
 #ifdef _WIN32
 
 InputFile::InputFile(std::filesystem::path path) : path_(std::move(path)) {
-    fd_ = reinterpret_cast<intptr_t>(::CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ,
+    // POSIX open(2) places no restriction on concurrent writers; tests rewrite artifact
+    // fixtures while a Reader is live. Share write/delete access so the same flows run.
+    fd_ = reinterpret_cast<intptr_t>(::CreateFileW(path_.c_str(), GENERIC_READ,
+                                                   FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                                       FILE_SHARE_DELETE,
                                                    nullptr, OPEN_EXISTING,
                                                    FILE_ATTRIBUTE_NORMAL, nullptr));
     if (fd_ == kInvalidHandle) { fail(path_, "open", ::GetLastError()); }
@@ -121,7 +125,9 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
         // The Windows counterpart of POSIX O_DIRECT: unbuffered overlapped I/O with
         // sector-aligned offsets and buffers, satisfying the same 4096-byte contract.
         direct_fd_ = reinterpret_cast<intptr_t>(
-            ::CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            ::CreateFileW(path_.c_str(), GENERIC_READ,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                          OPEN_EXISTING,
                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING |
                               FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
                           nullptr));
