@@ -62,10 +62,16 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
 } // namespace
 
 void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                              const PagedKVLayerView& cache, Tensor& out,
-                                              cudaStream_t stream) {
+                                              const PagedKVLayerView& cache,
+                                              const Tensor& scratch_k, const Tensor& scratch_v,
+                                              Tensor& out, cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_prompt_k8v4_attention_launch(q, positions, scale, cache, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        causal_attention_prompt_hq_attention_launch(q, positions, scale, cache, scratch_k,
+                                                    scratch_v, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
@@ -89,7 +95,9 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
-                                    PagedKVBatchLayerView cache, Tensor& out, cudaStream_t stream) {
+                                    PagedKVBatchLayerView cache, const Tensor& scratch_k,
+                                    const Tensor& scratch_v, Tensor& out,
+                                    cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_prompt_k8v4_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                             cache, out, stream);
@@ -103,6 +111,11 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_prompt_fp8_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                            cache, out, stream);
+        return;
+    }
+    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        causal_attention_prompt_hq_launch(q, k, v, positions, valid_columns, table_rows, scale,
+                                          cache, scratch_k, scratch_v, out, stream);
         return;
     }
     kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);

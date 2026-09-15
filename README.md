@@ -301,4 +301,5 @@ under `third_party/`.
 | [`feat/windows-port`](docs/features/windows-port.md) | `feat/msvc-test-constexpr` | Windows/MSVC platform IO, compiler and console support with portable CMake setup. | `squash(feat/windows-port)` |
 | [`feat/webui`](docs/serving.md#start-the-server) | `feat/windows-port` | Serve the stock llama.cpp WebUI with --webui or --webui-dir and its API dialect. | `squash(feat/webui)` |
 | [`feat/mtp7`](docs/cli.md#speculative-decoding) | `feat/webui` | Extend MTP planning and round execution to one through seven draft tokens. | `squash(feat/mtp7)` |
+| [`feat/hyperquant`](docs/cli.md#context-and-memory) | `feat/mtp7` | HQ-E8-Rice-2B packed Main Text/MTP KV profile, metadata layout and attention consumers. | `squash(feat/hyperquant)` |
 <!-- ninfer:features:end -->
