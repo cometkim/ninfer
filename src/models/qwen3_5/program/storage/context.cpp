@@ -1401,6 +1401,7 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
         set_device_i32(io.backend_kv_table_row,
                        sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
                                             : 0);
+        acquire_sequence_side_rows(sequence);
     } catch (...) {
         if (!text_active) {
             if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
@@ -1463,9 +1464,125 @@ void ProgramImpl::trim_sequence_kv(SequenceState& sequence, std::uint32_t main_t
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV trim requested without an allocation");
     }
+    if (decoder->text_kv.residual_enabled()) {
+        // The ring's population level is the address's last committed append (or inherited
+        // level), which a backward trim lowers; recompute the valid slot set for the new window.
+        const std::uint32_t retained_text =
+            text_kv_addresses->side_written_frontier(sequence.kv->text);
+        const std::uint32_t retained_backend =
+            sequence.kv->backend && backend_kv_addresses
+                ? backend_kv_addresses->side_written_frontier(*sequence.kv->backend)
+                : 0U;
+        text_kv_addresses->destructive_truncate(sequence.kv->text, main_tokens);
+        if (sequence.kv->backend) {
+            backend_kv_addresses->destructive_truncate(*sequence.kv->backend, backend_tokens);
+        }
+        revalidate_sequence_side_rows(sequence, retained_text, main_tokens);
+        return;
+    }
     text_kv_addresses->destructive_truncate(sequence.kv->text, main_tokens);
     if (sequence.kv->backend) {
         backend_kv_addresses->destructive_truncate(*sequence.kv->backend, backend_tokens);
+    }
+}
+
+
+
+void ProgramImpl::acquire_sequence_side_rows(SequenceState& sequence) {
+    if (!sequence.kv || !decoder->text_kv.residual_enabled()) { return; }
+    if (text_kv_addresses->acquire_side_rows(sequence.kv->text)) {
+        decoder->text_kv.clear_side_rows(text_kv_addresses->bound_row(sequence.kv->text),
+                                         device.stream);
+    } else {
+        // Kept rows: the words may still reflect writes past the current frontier (an inactive
+        // trim or a retained bundle's superseded tail); recompute the valid set. Clearing is
+        // monotone, so this is a no-op when the words already match the frontier.
+        revalidate_sequence_side_rows(
+            sequence, text_kv_addresses->side_written_frontier(sequence.kv->text),
+            sequence.kv->backend && backend_kv_addresses
+                ? backend_kv_addresses->side_written_frontier(*sequence.kv->backend)
+                : 0U);
+    }
+    if (sequence.kv->backend && backend_kv_cache() &&
+        backend_kv_cache()->residual_enabled()) {
+        if (backend_kv_addresses->acquire_side_rows(*sequence.kv->backend)) {
+            backend_kv_cache()->clear_side_rows(
+                backend_kv_addresses->bound_row(*sequence.kv->backend), device.stream);
+        }
+    }
+}
+
+// Prefix-fork side-plane inheritance: the destination bundle's history is the source's [0,
+// frontier), so the destination's slot keeps the source's exact rows when they are still
+// coherent; otherwise the destination falls back to codec rows for the inherited window and its
+// own appends repopulate the ring from `frontier` on.
+void ProgramImpl::inherit_fork_side_rows(qwen3_5::PagedKVCache& cache,
+                                         KVAddressSpaceStore& store,
+                                         KVAddressSpaceHandle destination,
+                                         std::int32_t source_row,
+                                         std::uint32_t source_written, std::uint32_t frontier,
+                                         cudaStream_t stream) {
+    if (!cache.residual_enabled()) { return; }
+    const std::int32_t destination_row = store.bound_row(destination);
+    if (destination_row < 0) { throw std::logic_error("KV prefix fork has no execution row"); }
+    if (!store.acquire_side_rows(destination)) { return; }
+    if (source_row == destination_row) {
+        cache.revalidate_residual_ring(destination_row, source_written, frontier, stream);
+        return;
+    }
+    if (source_row >= 0) {
+        cache.copy_side_rows(source_row, destination_row, stream);
+        cache.copy_side_words(source_row, destination_row, stream);
+        cache.revalidate_residual_ring(destination_row, source_written, frontier, stream);
+    } else {
+        cache.clear_side_rows(destination_row, stream);
+    }
+}
+
+// After any backward trim, a ring slot is exact only if its last written key survived inside the
+// sequence's new recent window; slot rows written by trimmed-away keys hold rows the sequence
+// will re-append later, not the older key the next fetch would name.
+void ProgramImpl::revalidate_sequence_side_rows(SequenceState& sequence,
+                                                std::uint32_t retained_text,
+                                                std::uint32_t retained_backend) {
+    if (!sequence.kv || !decoder->text_kv.residual_enabled()) { return; }
+    const std::int32_t text_row = text_kv_addresses->bound_row(sequence.kv->text);
+    if (text_row >= 0) {
+        decoder->text_kv.revalidate_residual_ring(text_row, retained_text,
+                                                  sequence.text_kv_valid, device.stream);
+    }
+    if (sequence.kv->backend && backend_kv_cache() &&
+        backend_kv_cache()->residual_enabled()) {
+        const std::int32_t backend_row = backend_kv_addresses->bound_row(*sequence.kv->backend);
+        if (backend_row >= 0) {
+            backend_kv_cache()->revalidate_residual_ring(backend_row, retained_backend,
+                                                         backend_kv_valid(sequence), device.stream);
+        }
+    }
+}
+
+// Rejected drafts wrote ring slots that older still-recent keys may name; those keys' exact rows
+// were clobbered, so the slots fall back to the codec planes until their positions are
+// re-appended.
+void ProgramImpl::invalidate_sequence_side_rows(SequenceState& sequence,
+                                                std::uint32_t rejected_from,
+                                                std::uint32_t rejected_end) {
+    if (!sequence.kv || !decoder->text_kv.residual_enabled() ||
+        rejected_end <= rejected_from) {
+        return;
+    }
+    const std::int32_t text_row = text_kv_addresses->bound_row(sequence.kv->text);
+    if (text_row >= 0) {
+        decoder->text_kv.invalidate_residual_ring(text_row, rejected_from, rejected_end,
+                                                  device.stream);
+    }
+    if (sequence.kv->backend && backend_kv_cache() &&
+        backend_kv_cache()->residual_enabled()) {
+        const std::int32_t backend_row = backend_kv_addresses->bound_row(*sequence.kv->backend);
+        if (backend_row >= 0) {
+            backend_kv_cache()->invalidate_residual_ring(backend_row, rejected_from, rejected_end,
+                                                         device.stream);
+        }
     }
 }
 

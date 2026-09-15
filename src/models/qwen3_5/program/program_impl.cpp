@@ -1,4 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
+
+#include "models/qwen3_5/program/rope_scaling.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -43,6 +45,22 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
+      rope_frequencies(plan.rope_scaling_factor > 1.0F
+                           ? rope_yarn_frequencies(
+                                 plan.parameters->model.config().text.rope_parameters->rope_theta,
+                                 static_cast<int>(
+                                     plan.parameters->model.config().text.rope_parameters->rotary_dim),
+                                 plan.parameters->model.config().text.max_position_embeddings,
+                                 plan.rope_scaling_factor, plan.rope_scaling_temperature,
+                                 plan.rope_scaling_beta_fast, plan.rope_scaling_beta_slow)
+                           : ops::rope_linear_frequencies(
+                                 plan.parameters->model.config().text.rope_parameters->rope_theta,
+                                 static_cast<int>(
+                                     plan.parameters->model.config().text.rope_parameters->rotary_dim))),
+      rope_scaling_factor(plan.rope_scaling_factor),
+      rope_scaling_temperature(plan.rope_scaling_temperature),
+      rope_scaling_beta_fast(plan.rope_scaling_beta_fast),
+      rope_scaling_beta_slow(plan.rope_scaling_beta_slow),
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
@@ -372,6 +390,11 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         if (text_kv_addresses->bound_row(*address) != 0) {
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
+        // The scorer appends through row 0 outside sequence binding; take over the row's side
+        // planes so any retained bundle that still claims them falls back to codec rows.
+        if (text_kv_addresses->acquire_side_rows(*address)) {
+            decoder->text_kv.clear_side_rows(0, device.stream);
+        }
         text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
@@ -409,7 +432,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head},
+                 prefill_chunk, proposal_head, rope_frequencies},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -508,6 +531,20 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.max_context     = capacity;
     out.kv_capacity     = kv_capacity;
     out.kv_cache        = kv_storage;
+    out.rope_scaling_factor      = rope_scaling_factor;
+    out.rope_scaling_temperature = rope_scaling_temperature;
+    out.rope_scaling_beta_fast   = rope_scaling_beta_fast;
+    out.rope_scaling_beta_slow   = rope_scaling_beta_slow;
+    if (rope_scaling_factor > 1.0F) {
+        if (capacity <= parameters.model.config().text.max_position_embeddings) {
+            out.rope_note =
+                "rope scaling is active below the checkpoint's native position range; this "
+                "costs short-prompt quality";
+        }
+    } else if (capacity > parameters.model.config().text.max_position_embeddings) {
+        out.rope_note =
+            "max-context exceeds the checkpoint's trained positions without rope scaling";
+    }
     const auto& weights = parameters.model.storage_stats();
     out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
                                      weights.device_capacity_bytes};

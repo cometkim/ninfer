@@ -129,6 +129,15 @@ causal_small_t_quantized_active_splits(int window, int launch_capacity, int toke
     return splits < launch_capacity ? splits : launch_capacity;
 }
 
+// The narrow HQ tile uses four dimension-sliced warps with a smaller live register set.
+// Supply four CTAs per SM at long windows; linear codecs retain their own split policies.
+template <typename Geometry>
+__device__ __forceinline__ int causal_hq_narrow_active_splits(int window, int capacity) {
+    int splits = causal_small_t_default_splits<Geometry>(window);
+    if (window > 1024) { splits = min(256, 2 * splits); }
+    return min(splits, capacity);
+}
+
 __device__ __forceinline__ int causal_small_t_tc_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
@@ -193,7 +202,8 @@ causal_merge_split_statistics(const float* partial_m, const float* partial_l, in
     return total;
 }
 
-template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
+template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset,
+          bool HqNarrow = false>
 __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_kernel(
     const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
@@ -245,7 +255,8 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
 
     const int window = last_pos + 1;
     const int active_split_count =
-        causal_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
+        HqNarrow ? causal_hq_narrow_active_splits<Geometry>(window, split_count)
+                 : causal_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
 
     __shared__ float weights[256], warp_sums[8], scalars[2];
     const float head_l =

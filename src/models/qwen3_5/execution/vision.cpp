@@ -369,7 +369,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
                 k.nb[2] = qkv.nb[1];
                 v.nb[2] = qkv.nb[1];
                 ops::rope(position_ids, dimension(config_.hidden_size / config_.num_heads),
-                          10'000.0F, q, k, stream);
+                          ops::rope_vision_frequencies(10'000.0F), q, k, stream);
                 Tensor attended_heads =
                     attended.view({dimension(config_.hidden_size / config_.num_heads),
                                    dimension(config_.num_heads), patches});
