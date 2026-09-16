@@ -202,6 +202,8 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
         detail::kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
     } else if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         detail::kv_cache_append_nvfp4_launch(k, v, positions, cache, stream);
+    } else if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        detail::kv_cache_append_hq_launch(k, v, positions, cache, stream);
     } else {
         detail::kv_cache_append_launch(k, v, positions, cache, stream);
     }
