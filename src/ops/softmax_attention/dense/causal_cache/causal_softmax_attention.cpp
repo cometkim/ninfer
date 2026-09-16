@@ -508,15 +508,15 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         return maximum;
     };
 
+    // The prompt routes above the verify ceiling must be provisioned for every reachable
+    // width: the INT8 split-count policy is not monotone in width (a 948-column tail can
+    // pick four splits where a 1024-column chunk picks three), so a max_width-only
+    // evaluation undercounts interior widths. exact_capacity is cheap host arithmetic, and
+    // for HQ its value is width-independent above the ceiling (the carry term is captured
+    // from max_width), so the full sweep stays exact for every storage.
     std::size_t maximum = 0;
-    if (min_width <= kMaximumVerifyTokens) {
-        const std::int32_t last = std::min(max_width, kMaximumVerifyTokens);
-        for (std::int32_t width = min_width; width <= last; ++width) {
-            maximum = std::max(maximum, exact_capacity(width));
-        }
-    }
-    if (max_width > kMaximumVerifyTokens && cache_storage == KvCacheStorage::HqE8Rice2B) {
-        maximum = std::max(maximum, exact_capacity(max_width));
+    for (std::int32_t width = min_width; width <= max_width; ++width) {
+        maximum = std::max(maximum, exact_capacity(width));
     }
     return maximum;
 }

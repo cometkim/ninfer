@@ -2405,6 +2405,27 @@ int verify_workspace_capacity_contract() {
             ++failures;
         }
     }
+    // The INT8 prompt split workspace engages only for widths whose wave-fill items exceed
+    // the device SM count, and the split count is not monotone in width; the interval
+    // capacity must cover every interior width (a 948-column tail can pick four splits
+    // where the 1024-column interval maximum picks three).
+    {
+        constexpr ops::CausalAttentionExecutionEnvelope envelope{1, 2048};
+        constexpr ops::AttentionHeadGeometry geometry{kHeadDim, 24, 4};
+        const std::size_t interval = ops::causal_softmax_attention_workspace_capacity_bytes(
+            geometry, KvCacheStorage::Int8Group64, envelope, 1, 1, 1024);
+        std::size_t witness = 0;
+        for (std::int32_t tokens = 1; tokens <= 1024; ++tokens) {
+            witness = std::max(witness, ops::causal_softmax_attention_workspace_capacity_bytes(
+                                            geometry, KvCacheStorage::Int8Group64, envelope, 1,
+                                            tokens, tokens));
+        }
+        if (interval != witness) {
+            std::cerr << "causal_softmax_attention int8 split interval capacity has no exact "
+                         "route witness\n";
+            ++failures;
+        }
+    }
     try {
         (void)ops::causal_softmax_attention_workspace_capacity_bytes(
             {kHeadDim, 16, 2}, KvCacheStorage::BFloat16,
