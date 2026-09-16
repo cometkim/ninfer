@@ -298,4 +298,5 @@ under `third_party/`.
 | feat branch | stacked on | status | squashed on dev as |
 |---|---|---|---|
 | [`feat/qwen3.8-profile-base`](docs/features/qwen3.8-profile-base.md) | `master` | Minimal shared vocabulary, optional-component allocation and parent grouping for sibling full/QAT recipes. | — |
+| [`feat/qwen3.8-nvfp4full`](model-cards/Qwen3.8-27B-nvfp4full-NInfer/README.md) | `feat/qwen3.8-profile-base` | Full mixed-source NVFP4 recipe, explicit calibration prerequisite and reproduction commands. | — |
 <!-- ninfer:features:end -->
