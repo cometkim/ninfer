@@ -21,6 +21,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+.venv-*/
 venv/
 *.egg-info/
 
@@ -52,6 +53,23 @@ out/
 tools/freq_corpus/fixtures/*
 !tools/freq_corpus/fixtures/ranking/
 
+# Local eval prerequisites (ModelScope needle corpus, extracted tokenizer trio)
+/eval/data/
+/eval/runs/
+/eval/runs-card/
+/eval/server-logs/
+/eval/agentic/
+
+# Terminal-Bench dataset materialized by a harbor download from the repo root
+/terminal-bench-2-1/
+
+# Root-level build/configure log captures from wrapper runs
+/*-log.txt
+
+# Local release products. Keep the publishing guide, upload archives as GitHub Release assets.
+dist/*
+!dist/README.md
+
 # Editor / OS
 .vscode/
 .idea/
@@ -62,3 +80,9 @@ profiles/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Local agent workspace
+.zcode/
+
+# Fork backup bundles
+/backup/

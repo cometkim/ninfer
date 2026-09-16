@@ -1,0 +1,86 @@
+schema_version: 1
+
+# Model-card LongBench v2 cells: full-capability mode (thinking ON) under the
+# card's registered sampling (temperature 0.6, top_p 0.95, top_k 20), one seed
+# per round; the runner generates a per-seed copy of this file replacing
+# __SEED__. Rule-scored on the final "ANSWER: [LETTER]" line with a 16,384-token
+# output budget so the answer line always lands after the reasoning. Each suite
+# runs against its own ninfer-serve launch; required server flags are noted per
+# suite. Samples beyond the launch envelope fail by construction and count in
+# the denominator (the collection pass also reports admitted-only cells).
+
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 1
+    request:
+      timeout_seconds: 86400
+      retries: 1
+      retry_interval_seconds: 10
+
+suites:
+  # Server: --kv-dtype int8 --max-context 262144 (no --rope-scaling).
+  lbv2_short_native:
+    jobs:
+      - id: lbv2_short
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        generation: &card_mcq
+          temperature: 0.6
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 16384
+          seed: __SEED__
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+        backend_args:
+          subset_list: [short]
+          judge_strategy: rule
+
+  # Server: --kv-dtype hq-e8-2b --max-context 262144 (no --rope-scaling). The
+  # codec A/B pair of lbv2_short_native: identical prompts, seed, and envelope,
+  # only the KV dtype differs.
+  lbv2_short_hq:
+    jobs:
+      - id: lbv2_short_hq
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *card_mcq
+        backend_args:
+          subset_list: [short]
+          judge_strategy: rule
+
+  # Server: --kv-dtype hq-e8-2b --max-context 524288 --rope-scaling yarn:2.
+  lbv2_medium_524k:
+    jobs:
+      - id: lbv2_medium
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *card_mcq
+        backend_args:
+          subset_list: [medium]
+          judge_strategy: rule
+
+  # Server: --kv-dtype hq-e8-2b --max-context 786432 --rope-scaling yarn:3.
+  lbv2_long_768k_full:
+    jobs:
+      - id: lbv2_long_768k_full
+        backend: evalscope
+        dataset: longbench_v2
+        target: qwen38_api
+        max_concurrency: 1
+        generation: *card_mcq
+        backend_args:
+          subset_list: [long]
+          judge_strategy: rule
