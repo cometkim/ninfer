@@ -527,11 +527,11 @@ public:
             ops::causal_softmax_attention(
                 q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity, table_rows_tensor_,
                 {kHeadDim, q_tensor_.ne[1], k_tensor_.ne[1]}, kScale, batch_cache_view_, envelope_,
-                workspace_, output_tensor_, stream);
+                workspace_, output_tensor_, nullptr, stream);
         } else {
             ops::causal_softmax_attention_cached(
                 q_tensor_, positions_tensor_, {kHeadDim, q_tensor_.ne[1], cache_view_.num_kv_heads},
-                kScale, cache_view_, envelope_, workspace_, output_tensor_, stream);
+                kScale, cache_view_, envelope_, workspace_, output_tensor_, nullptr, stream);
         }
     }
 

@@ -5,6 +5,7 @@
 // one 16-byte pack per thread; BF16x2 and scalar routes preserve correctness for
 // smaller alignments and odd tails. Sigmoid remains FP32 expf, not a fit.
 
+#include "core/pdl.cuh"
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -26,15 +27,18 @@ __device__ __forceinline__ __nv_bfloat162 sigmoid_gate_mul_pair(__nv_bfloat162 g
 
 __global__ void sigmoid_gate_mul_scalar_kernel(const __nv_bfloat16* gate, __nv_bfloat16* x,
                                                std::int64_t n) {
+    pdl::wait_for_dependencies();
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {
         x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) * sigmoid(__bfloat162float(gate[i])));
     }
+    pdl::publish();
 }
 
 __launch_bounds__(256) __global__
     void sigmoid_gate_mul_bf16x8_kernel(const Bf16x8Pack* gate, Bf16x8Pack* x, std::int64_t packs) {
+    pdl::wait_for_dependencies();
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < packs; i += stride) {
@@ -46,11 +50,13 @@ __launch_bounds__(256) __global__
         }
         store_vec(x + i, xv);
     }
+    pdl::publish();
 }
 
 __launch_bounds__(256) __global__
     void sigmoid_gate_mul_bf16x2_kernel(const __nv_bfloat16* gate, __nv_bfloat16* x,
                                         std::int64_t n) {
+    pdl::wait_for_dependencies();
     const std::int64_t tid = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride =
         static_cast<std::int64_t>(gridDim.x) * blockDim.x * kSigmoidGateMulPairsPerThread;
@@ -83,6 +89,7 @@ __launch_bounds__(256) __global__
         const std::int64_t i = n - 1;
         x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) * sigmoid(__bfloat162float(gate[i])));
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops

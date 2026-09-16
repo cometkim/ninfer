@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+#include "core/measurement_controls.h"
+
 #include <cstddef>
 #include <utility>
 
@@ -30,7 +32,7 @@ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), Call
     config.dynamicSmemBytes = launch.dynamic_smem_bytes;
     config.stream           = launch.stream;
     config.attrs            = &attribute;
-    config.numAttrs         = 1;
+    config.numAttrs         = measurement::pdl_enabled() ? 1 : 0;
 
     return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
 }
@@ -41,5 +43,16 @@ __device__ __forceinline__ void trigger_dependents() { cudaTriggerProgrammaticLa
 
 // Call on every consumer control path before its first access to producer-dependent data.
 __device__ __forceinline__ void wait_for_dependencies() { cudaGridDependencySynchronize(); }
+
+// Entry wait for kernels whose inputs are entirely producer-dependent: block until the producer
+// grid's writes are visible before any dependent read. No-op in launches without the
+// programmatic-serialization attribute.
+__device__ __forceinline__ void sync() { wait_for_dependencies(); }
+
+// Exit publish for producer kernels: announces dependent launches once the calling thread has
+// issued its global stores. Only writes issued before a CTA's publish are guaranteed visible to
+// a dependent that waited, so publish belongs at kernel end; CTAs that return early without
+// publishing still satisfy the launch gate through completion.
+__device__ __forceinline__ void publish() { trigger_dependents(); }
 
 } // namespace ninfer::pdl

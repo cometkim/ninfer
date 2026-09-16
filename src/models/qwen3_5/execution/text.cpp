@@ -33,6 +33,8 @@
 #include "ninfer/ops/sparse_moe.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
+#include "core/measurement_controls.h"
+#include "ninfer/ops/qk_norm_rope.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -353,11 +355,16 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
                                        dimension(config_.attention->num_attention_heads), T});
     Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
                                              dimension(config_.attention->num_key_value_heads), T});
-    ops::rmsnorm(q, mtp_->query_norm, config_.rms_norm_eps, true, qn, s);
-    ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, dimension(config_.rope_parameters->rotary_dim), rope_frequencies_,
-              qn, kn, s);
+    if (measurement::decode_fusions_enabled()) {
+        ops::qk_norm_rope(q, k, mtp_->query_norm, mtp_->key_norm, config_.rms_norm_eps,
+                          rope_for_op, rope_frequencies_, qn, kn, s);
+    } else {
+        ops::rmsnorm(q, mtp_->query_norm, config_.rms_norm_eps, true, qn, s);
+        ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
+        ops::rope(rope_for_op, dimension(config_.rope_parameters->rotary_dim),
+                  rope_frequencies_, qn, kn, s);
+    }
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -387,7 +394,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, &gate, s);
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
@@ -395,9 +402,8 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
+            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, &gate, s);
     }
-    ops::sigmoid_mul(gate, a, s);
 
     const auto post = workspace::mtp_post_attention(work_, config_, T);
     Tensor o        = post.output;
@@ -547,8 +553,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            mtp_kv_.layer_view(0), envelope, work_, a, s);
-        ops::sigmoid_mul(gate, a, s);
+            mtp_kv_.layer_view(0), envelope, work_, a, &gate, s);
 
         Tensor o = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
         project(a.view({dimension(config_.attention->query_width()), 1}), mtp_->output, o, work_,
@@ -874,15 +879,20 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                        dimension(config_.attention->num_attention_heads), T});
     Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
                                              dimension(config_.attention->num_key_value_heads), T});
-    ops::rmsnorm(q, p.query_norm, config_.rms_norm_eps, true, qn, s);
-    ops::rmsnorm(k, p.key_norm, config_.rms_norm_eps, true, kn, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, dimension(config_.rope_parameters->rotary_dim), rope_frequencies_, qn,
-              kn, s);
+    if (measurement::decode_fusions_enabled()) {
+        ops::qk_norm_rope(q, k, p.query_norm, p.key_norm, config_.rms_norm_eps,
+                          rope_for_op, rope_frequencies_, qn, kn, s);
+    } else {
+        ops::rmsnorm(q, p.query_norm, config_.rms_norm_eps, true, qn, s);
+        ops::rmsnorm(k, p.key_norm, config_.rms_norm_eps, true, kn, s);
+        ops::rope(rope_for_op, dimension(config_.rope_parameters->rotary_dim),
+                  rope_frequencies_, qn, kn, s);
+    }
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -914,7 +924,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
-            a_batch, s);
+            a_batch, &gate, s);
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
@@ -923,9 +933,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
-            s);
+            &gate, s);
     }
-    ops::sigmoid_mul(gate, a, s);
 
     ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
                     p.output.policy, work_, s);

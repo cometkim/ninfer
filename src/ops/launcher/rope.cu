@@ -2,6 +2,7 @@
 #include "ops/launcher/rope.h"
 
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
 #include "ops/kernel/rope.cuh"
 
 #include <cstdint>
@@ -34,11 +35,13 @@ template <RopeKernelMode Mode, int QHeads, int KHeads>
 void launch_fixed_block(const RopeFrequencies& frequencies, const Tensor& positions, Tensor* q,
                         Tensor* k, int block, cudaStream_t stream) {
     const int tokens = positions.ne[0];
-    rope_fixed_kernel<Mode, QHeads, KHeads><<<dim3(static_cast<unsigned>(tokens)), dim3(block), 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(static_cast<unsigned>(tokens)), dim3(block), 0, stream},
+        rope_fixed_kernel<Mode, QHeads, KHeads>,
         static_cast<const std::int32_t*>(positions.data), frequencies,
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), tokens, token_stride(q),
-        token_stride(k));
+        token_stride(k)));
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads>
@@ -67,11 +70,13 @@ void launch_dflash_split(const RopeFrequencies& frequencies, const Tensor& posit
     constexpr int kGroups = (QHeads + KHeads + HeadsPerBlock - 1) / HeadsPerBlock;
     constexpr int kBlock  = HeadsPerBlock <= 2 ? 64 : HeadsPerBlock * 32;
     const int tokens      = positions.ne[0];
-    rope_fixed_split_kernel<RopeKernelMode::DflashText1D, QHeads, KHeads, HeadsPerBlock><<<dim3(static_cast<unsigned>(tokens * kGroups)), dim3(kBlock), 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(static_cast<unsigned>(tokens * kGroups)), dim3(kBlock), 0, stream},
+        rope_fixed_split_kernel<RopeKernelMode::DflashText1D, QHeads, KHeads, HeadsPerBlock>,
         static_cast<const std::int32_t*>(positions.data), frequencies,
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), tokens, token_stride(q),
-        token_stride(k));
+        token_stride(k)));
 }
 
 bool launch_fixed_pair(const RopeFrequencies& frequencies, const Tensor& positions,
@@ -184,12 +189,14 @@ void launch_generic(const RopeFrequencies& frequencies, const Tensor& positions,
     constexpr int block = 128;
     Tensor& sample      = q != nullptr ? *q : *k;
     const int tokens    = sample.ne[2];
-    rope_generic_kernel<<<dim3(static_cast<unsigned>(tokens)), dim3(block), 0, stream>>>(
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(static_cast<unsigned>(tokens)), dim3(block), 0, stream},
+        rope_generic_kernel,
         static_cast<const std::int32_t*>(positions.data), positions.ne[1], frequencies,
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
         k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
         q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens, token_stride(q),
-        token_stride(k));
+        token_stride(k)));
 }
 
 } // namespace

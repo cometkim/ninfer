@@ -17,6 +17,7 @@ This is [cometkim](https://github.com/cometkim)'s personal fork of NInfer.
 | [`feat/qwen3.8-profile-base`](https://github.com/cometkim/ninfer/blob/feat/qwen3.8-profile-base/docs/features/qwen3.8-profile-base.md) | `master` | Minimal shared vocabulary, optional-component allocation and parent grouping for sibling full/QAT recipes. | — |
 | [`feat/qwen3.8-nvfp4full`](model-cards/Qwen3.8-27B-nvfp4full-NInfer/README.md) | `feat/qwen3.8-profile-base` | Full mixed-source NVFP4 recipe, explicit calibration prerequisite and reproduction commands. | — |
 | [`feat/qwen3.8-nvfp4qat`](model-cards/Qwen3.8-27B-nvfp4qat-NInfer/README.md) | `feat/qwen3.8-profile-base` | Independent QAT packed-weight import recipe, BF16 control decode and reproduction commands. | — |
+| [`feat/kernel-perf`](docs/features/kernel-perf.md) | `feat/dflash2` | Runtime QK/RoPE and attention-gate fusion, PDL/GDN launch chains, Small-T cache routes and INT8 prompt split reduction. | `squash(feat/kernel-perf)` |
 <!-- ninfer:features:end -->
 
 > Selected checkpoints. Maximum single-GPU inference performance.

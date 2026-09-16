@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+#include "core/pdl.cuh"
 
 #include "core/device.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh"
@@ -28,11 +29,16 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
     const float inverse       = 1.0F / weight.weight_scale_divisor;
-    nvfp4_simt_kernel<Geometry, ActiveTokens, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-        Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
-                            static_cast<__nv_bfloat16*>(z.data)});
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        nvfp4_simt_kernel<Geometry, ActiveTokens, Schedule, Nvfp4IdentityEpilogue,
+                            Nvfp4GdnInputOutput>,
+
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
+            Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
+                                static_cast<__nv_bfloat16*>(z.data)}, ActiveTokens));
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -7,6 +7,7 @@
 // only what both share: layout constants, device helpers, and the split reducer.
 
 #include "ops/common/math.cuh"
+#include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
@@ -202,13 +203,17 @@ causal_merge_split_statistics(const float* partial_m, const float* partial_l, in
     return total;
 }
 
+// The gate is the op's sigmoid-gated-output input: out[i] = bf16(attn[i]) * sigmoid(gate[i]),
+// with the attention value rounded to BF16 first so the fused store is bit-identical to the
+// reducer-then-sigmoid_mul kernel chain it replaces. A null gate stores the plain attention.
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset,
           bool HqNarrow = false>
 __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_kernel(
     const float* partial_acc, const float* partial_m, const float* partial_l,
-    const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    const std::int32_t* positions, const std::int32_t* valid_columns, const __nv_bfloat16* gate,
+    std::int32_t tokens, std::int32_t full_width, std::int32_t column_begin,
+    std::int32_t batch_size, std::int32_t split_count, __nv_bfloat16* out) {
+    pdl::sync();
     static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -272,8 +277,15 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
                 weights[split];
     }
 
-    const float value = (head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    const float value              = (head_l > 0.0f) ? numerator / head_l : 0.0f;
+    const std::int64_t output_index = causal_q_index<Geometry>(q_head, d, output_column);
+    const __nv_bfloat16 attention   = __float2bfloat16(value);
+    out[output_index] =
+        gate == nullptr
+            ? attention
+            : __float2bfloat16_rn(__bfloat162float(attention) *
+                                  sigmoid(__bfloat162float(gate[output_index])));
+    pdl::publish();
 }
 
 } // namespace ninfer::ops
