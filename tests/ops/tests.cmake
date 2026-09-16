@@ -43,6 +43,10 @@ ninfer_add_op_test(ninfer_hq_codec_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hq_codec.cu"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_hq_retrieval_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hq_retrieval.cu"
+  LIBRARIES CUDA::curand)
+
 ninfer_add_op_test(ninfer_hq_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/test_hq_attention.cu"
   LIBRARIES ninfer_ops)

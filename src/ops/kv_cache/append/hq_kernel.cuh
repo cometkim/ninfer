@@ -75,7 +75,9 @@ __global__ void kv_cache_append_full_hq_kernel(const __nv_bfloat16* __restrict__
                                                const std::int32_t* __restrict__ positions,
                                                Metadata metadata, std::uint8_t* codes_k,
                                                std::uint8_t* codes_v, std::uint8_t* meta_k,
-                                               std::uint8_t* meta_v, std::int32_t width) {
+                                               std::uint8_t* meta_v,
+                                               __nv_bfloat16* residual_k, __nv_bfloat16* residual_v,
+                                               std::uint32_t* side_words, std::int32_t width) {
     extern __shared__ float smem[];
     std::int8_t* signs = reinterpret_cast<std::int8_t*>(
         smem + kKVCacheHqFillWarps * (kHqSmemFloatsPerRow + kHqSmemSymbolsPerRow));
@@ -100,7 +102,26 @@ __global__ void kv_cache_append_full_hq_kernel(const __nv_bfloat16* __restrict__
     hq_encode_row_warp(
         src, signs, 0, u_scaled, syms,
         kv_cache_hq_row_codes_mut<Geometry>(role_v ? codes_v : codes_k, table, head, position),
-        kv_cache_hq_row_meta_mut<Geometry>(role_v ? meta_v : meta_k, table, head, position));
+        kv_cache_hq_row_meta_mut<Geometry>(role_v ? meta_v : meta_k, table, head, position),
+        hq_dither_row_seed(head, position, role_v));
+    if (residual_k != nullptr) {
+        // A chunk wider than the ring contains key pairs congruent mod kCausalHqRecentKeys that map
+        // to the same ring slot; the LATER key owns the slot at the chunk's end window (the earlier
+        // key is already outside every future recent window), so a warp whose key is superseded
+        // within this chunk skips the write instead of racing it.
+        const std::int32_t total = position + (valid - token);
+        if (position < static_cast<std::int32_t>(kCausalHqSinkKeys) ||
+            position + static_cast<std::int32_t>(kCausalHqRecentKeys) >= total) {
+            const std::int32_t slot = metadata.residual_slot();
+            hq_store_rotated_row_warp(
+                src, signs, hq_residual_row<Geometry::KVHeads>(role_v ? residual_v : residual_k,
+                                                               slot, head, position));
+            hq_ring_mark_valid(side_words == nullptr
+                                   ? nullptr
+                                   : side_words + static_cast<std::int64_t>(slot) * kHqSideWords,
+                               position);
+        }
+    }
 }
 
 } // namespace ninfer::ops

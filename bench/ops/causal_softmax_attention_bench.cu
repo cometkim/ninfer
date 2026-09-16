@@ -198,11 +198,12 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--batch") {
             options.batches = parse_list(next("--batch requires a value"), 1, 8, "--batch");
         } else if (argument == "--context") {
-            options.contexts =
-                parse_list(next("--context requires a value"), 0, 262144, "--context");
+            options.contexts = parse_list(next("--context requires a value"), 0,
+                                          ops::kCausalAttentionMaximumVisibleKeys, "--context");
         } else if (argument == "--row-contexts") {
             options.row_contexts =
-                parse_list(next("--row-contexts requires a value"), 0, 262144, "--row-contexts");
+                parse_list(next("--row-contexts requires a value"), 0,
+                           ops::kCausalAttentionMaximumVisibleKeys, "--row-contexts");
         } else if (argument == "--valid-columns") {
             options.valid_columns =
                 parse_list(next("--valid-columns requires a value"), 0, 16, "--valid-columns");

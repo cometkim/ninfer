@@ -12,6 +12,7 @@ This is [cometkim](https://github.com/cometkim)'s personal fork of NInfer.
 | [`feat/webui`](docs/serving.md#start-the-server) | `feat/windows-port` | Serve the stock llama.cpp WebUI with --webui or --webui-dir and its API dialect. | `squash(feat/webui)` |
 | [`feat/mtp7`](docs/cli.md#speculative-decoding) | `feat/webui` | Extend MTP planning and round execution to one through seven draft tokens. | `squash(feat/mtp7)` |
 | [`feat/hyperquant`](docs/cli.md#context-and-memory) | `feat/mtp7` | HQ-E8-Rice-2B packed Main Text/MTP KV profile, metadata layout and attention consumers. | `squash(feat/hyperquant)` |
+| [`feat/1m-context`](docs/cli.md#context-and-memory) | `feat/hyperquant` | Startup YaRN scaling and the HQ execution envelope up to 1,048,576 logical tokens. | `squash(feat/1m-context)` |
 <!-- ninfer:features:end -->
 
 > Selected checkpoints. Maximum single-GPU inference performance.

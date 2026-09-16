@@ -66,6 +66,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    card.set_rope_frequencies(state.execution.rope_frequencies);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -89,6 +90,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
+    card.set_rope_frequencies(state.execution.rope_frequencies);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
@@ -395,9 +397,18 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             throw std::logic_error("materialization prefix forks are incomplete");
         }
         if (text_prefix_fork) {
+            const KVAddressSpaceHandle fork_source  = sequence.kv->text;
+            const std::int32_t side_source_row      = text_kv_addresses->side_source_row(fork_source);
+            const std::uint32_t side_source_written =
+                side_source_row >= 0 ? text_kv_addresses->side_written_frontier(fork_source) : 0U;
+            const std::uint32_t inherited_frontier =
+                transaction.text_activation_frontier.value_or(0U);
             text_kv_addresses->commit_prefix_fork(std::move(*transaction.text_prefix_fork),
                                                   device.stream);
             transaction.text_prefix_fork.reset();
+            inherit_fork_side_rows(decoder->text_kv, *text_kv_addresses,
+                                   *transaction.root_text_address, side_source_row,
+                                   side_source_written, inherited_frontier, device.stream);
             if (!preserving_source) {
                 const KVAddressSpaceHandle source_address = sequence.kv->text;
                 sequence.kv->text                         = *transaction.root_text_address;
@@ -412,9 +423,24 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             transaction.text_activation.reset();
         }
         if (backend_prefix_fork) {
+            const KVAddressSpaceHandle backend_fork_source = *sequence.kv->backend;
+            const std::int32_t backend_side_row =
+                backend_kv_addresses->side_source_row(backend_fork_source);
+            const std::uint32_t backend_side_written =
+                backend_side_row >= 0
+                    ? backend_kv_addresses->side_written_frontier(backend_fork_source)
+                    : 0U;
+            const std::uint32_t backend_inherited_frontier =
+                transaction.backend_activation_frontier.value_or(0U);
             backend_kv_addresses->commit_prefix_fork(std::move(*transaction.backend_prefix_fork),
                                                      device.stream);
             transaction.backend_prefix_fork.reset();
+            if (qwen3_5::PagedKVCache* backend = backend_kv_cache(); backend != nullptr) {
+                inherit_fork_side_rows(*backend, *backend_kv_addresses,
+                                       *transaction.root_backend_address, backend_side_row,
+                                       backend_side_written, backend_inherited_frontier,
+                                       device.stream);
+            }
             if (!preserving_source) {
                 const KVAddressSpaceHandle source_address = *sequence.kv->backend;
                 sequence.kv->backend                      = *transaction.root_backend_address;
@@ -934,6 +960,10 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
             commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
             trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            if (committed < pending.produced) {
+                invalidate_sequence_side_rows(sequence, sequence.text_kv_valid,
+                                              pending.base_E + pending.produced);
+            }
             if (terminal[row]) {
                 request.lifecycle = Lifecycle::Finishable;
             } else {
@@ -992,7 +1022,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, rope_frequencies},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,

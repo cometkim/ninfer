@@ -53,7 +53,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
-    constexpr int PageIds              = 64;
+    // The 524288-key linear envelope needs up to 98 pages per split.
+    constexpr int PageIds              = 128;
     constexpr float Log2E              = 1.4426950408889634074F;
     constexpr unsigned FullMask        = 0xffffffffU;
 

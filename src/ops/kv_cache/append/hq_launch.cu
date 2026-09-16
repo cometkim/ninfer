@@ -26,7 +26,10 @@ void launch_hq_for(const Tensor& k, const Tensor& v, const Tensor& positions, Ca
             static_cast<std::uint8_t*>(cache.k_pages.data),
             static_cast<std::uint8_t*>(cache.v_pages.data),
             static_cast<std::uint8_t*>(cache.k_scale_pages.data),
-            static_cast<std::uint8_t*>(cache.v_scale_pages.data), tokens);
+            static_cast<std::uint8_t*>(cache.v_scale_pages.data),
+            static_cast<__nv_bfloat16*>(cache.residual_k.data),
+            static_cast<__nv_bfloat16*>(cache.residual_v.data),
+            static_cast<std::uint32_t*>(cache.side_words.data), tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -44,7 +47,8 @@ void dispatch_hq(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
 
 void kv_cache_append_hq_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                PagedKVLayerView cache, cudaStream_t stream) {
-    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
+    const PagedKVDirectMetadata metadata{
+        static_cast<const std::int32_t*>(cache.block_table.data), cache.slot};
     dispatch_hq(k, v, positions, cache, metadata, stream);
 }
 

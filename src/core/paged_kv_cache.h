@@ -23,6 +23,14 @@ struct PagedKVLayerView {
     Tensor v_pages;
     Tensor k_scale_pages;
     Tensor v_scale_pages;
+    // hq-e8-2b residual window (optional): BF16 side planes [head_dim, num_kv_heads,
+    // sink+recent rows, table_rows] in the codec's rotated frame, one layer slice shared by all
+    // slot rows, plus the per-slot validity words [kHqSideWords, table_rows]. `slot` selects this
+    // sequence's row. Empty tensors mean the feature is off (every other cache dtype).
+    Tensor residual_k;
+    Tensor residual_v;
+    Tensor side_words;
+    std::int32_t slot = 0;
     Tensor block_table;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
@@ -35,6 +43,11 @@ struct PagedKVBatchLayerView {
     Tensor v_pages;
     Tensor k_scale_pages;
     Tensor v_scale_pages;
+    // Same hq-e8-2b residual contract as the single view; consuming kernels select the slot row
+    // from the batch's table-row index.
+    Tensor residual_k;
+    Tensor residual_v;
+    Tensor side_words;
     Tensor block_tables;
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;

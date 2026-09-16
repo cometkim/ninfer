@@ -240,7 +240,9 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
     : ctx_(ctx), parameters_(weights), config_(weights.model.config().text), work_(work), kv_(kv),
       mtp_kv_(mtp_kv), state_(state), io_(io), prefill_hidden_(prefill_hidden),
       prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv),
-      batch_mtp_kv_(batch_mtp_kv) {
+      batch_mtp_kv_(batch_mtp_kv),
+      rope_frequencies_(ops::rope_linear_frequencies(config_.rope_parameters->rope_theta,
+                                                    static_cast<int>(config_.rope_parameters->rotary_dim))) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -354,7 +356,8 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rmsnorm(q, mtp_->query_norm, config_.rms_norm_eps, true, qn, s);
     ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
+    ops::rope(rope_for_op, dimension(config_.rope_parameters->rotary_dim), rope_frequencies_,
+              qn, kn, s);
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -487,7 +490,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             work_.alloc(DType::BF16, {dimension(config_.attention->head_dim),
                                       dimension(config_.attention->num_key_value_heads), T});
         ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
-        text_rope(rope_positions, *config_.rope_parameters, kn, s);
+        ops::rope(rope_positions, dimension(config_.rope_parameters->rotary_dim),
+                  rope_frequencies_, kn, ops::RopeSide::Key, s);
         ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
 
         if (final_chunk) {
@@ -532,7 +536,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                     cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
             }
         }
-        text_rope(last_rope_position, *config_.rope_parameters, qn, s);
+        ops::rope(last_rope_position, dimension(config_.rope_parameters->rotary_dim),
+                  rope_frequencies_, qn, ops::RopeSide::Query, s);
 
         Tensor a = work_.alloc(DType::BF16, {dimension(config_.attention->head_dim),
                                              dimension(config_.attention->num_attention_heads), 1});
@@ -876,7 +881,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
+    ops::rope(rope_for_op, dimension(config_.rope_parameters->rotary_dim), rope_frequencies_, qn,
+              kn, s);
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
