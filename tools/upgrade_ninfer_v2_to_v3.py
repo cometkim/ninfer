@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-time, standard-library upgrade of the seven known official NInfer v2 inputs.
+"""One-time, standard-library upgrade of known official and fork NInfer v2 inputs.
 
 Run: python3 upgrade_ninfer_v2_to_v3.py INPUT.ninfer OUTPUT.ninfer
 Weight bytes are preserved and the maintained Qwen chat template is installed.
@@ -50,6 +50,8 @@ KNOWN_COUNTS = {
     ("qwen3.8-27b", "groupwise-int"): (1124, 1190),
     ("qwen3.8-27b", "nvfp4"): (1124, 1190),
     ("qwen3.6-35b-a3b", "groupwise-int"): (940,),
+    ("qwen3.8-27b", "nvfp4full"): (1325,),
+    ("qwen3.8-27b", "nvfp4qat"): (1334,),
 }
 LIMIT = 32_000_000_000
 HEADER = struct.Struct("<8sQ16s")

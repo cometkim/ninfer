@@ -303,4 +303,8 @@ under `third_party/`.
 | [`feat/mtp7`](docs/cli.md#speculative-decoding) | `feat/webui` | Extend MTP planning and round execution to one through seven draft tokens. | `squash(feat/mtp7)` |
 | [`feat/hyperquant`](docs/cli.md#context-and-memory) | `feat/mtp7` | HQ-E8-Rice-2B packed Main Text/MTP KV profile, metadata layout and attention consumers. | `squash(feat/hyperquant)` |
 | [`feat/1m-context`](docs/cli.md#context-and-memory) | `feat/hyperquant` | Startup YaRN scaling and the HQ execution envelope up to 1,048,576 logical tokens. | `squash(feat/1m-context)` |
+| [`feat/dflash2`](docs/features/dflash2.md) | `feat/1m-context` | Cumulative NVFP4 DFlash2 integration and conversion tooling. | `squash(feat/dflash2)` |
+| [`feat/qwen3.8-profile-base`](https://github.com/cometkim/ninfer/blob/feat/qwen3.8-profile-base/docs/features/qwen3.8-profile-base.md) | `master` | Minimal shared vocabulary, optional-component allocation and parent grouping for sibling full/QAT recipes. | — |
+| [`feat/qwen3.8-nvfp4full`](model-cards/Qwen3.8-27B-nvfp4full-NInfer/README.md) | `feat/qwen3.8-profile-base` | Full mixed-source NVFP4 recipe, explicit calibration prerequisite and reproduction commands. | — |
+| [`feat/qwen3.8-nvfp4qat`](model-cards/Qwen3.8-27B-nvfp4qat-NInfer/README.md) | `feat/qwen3.8-profile-base` | Independent QAT packed-weight import recipe, BF16 control decode and reproduction commands. | — |
 <!-- ninfer:features:end -->
