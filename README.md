@@ -7,6 +7,7 @@ This is [cometkim](https://github.com/cometkim)'s personal fork of NInfer.
 <!-- ninfer:features:start -->
 | feat branch | stacked on | status | squashed on dev as |
 |---|---|---|---|
+| [`feat/msvc-test-constexpr`](docs/features/msvc-test-constexpr.md) | `master` | C++20/MSVC test fixes for sqrt constant expressions and explicit array headers. | `squash(feat/msvc-test-constexpr)` |
 <!-- ninfer:features:end -->
 
 > Selected checkpoints. Maximum single-GPU inference performance.
