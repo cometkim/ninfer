@@ -10,7 +10,9 @@ Run the commands below from the repository root.
 ## Upgrade an existing v2 artifact
 
 The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,
-and Qwen3.6-35B-A3B groupwise-int. Update your checkout to the current `master` and
+Qwen3.6-35B-A3B groupwise-int, and this fork's Qwen3.8-27B `nvfp4full` and `nvfp4qat`
+artifacts (including NVFP4 DFlash2 modules). The same command handles all these inputs; no
+separate fork wrapper is needed. Update your checkout to the current branch and
 [rebuild NInfer](../README.md#quick-start), then run with Python 3.11:
 
 ```bash

@@ -245,8 +245,8 @@ public:
         }
         if (w.selector) {
             out.selector = SelectorParameters{linear(w.selector->hidden_projection),
-                                              tensor(w.selector->predecessor_codebook),
-                                              tensor(w.selector->successor_codebook)};
+                                              linear(w.selector->predecessor_codebook),
+                                              linear(w.selector->successor_codebook)};
         }
         return out;
     }
