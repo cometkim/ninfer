@@ -8,10 +8,14 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_hq_h24.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_hq_h16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_bf16.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_i8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_fp8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_k8v4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_hq.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_hq_h24.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_hq_h16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_tc_bf16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_tc_i8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_fp8_tc.cu"
@@ -27,4 +31,6 @@ target_sources(ninfer_ops PRIVATE
 
 target_sources(ninfer_nvfp4_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_non_rdc.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_non_rdc_h24.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_non_rdc_h16.cu"
 )
