@@ -95,36 +95,39 @@ On the conversion-verification workload the NVFP4 module drafted 5.50 tokens/rou
 | Field | Value |
 |---|---|
 | Filename | `qwen3_8_27b_nvfp4full.ninfer` |
-| Size | 19,406,942,468 bytes (18.07 GiB) |
-| SHA-256 | `abb1e120d5f1f32d61689604d238227ff579ab76cbd9319628f3b3904fffd9af` |
-| Container version | 2 |
+| Size | 19,407,229,188 bytes (18.07 GiB) |
+| SHA-256 | `ac98cd392c84a04b2a21c2f5c3988dece88d20a697ba1de663fb32d5998b8ee9` |
+| Container version | 3 |
 | NInfer model ID | `qwen3.8-27b` |
 | NInfer weights ID | `nvfp4full` |
 | NInfer target key | `qwen3_8_27b` |
-| Stored objects | 1,325 (1,319 tensors and 6 resources) |
+| Stored objects | 1,325 (the v2 release tensors plus six resources) |
 | NVFP4 tensors | 281 (247 Text parents + 34 DFlash2 module matrices) |
 | BF16 exception tensors | 9 |
+| Components | Text, Vision, MTP, DFlash2 (NVFP4-encoded module), optimized draft head |
 
 Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  'abb1e120d5f1f32d61689604d238227ff579ab76cbd9319628f3b3904fffd9af' \
+  'ac98cd392c84a04b2a21c2f5c3988dece88d20a697ba1de663fb32d5998b8ee9' \
   'qwen3_8_27b_nvfp4full.ninfer' | sha256sum --check
 ```
 
-### v3 artifact
+The file is the v2 release upgraded offline with the standard `tools/upgrade_ninfer_v2_to_v3.py` and published under the same canonical filename: weight bytes are preserved, the directory and bindings move to the v3 schema, and the maintained chat template is installed. The 281 NVFP4 tensors — 247 Text parents and the 34 drafter matrices — are unchanged. Verified on one RTX 5090 through the fork engine (Windows, INT8 group-64 KV, 8,192-token context): greedy text, MTP3, DFlash2 draft-window 7 and Vision image input all execute end to end. The evaluation tables in Size and quality below continue to describe these byte-preserved weights; acceptance observed on a 128-token greedy smoke is not a new quality claim.
+
+### v2 release (superseded)
+
+The first published release used the v2 container at the same filename. Current NInfer builds accept v3 only, the Hub hosts the v3 file above, and the v2 weight bytes are preserved inside it.
 
 | Field | Value |
 |---|---|
-| Filename | `qwen3_8_27b_nvfp4full.v3.ninfer` |
-| Size | 19,407,229,188 bytes (18.07 GiB) |
-| SHA-256 | `ac98cd392c84a04b2a21c2f5c3988dece88d20a697ba1de663fb32d5998b8ee9` |
-| Container version | 3 |
-| Stored objects | 1,325 (the v2 release tensors plus six resources) |
-| Components | Text, Vision, MTP, DFlash2 (NVFP4-encoded module), optimized draft head |
+| Size | 19,406,942,468 bytes (18.07 GiB) |
+| SHA-256 | `abb1e120d5f1f32d61689604d238227ff579ab76cbd9319628f3b3904fffd9af` |
+| Container version | 2 |
+| Stored objects | 1,325 (1,319 tensors and 6 resources) |
 
-This file is the v2 release upgraded offline with the standard `tools/upgrade_ninfer_v2_to_v3.py`: weight bytes are preserved, the directory and bindings move to the v3 schema, and the maintained chat template is installed. The 281 NVFP4 tensors — 247 Text parents and the 34 drafter matrices — are unchanged. Verified on one RTX 5090 through the fork engine (Windows, INT8 group-64 KV, 8,192-token context): greedy text, MTP3, DFlash2 draft-window 7 and Vision image input all execute end to end. The v2 evaluation tables above continue to describe these byte-preserved weights; acceptance observed on a 128-token greedy smoke is not a new quality claim.
+The SHA-256 identifies previously downloaded v2 copies; it does not match the currently hosted file.
 
 ## Engine support
 
@@ -154,14 +157,14 @@ You can get full capability by using `cometkim/dev` branch that integrated all f
 Current NInfer builds accept **v3** `.ninfer` artifacts; download the v3 file below, or upgrade an existing v2 copy offline with `tools/upgrade_ninfer_v2_to_v3.py`. Windows (MSVC + CUDA 13.1+) or 64-bit Linux, NVIDIA GeForce RTX 5090 (`sm_120a`).
 
 ```bash
-hf download cometkim/Qwen3.8-27B-nvfp4full-NInfer qwen3_8_27b_nvfp4full.v3.ninfer \
+hf download cometkim/Qwen3.8-27B-nvfp4full-NInfer qwen3_8_27b_nvfp4full.ninfer \
   --local-dir models
 # or upgrade an existing v2 copy offline:
 # python3 tools/upgrade_ninfer_v2_to_v3.py \
-#   models/qwen3_8_27b_nvfp4full.ninfer models/qwen3_8_27b_nvfp4full.v3.ninfer
+#   models/qwen3_8_27b_nvfp4full.ninfer models/qwen3_8_27b_nvfp4full.ninfer
 
 # greedy text generation with MTP speculative decoding
-./build/apps/ninfer models/qwen3_8_27b_nvfp4full.v3.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4full.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 --max-new 256 \
   --spec mtp --draft-tokens 3
@@ -169,13 +172,13 @@ hf download cometkim/Qwen3.8-27B-nvfp4full-NInfer qwen3_8_27b_nvfp4full.v3.ninfe
 # the DFlash2 drafter (single parallel draft pass; the recommended lane).
 # The released NVFP4 module needs the fork's NVFP4 DFlash2 runtime;
 # a freshly converted W8 companion runs on the upstream schema.
-./build/apps/ninfer models/qwen3_8_27b_nvfp4full.v3.ninfer \
+./build/apps/ninfer models/qwen3_8_27b_nvfp4full.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 --max-new 256 \
   --spec dflash2 --draft-tokens 7
 
 # OpenAI/Anthropic-compatible serving, 262,144-token context on INT8 KV
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4full.v3.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4full.ninfer \
   --model-id qwen3.8-27b-nvfp4full --vision \
   --spec dflash2 --draft-tokens 7 \
   --kv-dtype int8 --max-context 262144
@@ -249,7 +252,7 @@ python3 -m tools.convert \
   --source calibration=out/qwen3_8_27b_nvfp4full_calibration.json \
   --recipe tools/convert/recipes/qwen3_8_27b_nvfp4full.py \
   --components text,mtp \
-  --out out/qwen3_8_27b_nvfp4full.v3.ninfer
+  --out out/qwen3_8_27b_nvfp4full.ninfer
 ```
 
 Sources are the official BF16 checkpoint, the unsloth NVFP4 checkpoint and the saved
