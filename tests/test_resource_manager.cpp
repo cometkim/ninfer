@@ -2175,7 +2175,9 @@ void test_candidate_search_prefers_deep_reuse_without_eviction() {
     program.eviction_pressure_action_units    = 2;
     program.pressure_action_immediate_ns      = 1'000'000;
     program.pressure_action_degradation_units = 1;
-    program.pressure_assessment_delay_us      = 1'000;
+    // Test candidate/closure selection, not the OS sleep quantum. Artificial assessment
+    // sleeps can exhaust the planner's gain budget before this two-action closure exists.
+    // Time-budget termination is covered separately by the delayed-assessment test.
     program.pressure_checkpoint_recovery_ns   = 8'000'000'000ULL;
 
     FakeAdmissionCandidate root;
