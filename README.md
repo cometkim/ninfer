@@ -10,6 +10,7 @@ This is [cometkim](https://github.com/cometkim)'s personal fork of NInfer.
 | [`feat/msvc-test-constexpr`](docs/features/msvc-test-constexpr.md) | `master` | C++20/MSVC test fixes for sqrt constant expressions and explicit array headers. | `squash(feat/msvc-test-constexpr)` |
 | [`feat/windows-port`](docs/features/windows-port.md) | `feat/msvc-test-constexpr` | Windows/MSVC platform IO, compiler and console support with portable CMake setup. | `squash(feat/windows-port)` |
 | [`feat/webui`](docs/serving.md#start-the-server) | `feat/windows-port` | Serve the stock llama.cpp WebUI with --webui or --webui-dir and its API dialect. | `squash(feat/webui)` |
+| [`feat/mtp7`](docs/cli.md#speculative-decoding) | `feat/webui` | Extend MTP planning and round execution to one through seven draft tokens. | `squash(feat/mtp7)` |
 <!-- ninfer:features:end -->
 
 > Selected checkpoints. Maximum single-GPU inference performance.
