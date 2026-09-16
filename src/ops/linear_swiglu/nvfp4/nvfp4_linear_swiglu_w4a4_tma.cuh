@@ -46,10 +46,8 @@ template <class Geometry, class Schedule>
 __global__ __launch_bounds__(
     Schedule::kThreads,
     Schedule::
-        kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(const __grid_constant__
-                                                                      Nvfp4W4a4TmaDescriptors
-                                                                          descriptors,
-                                                                  float alpha,
+        kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(
+    NINFER_NVFP4_TMA_DESCRIPTOR_PARAM descriptors, float alpha,
                                                                   __nv_bfloat16* __restrict__ output) {
     static_assert(Geometry::kOutputRows == 34816);
     static_assert(Geometry::kInputRows == 5120);
@@ -89,6 +87,11 @@ __global__ __launch_bounds__(
             asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" : : : "memory");
         }
         if (threadIdx.x == 0) {
+#ifdef _WIN32
+            const Nvfp4W4a4TmaDescriptors* descriptor_block = descriptors;
+#else
+            const Nvfp4W4a4TmaDescriptors* descriptor_block = &descriptors;
+#endif
 #pragma unroll 1
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
                 const int stage                 = k_tile % Schedule::kStages;
@@ -109,14 +112,14 @@ __global__ __launch_bounds__(
                                                           : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
-                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
+                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptor_block->a_codes,
                                   k_tile * Schedule::kCodeRowBytes, token_begin,
                                   &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
+                nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptor_block->b_codes,
                                   k_tile * Schedule::kCodeRowBytes, pair_begin,
                                   &shared.full[stage]);
                 nvfp4_tma_load_2d(tensors.b_codes[stage] + kPairN * Schedule::kCodeRowBytes,
-                                  &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
+                                  &descriptor_block->b_codes, k_tile * Schedule::kCodeRowBytes,
                                   pair_begin + kIntermediate, &shared.full[stage]);
                 if (load_scales) {
                     // Tile-contiguous, so the box address is a tile index; see the shared W4A4
@@ -125,8 +128,9 @@ __global__ __launch_bounds__(
                         Geometry::kGroupsPerRow / kNvfp4ScaleTileGroups;
                     const int scale_tile =
                         (token_begin / Schedule::kBlockM) * kScaleTilesPerPlane + k_tile / 2;
-                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1], &descriptors.a_scales, 0,
-                                      scale_tile * 16, &shared.full[stage]);
+                    nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) & 1],
+                                      &descriptor_block->a_scales, 0, scale_tile * 16,
+                                      &shared.full[stage]);
                 }
 
                 const int gate_scale_row = ((pair_begin / 128) * Geometry::kScaleTilesPerRow +
@@ -136,9 +140,9 @@ __global__ __launch_bounds__(
                     (((pair_begin + kIntermediate) / 128) * Geometry::kScaleTilesPerRow +
                      k_tile * Schedule::kK64PerStage) *
                     32;
-                nvfp4_tma_load_2d(tensors.b_scales[stage][0], &descriptors.b_scales, 0,
+                nvfp4_tma_load_2d(tensors.b_scales[stage][0], &descriptor_block->b_scales, 0,
                                   gate_scale_row, &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.b_scales[stage][1], &descriptors.b_scales, 0,
+                nvfp4_tma_load_2d(tensors.b_scales[stage][1], &descriptor_block->b_scales, 0,
                                   up_scale_row, &shared.full[stage]);
             }
         }
