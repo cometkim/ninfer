@@ -114,6 +114,19 @@ printf '%s  %s\n' \
   'qwen3_8_27b_nvfp4qat.ninfer' | sha256sum --check
 ```
 
+### v3 artifact
+
+| Field | Value |
+|---|---|
+| Filename | `qwen3_8_27b_nvfp4qat.v3.ninfer` |
+| Size | 18,638,510,576 bytes (17.35 GiB) |
+| SHA-256 | `8b86901a8cd2a297a3d737e470c793b67e5ce65b49131c48c2f2f0b346fd943c` |
+| Container version | 3 |
+| Stored objects | 1,334 (1,328 tensors and six resources under the v3 schema) |
+| Components | Text, Vision, MTP, DFlash2 (NVFP4-encoded module), optimized draft head |
+
+This file is the v2 release upgraded offline with the standard `tools/upgrade_ninfer_v2_to_v3.py`: weight bytes are preserved, the directory and bindings move to the v3 schema, and the maintained chat template is installed. The 290 NVFP4 tensors — 256 Text parents and the 34 drafter matrices — are unchanged. Verified on one RTX 5090 through the fork engine (Windows, INT8 group-64 KV, 8,192-token context): greedy text, MTP3, DFlash2 draft-window 7 and Vision image input all execute end to end. The v2 evaluation tables above continue to describe these byte-preserved weights; acceptance observed on a 128-token greedy smoke is not a new quality claim.
+
 ## Engine support
 
 NInfer v3 selects execution from the artifact's configuration, bindings, weights and frontend resources; there is no compile-time `(model_id, weights_id)` registration to patch. The Text and MTP components of this profile use format/shape combinations the upstream v3 runtime already implements — NVFP4 parent matrices with `AllowA4` activation policies and Q8 vocabulary endpoints — so a converted v3 artifact runs on upstream-based v3 builds.
@@ -139,13 +152,14 @@ You can get full capability by using `cometkim/dev` branch that integrated all f
 
 ## Run with NInfer
 
-Current NInfer builds accept **v3** `.ninfer` artifacts. The published file above is the v2 release: upgrade a downloaded copy offline before running it, or generate a fresh v3 artifact with the recipe. Windows (MSVC + CUDA 13.1+) or 64-bit Linux, NVIDIA GeForce RTX 5090 (`sm_120a`).
+Current NInfer builds accept **v3** `.ninfer` artifacts; download the v3 file below, or upgrade an existing v2 copy offline with `tools/upgrade_ninfer_v2_to_v3.py`. Windows (MSVC + CUDA 13.1+) or 64-bit Linux, NVIDIA GeForce RTX 5090 (`sm_120a`).
 
 ```bash
-hf download cometkim/Qwen3.8-27B-nvfp4qat-NInfer qwen3_8_27b_nvfp4qat.ninfer \
+hf download cometkim/Qwen3.8-27B-nvfp4qat-NInfer qwen3_8_27b_nvfp4qat.v3.ninfer \
   --local-dir models
-python3 tools/upgrade_ninfer_v2_to_v3.py \
-  models/qwen3_8_27b_nvfp4qat.ninfer models/qwen3_8_27b_nvfp4qat.v3.ninfer
+# or upgrade an existing v2 copy offline:
+# python3 tools/upgrade_ninfer_v2_to_v3.py \
+#   models/qwen3_8_27b_nvfp4qat.ninfer models/qwen3_8_27b_nvfp4qat.v3.ninfer
 
 # greedy text generation with MTP speculative decoding
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4qat.v3.ninfer \
