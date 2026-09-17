@@ -894,11 +894,15 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     validate_compatibility_hints(body);
 
     OpenAIChatRequest output;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get<std::string>().empty()) {
-        bad_request("missing required field: model", "model");
+    // Single-model clients omit `model` - the bundled llama.cpp webui is one of them, and
+    // rejecting it makes --webui unusable. An empty model is filled in by the handler with
+    // the loaded artifact's id; a model that is present but wrong is still rejected there.
+    if (body.contains("model") && !body.at("model").is_null()) {
+        if (!body.at("model").is_string() || body.at("model").get<std::string>().empty()) {
+            bad_request("missing required field: model", "model");
+        }
+        output.model = body.at("model").get<std::string>();
     }
-    output.model = body.at("model").get<std::string>();
 
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
