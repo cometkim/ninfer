@@ -262,6 +262,9 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
     const auto planes = weight_row_planes(region);
+    // Byte offset of this view's first scale tile inside the parent's swizzled scale plane;
+    // zero except for the 128-row-aligned NVFP4 sub-ranges below.
+    std::uint64_t scale_tile_offset = 0;
     if (g.layout == QuantLayout::RowScale && !is_complete_weight(view)) {
         throw std::invalid_argument("this native Weight input requires a complete FP8 parent");
     }
@@ -277,12 +280,12 @@ Weight native_weight(const WeightView& view, float input_divisor) {
             throw std::invalid_argument(
                 "this native Weight input requires a complete or 128-row-aligned NVFP4 parent");
         }
-        out.scales = planes.scales + (planes.row_begin / 128) * (out.k / 64) * 512;
+        scale_tile_offset = (planes.row_begin / 128) * static_cast<std::uint64_t>(out.k / 64) * 512;
     }
     out.padded_shape[1]      = dimension(g.padded_columns);
     out.qdata                = planes.codes;
     out.qhigh                = planes.high;
-    out.scales               = planes.scales;
+    out.scales               = planes.scales + scale_tile_offset;
     out.group_size           = static_cast<std::uint32_t>(g.group_size);
     out.group                = g.group_size ? dimension(g.group_size) : 0;
     out.weight_scale_divisor = region.parent->weight_scale_divisor;
