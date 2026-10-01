@@ -28,8 +28,10 @@ single-GPU RTX 5090 (`sm_120a`) inference routes.
   attention/GDN input projections), RMSNorm, RoPE, sigmoid gating, the BF16/INT8
   grouped attention kernels and the attention merges. Consumers wait before their
   first dependent read; producers publish after their output stores. Upstream's
-  own early-trigger sites (Q4/Q5 GEMV pairs, MoE decode) are unchanged. This
-  changes launch scheduling, not the model's dependency ordering.
+  own early-trigger sites (Q4/Q5/Q8 GEMV and SIMT pairs, the MoE decode chain)
+  are kept where they measured faster; the sparse-MoE small-T router kernels
+  publish at exit instead (see below). This changes launch scheduling, not the
+  model's dependency ordering.
 - **GDN recurrence.** Direct recurrent updates, batched updates, speculative
   record generation and replay folding join the PDL chain, including waits and
   publication around FP32 recurrent-state accesses. This is not a new recurrence
@@ -40,7 +42,27 @@ single-GPU RTX 5090 (`sm_120a`) inference routes.
   count (at most four) is chosen from the query-tile count and the device's SM
   count; workspace planning covers every reachable width. Causally empty
   partitions carry neutral statistics. This is runtime parallelism, distinct from
-  the later build-speed feature's compilation split.
+  the later build-speed feature's compilation split. The PV product accumulates
+  in FP16 within each 64-key tile and promotes to the FP32 running sum once per
+  tile; the staged V carries an exact 1/64 guard so a tile partial stays within
+  max|v| of the FP16 range. INT8 prompt outputs therefore differ from FP32
+  accumulation by the FP16 rounding of the per-tile partials.
+
+## Fork routes kept on the rebased base
+
+Upstream's unified kernels replaced several routes this fork had tuned. Where the
+fork's form measured faster inside the decode or verify graph on the RTX 5090, the
+fork keeps it as a patch on the new base; everywhere else upstream's code stays.
+
+- **NVFP4 T=1 GEMV.** Identity-row projections (LinearAdd, Linear, attention and GDN
+  input) use the fork's kernel shape, and the SwiGLU decode keeps the fork's
+  dedicated gate/up pair kernel. Same math and memory accesses as upstream's
+  unified GEMV; the fork's shape keeps more weight loads in flight.
+- **Sparse-MoE small-T router.** The small-T router kernels publish at exit after
+  their stores instead of at entry, so the following kernels of an MTP verify graph
+  do not share SMs with early-launched waiting CTAs.
+- **Q4/Q5 rowsplit SIMT at verify widths.** The GDN input Q5/Q4 pair at T=4 and the
+  Q5 LinearAdd at T=2..4 use the fork's rowsplit SIMT kernels.
 
 The implementation entry points are the [Q/K preparation contract](../../include/ninfer/ops/qk_norm_rope.h),
 [gated attention contract](../../include/ninfer/ops/softmax_attention.h),
@@ -73,5 +95,3 @@ prefill/decode measurements against an explicit `.ninfer` artifact.
 
 This guide describes implemented mechanisms, not a newly measured speedup. No
 new GPU qualification or universal throughput/latency gain is asserted here.
-A follow-up may re-measure FP16 accumulation for the INT8 prompt PV product
-against the FP32 accumulation used now.
