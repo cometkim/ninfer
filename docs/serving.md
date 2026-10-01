@@ -755,9 +755,9 @@ the API paths so the UI shell loads freely (llama-server parity). `--webui-dir D
 serves an already-built static directory instead; for `--webui` it also selects the
 download location, defaulting to `<model dir>/webui`. The OpenAI-compatible endpoints
 additionally accept the llama.cpp server dialect: `chat_template_kwargs.enable_thinking`,
-an omitted or empty `model` (defaults to the loaded model), negative `max_tokens`
-(server default), `/props` introspection, and `status`/`meta.n_ctx` fields on the
-models objects.
+an omitted or empty `model` on Chat Completions (defaults to the loaded model), negative
+`max_tokens`/`max_completion_tokens` (server default; zero stays an explicit limit), `/props`
+introspection, and `status`/`meta.n_ctx` fields on the models objects.
 
 ## Server options
 

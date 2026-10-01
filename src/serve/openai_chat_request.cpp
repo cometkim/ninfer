@@ -869,15 +869,12 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
         param = "max_tokens";
     }
     if (limit) {
-        if (*limit < 0) { bad_request(std::string(param) + " must be nonnegative", param); }
-        // The llama.cpp webui sends -1 for "server default"; a non-positive value behaves
-        // exactly like an omitted field so the server default wins.
+        // The llama.cpp webui sends -1 for "server default"; a negative value behaves exactly
+        // like an omitted field so the server default wins. Zero stays an explicit limit.
         if (*limit >= 0) {
             output.generation.max_tokens  = *limit;
             output.output_tokens_explicit = true;
         } else {
-            // The llama.cpp webui sends -1 for "server default"; negative values behave
-            // exactly like an omitted field so the server default wins.
             output.generation.max_tokens = limits.default_max_tokens;
         }
     } else {
@@ -894,11 +891,12 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     validate_compatibility_hints(body);
 
     OpenAIChatRequest output;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get<std::string>().empty()) {
-        bad_request("missing required field: model", "model");
+    // llama.cpp server dialect: an omitted or empty model names the loaded model. The HTTP
+    // handler substitutes the served model id before model validation.
+    if (body.contains("model")) {
+        if (!body.at("model").is_string()) { bad_request("model must be a string", "model"); }
+        output.model = body.at("model").get<std::string>();
     }
-    output.model = body.at("model").get<std::string>();
 
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 

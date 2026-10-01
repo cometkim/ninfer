@@ -183,6 +183,26 @@ int test_standard_field_policy() {
     const OpenAIChatRequest zero        = parse(zero_limit);
     failures += check(zero.output_tokens_explicit && zero.generation.max_tokens == 0,
                       "an explicit zero output limit reaches Engine's no-generation path");
+
+    // llama.cpp WebUI dialect: -1 means "server default", and the model may be omitted.
+    Json webui_limit              = base_request();
+    webui_limit["max_tokens"]     = -1;
+    const OpenAIChatRequest webui = parse(webui_limit);
+    failures += check(!webui.output_tokens_explicit &&
+                          webui.generation.max_tokens == limits().default_max_tokens,
+                      "a negative max_tokens selects the server default");
+    Json omitted_model = base_request();
+    omitted_model.erase("model");
+    failures += check(parse(omitted_model).model.empty(),
+                      "an omitted model is left for the server to resolve");
+    Json empty_model     = base_request();
+    empty_model["model"] = "";
+    failures +=
+        check(parse(empty_model).model.empty(), "an empty model is left for the server to resolve");
+    Json numeric_model     = base_request();
+    numeric_model["model"] = 7;
+    failures += check(api_error([&] { (void)parse(numeric_model); }).param == "model",
+                      "a non-string model is rejected");
     return failures;
 }
 
