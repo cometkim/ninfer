@@ -148,13 +148,21 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
     const std::size_t k_scale_index = base + 2;
     const std::size_t v_scale_index =
         k_scale_index + static_cast<std::size_t>(layer_storage_.key.has_scale());
+    // Layer `layer` owns residual slots [layer * table_rows, (layer + 1) * table_rows) of the
+    // shared side planes (the kernels address slot rows from the view's base); the validity
+    // words stay shared by all layers.
+    const auto layer_residual = [&](const Tensor& plane) {
+        return plane.data == nullptr
+                   ? Tensor()
+                   : plane.slice(3, static_cast<std::int32_t>(layer) * table_rows_, table_rows_);
+    };
     return PagedKVLayerView{
         .k_pages       = pages_.plane(base),
         .v_pages       = pages_.plane(base + 1),
         .k_scale_pages = layer_storage_.key.has_scale() ? pages_.plane(k_scale_index) : Tensor(),
         .v_scale_pages = layer_storage_.value.has_scale() ? pages_.plane(v_scale_index) : Tensor(),
-        .residual_k    = residual_k_,
-        .residual_v    = residual_v_,
+        .residual_k    = layer_residual(residual_k_),
+        .residual_v    = layer_residual(residual_v_),
         .side_words    = side_words_,
         .slot          = slot,
         .block_table   = block_table,

@@ -133,6 +133,34 @@ void test_decoder_layout() {
            "K8V4 Text/MTP asymmetric physical payload bytes");
 }
 
+// hq-e8-2b residual side planes are one tensor over layers * table rows; each layer's views
+// must address its own table-row block (kernels index slot rows from the view's base), while
+// the validity words stay shared. Binding is pointer arithmetic only, so a fake device base
+// keeps this check host-only.
+void test_hq_residual_layer_views() {
+    q36::DecoderStateSpec spec = decoder_spec(ninfer::KvCacheStorage::HqE8Rice2B, false);
+    spec.kv_table_rows         = 3;
+    ninfer::LayoutBuilder builder;
+    const q36::DecoderStateLayout layout = q36::plan_decoder_state(builder, spec);
+    const std::size_t bytes              = builder.finish(256);
+    const ninfer::DeviceSpan backing{reinterpret_cast<void*>(std::uintptr_t{1} << 32), bytes};
+    const q36::PagedKVCache cache(backing, layout.text_kv);
+    const ninfer::PagedKVBatchLayerView first  = cache.batch_layer_view(0);
+    const ninfer::PagedKVBatchLayerView second = cache.batch_layer_view(1);
+    constexpr std::ptrdiff_t slot_bytes        = 256 * 2 * (32 + 512) * 2;
+    const auto offset = [](const ninfer::Tensor& later, const ninfer::Tensor& earlier) {
+        return static_cast<const char*>(later.data) - static_cast<const char*>(earlier.data);
+    };
+    expect(first.residual_k.ne[3] == 3 && second.residual_k.ne[3] == 3 &&
+               first.residual_v.ne[3] == 3 && second.residual_v.ne[3] == 3,
+           "HQ residual views cover one layer's table rows");
+    expect(offset(second.residual_k, first.residual_k) == 3 * slot_bytes &&
+               offset(second.residual_v, first.residual_v) == 3 * slot_bytes,
+           "HQ residual views of consecutive layers are disjoint table-row blocks");
+    expect(first.side_words.data != nullptr && first.side_words.data == second.side_words.data,
+           "HQ residual validity words are shared by all layers");
+}
+
 void test_round_layout() {
     ninfer::LayoutBuilder builder;
     q36::RoundStateLayout round = q36::begin_round_state_layout(
@@ -417,6 +445,7 @@ void test_rebuild_work_prompt_frontier_boundary() {
 
 int main() {
     test_decoder_layout();
+    test_hq_residual_layer_views();
     test_round_layout();
     test_mtp_alignment();
     test_vision_control();
