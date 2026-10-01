@@ -14,6 +14,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#undef near
+#undef far
+#endif
+
 namespace {
 
 using Json   = nlohmann::json;

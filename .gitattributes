@@ -2,3 +2,6 @@
 # default whitespace checks.
 /third_party/spdlog/include/** -whitespace
 /third_party/spdlog/src/** -whitespace
+
+# Frontend tests and artifact conversion consume these maintained resources as raw bytes.
+/tools/chat_templates/*.jinja text eol=lf

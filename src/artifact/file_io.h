@@ -24,8 +24,14 @@ public:
 
 private:
     std::filesystem::path path_;
+#ifdef _WIN32
+    static constexpr intptr_t kInvalidHandle = -1;
+    intptr_t fd_                      = kInvalidHandle;
+    mutable intptr_t direct_fd_       = kInvalidHandle;
+#else
     int fd_                = -1;
     mutable int direct_fd_ = -1;
+#endif
     std::uint64_t bytes_   = 0;
 };
 

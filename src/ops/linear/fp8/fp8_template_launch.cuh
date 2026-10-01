@@ -76,8 +76,8 @@ void launch_fp8_a16_sliced_k_mma(const Fp8A16Operands& p, Output output, Epilogu
         (Schedule::kExactTokens && p.tokens != capacity))
         throw std::invalid_argument(
             "FP8 sliced-K requires complete row/K tiles and matching tokens");
-    constexpr auto kernel = fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
-    const int bytes       = fp8_prepare_shared<Schedule::kSharedBytes, kernel>();
+    static constexpr auto kernel = fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
+    const int bytes              = fp8_prepare_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);

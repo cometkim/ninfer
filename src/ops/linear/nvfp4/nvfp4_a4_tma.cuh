@@ -6,6 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_operands.h"
 #include "ops/linear/nvfp4/nvfp4_shared.cuh"
+#include "ops/common/tma_descriptors.cuh"
 #include "ops/common/token_slices.h"
 #include "ops/common/math.h"
 #include "ops/linear/common/epilogue.cuh"
@@ -142,7 +143,7 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
 template <class Schedule, class Epilogue, class OutputPolicy, class Rows>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_tma_kernel(
-    const __grid_constant__ Nvfp4A4TmaDescriptors descriptors, float alpha,
+    NINFER_TMA_DESCRIPTORS_PARAM(Nvfp4A4TmaDescriptors) descriptors, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output,
     int token_count, int output_rows, int input_rows, int token_offset) {
     const int K               = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
@@ -176,6 +177,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
             asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" : : : "memory");
         }
         if (threadIdx.x == 0) {
+            const auto& maps = tma_descriptor_block(descriptors);
 #pragma unroll 1
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
                 const int stage                 = k_tile % Schedule::kStages;
@@ -196,14 +198,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                                                           : kTransactionBytes - kScaleBytes);
 
                 auto& tensors = shared.scratch.tensors;
-                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
+                nvfp4_tma_load_2d(tensors.a_codes[stage], &maps.a_codes,
                                   k_tile * Schedule::kCodeRowBytes, token_begin,
                                   &shared.full[stage]);
 #pragma unroll
                 for (int branch = 0; branch < branches; ++branch)
                     nvfp4_tma_load_2d(tensors.b_codes[stage] +
                                           branch * loaded_rows * Schedule::kCodeRowBytes,
-                                      &descriptors.b_codes, k_tile * Schedule::kCodeRowBytes,
+                                      &maps.b_codes, k_tile * Schedule::kCodeRowBytes,
                                       row_begin + branch * (output_rows / 2), &shared.full[stage]);
                 if (load_scales) {
                     // The box is tile-contiguous, so its address is a tile index rather than a
@@ -212,8 +214,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                     const int scale_tile =
                         (token_begin / Schedule::kBlockTokens) * kScaleTilesPerPlane + k_tile / 2;
                     nvfp4_tma_load_2d(tensors.a_scale4[(k_tile / 2) % Schedule::kScaleSlots],
-                                      &descriptors.a_scales, 0, scale_tile * 16,
-                                      &shared.full[stage]);
+                                      &maps.a_scales, 0, scale_tile * 16, &shared.full[stage]);
                 }
 #pragma unroll
                 for (int branch = 0; branch < branches; ++branch) {
@@ -221,8 +222,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
                         (((row_begin + branch * (output_rows / 2)) / 128) * (K / 64) +
                          k_tile * Schedule::kK64PerStage) *
                         32;
-                    nvfp4_tma_load_2d(tensors.b_scales[stage][branch], &descriptors.b_scales, 0,
-                                      scale_row, &shared.full[stage]);
+                    nvfp4_tma_load_2d(tensors.b_scales[stage][branch], &maps.b_scales, 0, scale_row,
+                                      &shared.full[stage]);
                 }
             }
         }
@@ -390,14 +391,17 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
     };
     if (!aligned(p.x) || !aligned(p.codes) || !aligned(p.scales) || !aligned(p.x_scales))
         throw std::invalid_argument("NVFP4 TMA operands require 16-byte alignment");
-    const auto descriptors = make_nvfp4_a4_tma_descriptors<Schedule, Rows>(p);
-    constexpr int bytes    = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
-    constexpr auto kernel  = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
+    // Descriptors are launch-owned values, copied into kernel parameters during Graph capture
+    // (a stream-staged device block on Windows, see tma_descriptors.cuh).
+    const TmaDescriptorArgument<Nvfp4A4TmaDescriptors> descriptors(
+        make_nvfp4_a4_tma_descriptors<Schedule, Rows>(p), stream);
+    constexpr int bytes          = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
+    static constexpr auto kernel = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
     (void)nvfp4_prepare_shared<bytes, kernel, true>();
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(descriptors, p.alpha, epilogue, output,
-                                                            offset + count, p.rows, p.k, offset);
+        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(
+            descriptors.get(), p.alpha, epilogue, output, offset + count, p.rows, p.k, offset);
         CUDA_CHECK(cudaGetLastError());
     });
 }
