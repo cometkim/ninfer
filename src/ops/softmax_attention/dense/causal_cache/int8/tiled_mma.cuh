@@ -32,6 +32,9 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     constexpr int WorkerThreads = VWorkerWarps * 32;
     constexpr float Log2E       = kLog2E;
     constexpr unsigned FullMask = 0xffffffffu;
+    // f16-accumulate PV (fork WI-K1b): V is staged times 1/Bc and each tile promotes times Bc.
+    constexpr float PVPromote = static_cast<float>(Bc);
+    constexpr float PVGuard   = 1.0f / static_cast<float>(Bc);
 
     static_assert(GroupKc == 2);
     static_assert(PVNtPerWarp == 8);
@@ -341,7 +344,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                     __half vs     = __float2half_rn(0.0f);
                     if ((lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
                     vs = __shfl_sync(FullMask, vs, grp * 8);
-                    store_vec(dst, int8_kv_dequant_f16x8(&v_i8[key_l * D + d], vs));
+                    store_vec(dst,
+                              int8_kv_dequant_f16x8_guarded(&v_i8[key_l * D + d], vs, PVGuard));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }
@@ -365,6 +369,18 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             acc[n][3] *= alpha1;
         }
 
+        // Fork kernel-perf (WI-K1b): PV runs on the f16-accumulate MMA (2x the f32-accumulate
+        // issue rate on GeForce): each key tile accumulates into f16 fragments and promotes once
+        // into the f32 running sum. The staged V carries the 1/Bc guard, so a tile partial stays
+        // within max|v| of the FP16 range; the promotion scales the exact Bc back in the same FFMA
+        // that adds into the running sum. Outputs differ from FP32 accumulation by the FP16
+        // rounding of the per-tile partials.
+        unsigned hacc[PVNtPerWarp][2];
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            hacc[n][0] = 0u;
+            hacc[n][1] = 0u;
+        }
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
             unsigned pf[4];
@@ -380,9 +396,17 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + causal_swizzle(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                        vf[0], vf[1]);
+                mma_f16_f16acc(hacc[n][0], hacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
+        }
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const float2 h0 = __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][0]));
+            const float2 h1 = __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][1]));
+            acc[n][0]       = fmaf(PVPromote, h0.x, acc[n][0]);
+            acc[n][1]       = fmaf(PVPromote, h0.y, acc[n][1]);
+            acc[n][2]       = fmaf(PVPromote, h1.x, acc[n][2]);
+            acc[n][3]       = fmaf(PVPromote, h1.y, acc[n][3]);
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
