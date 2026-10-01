@@ -102,6 +102,16 @@ private:
     std::string public_model_id_;
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;
+
+    // In-process webui (llama.cpp static UI): a directory mounted at "/" with an SPA
+    // fallback for client-side routes, plus llama-server-style key gating where only
+    // API paths require the key so the UI shell loads freely.
+    void mount_webui(const std::string& webui_dir);
+    void register_webui_mime();
+    [[nodiscard]] bool webui_spa_path(const std::string& path) const;
+    [[nodiscard]] bool is_api_path(const std::string& path) const;
+    bool webui_serving_   = false; // true once a static webui dir is mounted
+    std::string webui_index_html_; // cached index.html for the SPA fallback
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
