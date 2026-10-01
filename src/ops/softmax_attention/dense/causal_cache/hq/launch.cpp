@@ -86,4 +86,32 @@ bool hq_kv_cached_attention(const Tensor& q, const Tensor& positions, float scal
     return gate != nullptr;
 }
 
+bool linear_kv_small_t_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                        const Tensor& positions, const Tensor& valid,
+                                        const Tensor& rows, float scale,
+                                        PagedKVBatchLayerView cache,
+                                        CausalAttentionExecutionEnvelope envelope, int splits,
+                                        WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                        DeviceExecutionView execution) {
+    auto scope   = workspace.scope();
+    auto partial = hq::allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, q.ne[3]);
+    hq::causal_attention_small_t_linear_launch(
+        q, k, v, positions, valid, rows, scale, cache, envelope, partial.acc, partial.m, partial.l,
+        out, gate, execution.multiprocessor_count, execution.stream);
+    return gate != nullptr;
+}
+
+bool linear_kv_small_t_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                                        const PagedKVLayerView& cache,
+                                        CausalAttentionExecutionEnvelope envelope, int splits,
+                                        WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                        DeviceExecutionView execution) {
+    auto scope   = workspace.scope();
+    auto partial = hq::allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, 1);
+    hq::causal_attention_cached_small_t_linear_launch(
+        q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out, gate,
+        execution.multiprocessor_count, execution.stream);
+    return gate != nullptr;
+}
+
 } // namespace ninfer::ops::detail

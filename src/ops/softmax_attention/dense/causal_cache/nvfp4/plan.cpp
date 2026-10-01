@@ -1,4 +1,5 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h"
+#include "ops/softmax_attention/dense/causal_cache/hq/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/operands.h"
 #include <algorithm>
 #include <stdexcept>
@@ -36,7 +37,21 @@ Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
     // Bound partial traffic by keeping enough KV work in each split.
     partition.key_shift = (row_tiles <= 2 ? 7 : 8) - (heads == 16 ? 1 : 0);
     partition.capacity  = partition.active(envelope.max_visible_keys);
-    return {family, heads, width, batch, query_tile, envelope, partition};
+    Nvfp4KvCausalPlan plan{family, heads, width, batch, query_tile, envelope, partition};
+    // Grouped widths take the fork small-T route where it measured faster; a grouped plan
+    // reserves the partials its sub-envelope small-T calls need.
+    if (family == Nvfp4KvFamily::Grouped) {
+        if (linear_kv_small_t_selected(KvCacheStorage::Nvfp4Group16, heads, width, batch,
+                                       envelope)) {
+            plan.family         = Nvfp4KvFamily::SmallT;
+            plan.small_t_splits = linear_kv_small_t_splits(
+                KvCacheStorage::Nvfp4Group16, heads, width, batch, envelope, multiprocessor_count);
+        } else {
+            plan.small_t_reserve = linear_kv_small_t_reserve_bytes(
+                KvCacheStorage::Nvfp4Group16, heads, width, batch, envelope, multiprocessor_count);
+        }
+    }
+    return plan;
 }
 
 std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int max_width,
@@ -47,10 +62,15 @@ std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int ma
         const auto plan =
             make_nvfp4_kv_causal_plan(heads, width, batch, envelope, multiprocessor_count);
         if (plan.family == Nvfp4KvFamily::Tiled) continue;
-        const int splits = plan.partition.capacity;
+        if (plan.family == Nvfp4KvFamily::SmallT) {
+            maximum = std::max(maximum, linear_kv_small_t_workspace_bytes(
+                                            heads, width, plan.small_t_splits, batch));
+            continue;
+        }
         WorkspaceLayoutBuilder layout;
-        (void)allocate_causal_partials(layout, heads, width, splits, batch);
-        maximum = std::max(maximum, layout.peak_bytes(1));
+        (void)allocate_causal_partials(layout, heads, width, plan.partition.capacity, batch);
+        // A grouped call pads its partials up to the small-T reserve of its envelope.
+        maximum = std::max({maximum, layout.peak_bytes(1), plan.small_t_reserve});
     }
     return maximum;
 }

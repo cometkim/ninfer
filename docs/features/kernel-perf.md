@@ -19,14 +19,15 @@ single-GPU RTX 5090 (`sm_120a`) inference routes.
 - **Attention sigmoid gating.** The gated attention entry points apply the output
   gate in the output epilogue of every route that merges split partial state
   (grouped and parallel decode/verify/prefill routes of all KV types, the split
-  prompt routes, and the hq-e8-2b small-T reducer), with the attention value still
-  in FP32. Routes that write their output directly apply the gate as a separate
+  prompt routes, and the small-T reducer of the hq-e8-2b and linear-codec small-T
+  routes), with the attention value still in FP32. Routes that write their output directly apply the gate as a separate
   sigmoid-multiply pass.
 - **Programmatic dependent launch (PDL).** Projection, normalization, activation
   and attention kernels participate in producer/consumer launch chains: the NVFP4
   A16 GEMV, SIMT and sliced-K templates (Linear, LinearAdd, LinearSwiGLU and the
   attention/GDN input projections), RMSNorm, RoPE, sigmoid gating, the BF16/INT8
-  grouped attention kernels and the attention merges. Consumers wait before their
+  grouped attention kernels, the INT8 small-T partial kernel and the attention
+  merges and small-T reducer. Consumers wait before their
   first dependent read; producers publish after their output stores. Upstream's
   own early-trigger sites (Q4/Q5/Q8 GEMV and SIMT pairs, the MoE decode chain)
   are kept where they measured faster; the sparse-MoE small-T router kernels
@@ -63,6 +64,16 @@ fork keeps it as a patch on the new base; everywhere else upstream's code stays.
   do not share SMs with early-launched waiting CTAs.
 - **Q4/Q5 rowsplit SIMT at verify widths.** The GDN input Q5/Q4 pair at T=4 and the
   Q5 LinearAdd at T=2..4 use the fork's rowsplit SIMT kernels.
+- **Small-T attention for the linear KV caches.** INT8, FP8, NVFP4 and FP8-K/NVFP4-V
+  decode and verify calls (24 query heads with W<=8, 16 query heads with W<=6) use the
+  fork's tensor-core split-KV small-T kernels, with the fused append and the shared
+  gated split reducer, where they measured faster than upstream's grouped kernels. A
+  per-cache-type table gives, per batch class and width, the largest graph resource
+  tier the fork kernel serves (mostly short and medium contexts); longer contexts,
+  wider verify calls and the BF16 cache keep upstream's routes. Both families launch
+  two kernels with the same dependency forms, so a decode graph updates across tiers
+  that switch between them. A grouped call also reserves the small-T partial storage
+  of the narrower envelopes inside its own, so one workspace capacity covers both.
 
 The implementation entry points are the [Q/K preparation contract](../../include/ninfer/ops/qk_norm_rope.h),
 [gated attention contract](../../include/ninfer/ops/softmax_attention.h),

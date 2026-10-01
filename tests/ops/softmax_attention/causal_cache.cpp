@@ -2460,6 +2460,16 @@ int run_graph_envelope_cases(DeviceExecutionView execution, KvCacheStorage stora
         constexpr std::array<std::uint32_t, 3> batch_limits{64, 65536, 256};
         failures += run_batch_case(execution, geometry, storage, replay, 65536, batch_limits);
     }
+    // Fork kernel-perf: the linear codecs take the small-T route below a measured visible-key
+    // bound and the grouped route above it, so one executable updates across that switch (both
+    // directions) and the capacity of the widest envelope covers both families.
+    if (storage != KvCacheStorage::BFloat16) {
+        constexpr std::array<std::uint32_t, 4> switch_limits{128, 32769, 512, 65536};
+        for (const auto& geometry : kGeometries)
+            for (int width : {1, 4, 6})
+                failures += run_a1_case(execution, geometry, storage, {width, 17, 65536, 968u},
+                                        MappingPattern::Fragmented, {}, switch_limits);
+    }
     return failures;
 }
 

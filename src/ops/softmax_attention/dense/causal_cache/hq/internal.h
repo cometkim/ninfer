@@ -35,6 +35,31 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                                              std::int32_t batch_size,
                                              std::int32_t multiprocessor_count);
 
+// Fork kernel-perf small-T routes for the linear codecs (INT8, FP8, NVFP4 and FP8-K/NVFP4-V;
+// 24 Q heads W <= 8, 16 Q heads W <= 6): split-grid capacity under the codec's device split
+// policy (small_t_common.cuh) and the launch pair (fused append + split-KV partials, then the
+// gated reducer) for `cache.storage`.
+std::int32_t causal_attention_split_capacity_linear(KvCacheStorage cache_storage,
+                                                    std::int32_t q_heads, std::int32_t tokens,
+                                                    CausalAttentionExecutionEnvelope envelope,
+                                                    std::int32_t batch_size,
+                                                    std::int32_t multiprocessor_count);
+
+void causal_attention_small_t_linear_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                            const Tensor& positions, const Tensor& valid_columns,
+                                            const Tensor& table_rows, float scale,
+                                            PagedKVBatchLayerView cache,
+                                            CausalAttentionExecutionEnvelope envelope,
+                                            Tensor& partial_acc, Tensor& partial_m,
+                                            Tensor& partial_l, Tensor& out, const Tensor* gate,
+                                            std::int32_t multiprocessor_count, cudaStream_t stream);
+
+void causal_attention_cached_small_t_linear_launch(
+    const Tensor& q, const Tensor& positions, float scale, const PagedKVLayerView& cache,
+    CausalAttentionExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m,
+    Tensor& partial_l, Tensor& out, const Tensor* gate, std::int32_t multiprocessor_count,
+    cudaStream_t stream);
+
 void causal_attention_small_t_hq_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,

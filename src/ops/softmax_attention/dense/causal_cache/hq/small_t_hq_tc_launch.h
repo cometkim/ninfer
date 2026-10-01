@@ -98,7 +98,8 @@ void causal_attention_small_t_hq_launch_for(const Tensor& q, CacheInput input, c
                         invocation.width * invocation.batch_size);
         CUDA_CHECK(pdl::launch_dependent(
             {grid, dim3(kReduceBlock), 0, stream},
-            causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, false, MultiBatch,
+            causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk,
+                                                          SmallTSplitPolicy::Default, MultiBatch,
                                                           Masked, Offset, Narrow>,
             static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
             static_cast<const float*>(partial_l.data), static_cast<const std::int32_t*>(pos.data),

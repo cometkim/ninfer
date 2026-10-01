@@ -18,4 +18,20 @@ bool hq_kv_cached_attention(const Tensor& q, const Tensor& positions, float scal
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                             Tensor& out, const Tensor* gate, DeviceExecutionView execution);
 
+// The linear codecs' fork small-T route (hq/plan.h) for `cache.storage`, with `splits` from
+// linear_kv_small_t_splits. The reducer applies `gate`; both return whether a gate was given.
+bool linear_kv_small_t_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                        const Tensor& positions, const Tensor& valid,
+                                        const Tensor& rows, float scale,
+                                        PagedKVBatchLayerView cache,
+                                        CausalAttentionExecutionEnvelope envelope, int splits,
+                                        WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                        DeviceExecutionView execution);
+
+bool linear_kv_small_t_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                                        const PagedKVLayerView& cache,
+                                        CausalAttentionExecutionEnvelope envelope, int splits,
+                                        WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                        DeviceExecutionView execution);
+
 } // namespace ninfer::ops::detail

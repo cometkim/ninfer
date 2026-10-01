@@ -1,4 +1,6 @@
 #include "ops/softmax_attention/dense/causal_cache/int8/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/hq/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/hq/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/template_launch.cuh"
@@ -59,8 +61,10 @@ void execute_grouped(const Tensor& q, const Tensor& positions, float scale,
     const auto view =
         make_quantized_causal_cache_view<Int8KvCacheView<Input::writes_cache>>(cache, valid, rows);
     auto scope         = workspace.scope();
+    const auto start   = workspace.used();
     const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
                                                   plan.partition.capacity, plan.batch);
+    pad_linear_kv_small_t_reserve(workspace, workspace.used() - start, plan.small_t_reserve);
     const auto p =
         make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys, gate);
     if (plan.query_heads == 24)
@@ -135,6 +139,11 @@ bool int8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const cudaStream_t stream = execution.stream;
     const auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                          execution.multiprocessor_count);
+    // The fork small-T pair appends the new columns itself; its reducer applies the gate.
+    if (plan.family == Int8KvFamily::SmallT)
+        return linear_kv_small_t_append_attention(q, k, v, positions, valid, rows, scale, cache,
+                                                  envelope, plan.small_t_splits, workspace, out,
+                                                  gate, execution);
     if (plan.family != Int8KvFamily::Grouped) {
         kv_cache_append_batch_launch(k, v, positions, valid, rows, cache, stream);
         // The tiled route applies the gate only when its key split merges partial state.
@@ -161,6 +170,10 @@ bool int8_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
     const cudaStream_t stream = execution.stream;
     const auto plan =
         make_int8_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
+    if (plan.family == Int8KvFamily::SmallT)
+        return linear_kv_small_t_cached_attention(q, positions, scale, cache, envelope,
+                                                  plan.small_t_splits, workspace, out, gate,
+                                                  execution);
     const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == Int8KvFamily::Tiled)
         return tiled(
