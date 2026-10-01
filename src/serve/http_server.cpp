@@ -498,8 +498,9 @@ void HttpServer::register_routes() {
         // Only API endpoints require a key. The UI shell and every static asset load
         // freely so the webui can prompt for and send the key on API calls (the same
         // policy as llama-server). /health stays open and OPTIONS is a CORS preflight.
+        // Without a served webui every path except those two requires the key.
         if (options_.api_key.empty() || req.method == "OPTIONS" || req.path == "/health" ||
-            (!webui_serving_ || is_api_path(req.path))) {
+            (webui_serving_ && !is_api_path(req.path))) {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
