@@ -2,6 +2,8 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/layout.h"
+#include "ninfer/ops/linear.h"
+#include "ninfer/ops/silu_mul.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"
@@ -16,6 +18,7 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    LinearA16Post,
     FusedA4,
     TmaFusedA4,
 };
@@ -28,7 +31,7 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
+        return Nvfp4LinearSwiGluRoute::LinearA16Post;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -59,10 +62,16 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
-    if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) || max_tokens <= 4) {
-        return 0;
-    }
+    if (max_tokens <= 4) { return 0; }
 
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+        // Beyond the fused A16 small-T family the route materializes the gate/up projection;
+        // the A16 NVFP4 Linear route itself needs no workspace.
+        if (max_tokens <= 16) return 0;
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::BF16, {Nvfp4N34816K5120::kOutputRows, max_tokens}, 256);
+        return layout.peak_bytes(1);
+    }
     return fused_workspace_bytes(max_tokens);
 }
 
@@ -76,6 +85,18 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
         return;
+    case Nvfp4LinearSwiGluRoute::LinearA16Post: {
+        // A16 beyond T=16: the registered A16 Linear route over the stored [gate; up] halves,
+        // then SiLU(gate) * up.
+        auto scope = workspace.scope();
+        Tensor projected =
+            workspace.alloc(DType::BF16, {Nvfp4N34816K5120::kOutputRows, x.ne[1]}, 256);
+        linear(x, weight, projected, LinearPolicy::A16Only, workspace, stream);
+        constexpr std::int32_t kIntermediate = Nvfp4N34816K5120::kOutputRows / 2;
+        silu_mul(projected.slice(0, 0, kIntermediate),
+                 projected.slice(0, kIntermediate, kIntermediate), out, stream);
+        return;
+    }
     case Nvfp4LinearSwiGluRoute::FusedA4:
         nvfp4_linear_swiglu_a4_launch(x, weight, out, workspace, stream);
         return;

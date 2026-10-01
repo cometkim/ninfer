@@ -262,15 +262,30 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
     const auto planes = weight_row_planes(region);
-    if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4) &&
-        !is_complete_weight(view)) {
-        throw std::invalid_argument(
-            "this native Weight input requires a complete FP8/NVFP4 parent");
+    // Byte offset of this view's first scale tile inside the parent's swizzled scale plane;
+    // zero except for the 128-row-aligned NVFP4 sub-ranges below.
+    std::uint64_t scale_tile_offset = 0;
+    if (g.layout == QuantLayout::RowScale && !is_complete_weight(view)) {
+        throw std::invalid_argument("this native Weight input requires a complete FP8 parent");
+    }
+    if (g.layout == QuantLayout::BlockScaleK16M128x4 && !is_complete_weight(view)) {
+        // The m128x4 scale swizzle is row-tile-major, so a 128-row-aligned sub-range of an
+        // NVFP4 parent is itself a complete BlockScaleK16M128x4 matrix: the codes plane
+        // shifts by whole code rows and the scale plane by whole 512-byte scale tiles. This
+        // serves the NVFP4 DFlash2 module, whose context K/V rows share the fused
+        // query/key/value parent at exact 128-row boundaries.
+        const bool tile_aligned =
+            planes.row_begin % 128 == 0 && planes.row_count % 128 == 0 && planes.swizzled_scales;
+        if (!tile_aligned) {
+            throw std::invalid_argument(
+                "this native Weight input requires a complete or 128-row-aligned NVFP4 parent");
+        }
+        scale_tile_offset = (planes.row_begin / 128) * static_cast<std::uint64_t>(out.k / 64) * 512;
     }
     out.padded_shape[1]      = dimension(g.padded_columns);
     out.qdata                = planes.codes;
     out.qhigh                = planes.high;
-    out.scales               = planes.scales;
+    out.scales               = planes.scales + scale_tile_offset;
     out.group_size           = static_cast<std::uint32_t>(g.group_size);
     out.group                = g.group_size ? dimension(g.group_size) : 0;
     out.weight_scale_divisor = region.parent->weight_scale_divisor;

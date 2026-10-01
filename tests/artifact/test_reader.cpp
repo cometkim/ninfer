@@ -105,6 +105,22 @@ void geometry_and_views() {
     require(nv_rows.swizzled_scales && nv_rows.row_begin == 31 &&
                 nv_rows.scales == nvfp4.data() + 4096,
             "NVFP4 submatrix lost its parent coordinates");
+    // A 128-row-aligned NVFP4 sub-range is itself a complete m128x4 matrix whose scale plane
+    // starts at the parent's scale tile of its first row (the DFlash2 context K/V rows of the
+    // fused query/key/value parent); other sub-ranges stay rejected.
+    const auto tiled_geometry = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
+                                                std::array<std::uint64_t, 2>{256, 64});
+    std::vector<std::byte> tiled(tiled_geometry.bytes);
+    WeightParent tiled_parent{tiled_geometry, tiled.data(), 2.0F};
+    const WeightView second_tile{{128, 64}, {{&tiled_parent, 128 * 64, 256 * 64}}};
+    const auto tile_planes = weight_row_planes(second_tile.parts.front());
+    const auto tile_weight = native_weight(second_tile);
+    require(tile_weight.n == 128 && tile_weight.qdata == tile_planes.codes &&
+                tile_weight.scales == tiled.data() + weight_scale_offset(tiled_geometry, 128, 0),
+            "128-row NVFP4 sub-range lost its scale tile");
+    rejects<std::invalid_argument>(
+        [&] { (void)native_weight(WeightView{{64, 64}, {{&tiled_parent, 64 * 64, 128 * 64}}}); },
+        "NVFP4 sub-range off the 128-row scale tiles accepted");
     const WeightView complete{{128, 64}, {{&nv_parent, 0, 128 * 64}}};
     const auto query   = native_weight(complete, 3.0F);
     const auto context = native_weight(complete, 4.0F);

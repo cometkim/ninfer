@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-time, standard-library upgrade of the seven known official NInfer v2 inputs.
+"""One-time, standard-library upgrade of known official and fork NInfer v2 inputs.
 
 Run: python3 upgrade_ninfer_v2_to_v3.py INPUT.ninfer OUTPUT.ninfer
 Weight bytes are preserved and the maintained Qwen chat template is installed.
@@ -11,6 +11,16 @@ import argparse
 import json
 import math
 import os
+
+# posix_fadvise has no Windows counterpart; page-cache eviction is throughput planning only.
+if not hasattr(os, "posix_fadvise"):
+    def _fadvise_noop(fd, offset, count, advise):
+        return None
+
+    os.posix_fadvise = _fadvise_noop
+    os.POSIX_FADV_DONTNEED = 4
+if not hasattr(os, "fdatasync"):
+    os.fdatasync = os.fsync
 from pathlib import Path
 import re
 import struct
@@ -40,6 +50,8 @@ KNOWN_COUNTS = {
     ("qwen3.8-27b", "groupwise-int"): (1124, 1190),
     ("qwen3.8-27b", "nvfp4"): (1124, 1190),
     ("qwen3.6-35b-a3b", "groupwise-int"): (940,),
+    ("qwen3.8-27b", "nvfp4full"): (1325,),
+    ("qwen3.8-27b", "nvfp4qat"): (1334,),
 }
 LIMIT = 32_000_000_000
 HEADER = struct.Struct("<8sQ16s")
@@ -238,6 +250,11 @@ def _input_names(name, components):
             return [backend + "/target_features"]
         if role == "candidate_selector/hidden_projection":
             return [backend + "/final_hidden"]
+        if role in (
+            "candidate_selector/predecessor_codebook",
+            "candidate_selector/successor_codebook",
+        ):
+            return [backend + "/candidate_walk"]
         match = re.fullmatch(r"(layers/\d+/)(.+)", role)
         if match:
             block, role = match.groups()
@@ -660,9 +677,11 @@ def make_directory(identity, old_objects):
     uses = []
     for name in bindings:
         format = parameter_formats[name]
+        # NVFP4 sites without a stored activation divisor are weight-only: the fork-encoded
+        # DFlash2 module runs its projections through the A16 families.
         policy = (
             "AllowA4"
-            if format == "nvfp4"
+            if format == "nvfp4" and name in scalar_uses
             else "AllowA8" if format == "fp8_e4m3fn_row_bf16" else "A16Only"
         )
         for input_name in _input_names(name, components):

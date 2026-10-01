@@ -33,6 +33,16 @@ public:
                             [&] { return ops::prepare_linear_weight(model_.input(id)); });
     }
 
+    // A use-free parameter read row-wise (no activation is quantized against it): A16Only with no
+    // activation divisor describes it exactly in every stored format.
+    LinearParameters rows(WeightId id) const {
+        const auto& bound = model_.weight(id);
+        return with_context(bound.name, [&] {
+            return ops::prepare_linear_weight(
+                ops::WeightInput{bound.view, ops::LinearPolicy::A16Only, std::nullopt});
+        });
+    }
+
     Tensor tensor(WeightId id) const {
         const auto& bound = model_.weight(id);
         return with_context(bound.name, [&] {
@@ -245,8 +255,8 @@ public:
         }
         if (w.selector) {
             out.selector = SelectorParameters{linear(w.selector->hidden_projection),
-                                              tensor(w.selector->predecessor_codebook),
-                                              tensor(w.selector->successor_codebook)};
+                                              rows(w.selector->predecessor_codebook),
+                                              rows(w.selector->successor_codebook)};
         }
         return out;
     }
