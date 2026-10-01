@@ -30,9 +30,10 @@ void hq_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (plan.family == HqKvFamily::Prompt) {
         auto scope         = workspace.scope();
         const auto scratch = hq::allocate_prompt_scratch(
-            workspace, cache.num_kv_heads, static_cast<std::int32_t>(envelope.max_visible_keys));
-        hq::causal_attention_prompt_hq_launch(q, k, v, positions, valid, rows, scale, cache,
-                                              scratch.k, scratch.v, out, execution.stream);
+            workspace, cache.num_kv_heads, plan.query_heads, plan.width, envelope.max_visible_keys);
+        hq::causal_attention_prompt_hq_launch(
+            q, k, v, positions, valid, rows, scale, cache, scratch.k, scratch.v, scratch.carry_acc,
+            scratch.carry_m, scratch.carry_l, envelope.max_visible_keys, out, execution.stream);
         return;
     }
     // The chunked family runs the small-T pair per token-tile chunk over the full tensors; the
@@ -57,9 +58,10 @@ void hq_kv_cached_attention(const Tensor& q, const Tensor& positions, float scal
     if (plan.family == HqKvFamily::Prompt) {
         auto scope         = workspace.scope();
         const auto scratch = hq::allocate_prompt_scratch(
-            workspace, cache.num_kv_heads, static_cast<std::int32_t>(envelope.max_visible_keys));
-        hq::causal_attention_prompt_hq_attention_launch(q, positions, scale, cache, scratch.k,
-                                                        scratch.v, out, execution.stream);
+            workspace, cache.num_kv_heads, plan.query_heads, plan.width, envelope.max_visible_keys);
+        hq::causal_attention_prompt_hq_attention_launch(
+            q, positions, scale, cache, scratch.k, scratch.v, scratch.carry_acc, scratch.carry_m,
+            scratch.carry_l, envelope.max_visible_keys, out, execution.stream);
         return;
     }
     for (std::int32_t begin = 0; begin < plan.width; begin += plan.chunk_tokens) {

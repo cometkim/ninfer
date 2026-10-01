@@ -167,7 +167,8 @@ void run(const char* artifact, SpeculativeBackend backend) {
     }
     execution::PrefillContext context{
         {device, parameters, program.work, program.state_images->linear(), &*program.replay_records,
-         program.io, program.prefill_hidden, program.prefill_chunk, program.proposal_head},
+         program.io, program.prefill_hidden, program.prefill_chunk, program.proposal_head,
+         program.rope_frequencies},
         program.decoder->text_kv.execution_view(program.text_kv_addresses->execution_row(*text)),
         {},
         program.decoder->text_kv,

@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "models/qwen3_5/execution/parameters.h"
+#include "ninfer/ops/rope.h"
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -12,9 +13,13 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                           WorkspaceArena& workspace, cudaStream_t stream);
 
-void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
+// Text RoPE with the run's pair-frequency table (the checkpoint-linear table, or the YaRN table
+// under rope scaling). The checkpoint's MRoPE axis mapping must be the native pair % 3.
+void text_rope(const Tensor& positions, const RopeConfig& config,
+               const ops::RopeFrequencies& frequencies, Tensor& x, ops::RopeSide side,
                DeviceExecutionView execution);
-void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
+void text_rope(const Tensor& positions, const RopeConfig& config,
+               const ops::RopeFrequencies& frequencies, Tensor& query, Tensor& key,
                DeviceExecutionView execution);
 
 } // namespace ninfer::models::qwen3_5::execution

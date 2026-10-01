@@ -14,7 +14,29 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
+// Absolute execution-envelope ceiling, reachable only with the U8 (hq-e8-2b) cache: the hq
+// decode kernel computes row addresses from the global block table and the prompt route
+// materializes banded linear scratch, so neither stages fixed-size page tables.
+inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
+// Envelope ceiling of the linear cache types (BF16, INT8-G64, FP8, NVFP4-G16, K8V4). Their
+// kernels stage physical page ids through a rolling window, so the ceiling is the qualified
+// envelope of those routes rather than a staging bound.
+inline constexpr std::uint32_t kCausalAttentionMaximumLinearVisibleKeys = 524288;
+// U8 prompt-route scratch band: the one-shot rotated planes are materialized in sequential
+// bands of at most this many keys (the FA2 kernel carries its online-softmax state between
+// bands), bounding the prompt scratch at 1 GiB regardless of the execution envelope.
+inline constexpr std::uint32_t kCausalHqPromptScratchBandKeys = 262144;
+
+// hq-e8-2b residual window: every sequence additionally keeps the first kCausalHqSinkKeys and the
+// last kCausalHqRecentKeys K/V rows EXACT (BF16, codec-rotated frame) in per-slot side planes, and
+// every hq consumer reads those rows from the side planes instead of the codec planes - the
+// per-vector quantization bias compounds over long windows (clean through the native envelope,
+// degrading past it), and exact sink+recent rows are the calibration-free protection. Source
+// selection is PER ROW (the ring boundary sits at an arbitrary window offset), so no tile
+// alignment is required; kCausalHqSinkKeys equals one whole 32-key small-T tile, and the recent
+// window is a power-of-two ring (slot = key & (kCausalHqRecentKeys - 1)).
+inline constexpr std::uint32_t kCausalHqSinkKeys   = 32;
+inline constexpr std::uint32_t kCausalHqRecentKeys = 512;
 
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
@@ -50,6 +72,12 @@ struct ContextAttentionExecutionEnvelope {
  * It does not quantize or round q, probabilities, partial sums or decoded vectors to copy a
  * kernel's private arithmetic. Newly appended rows cross their specified persistent codec
  * boundary before attention observes them.
+ * HQ-E8-Rice-2B uses the same formula with R=H256*diag(signs)/16, signed lattice coordinates and
+ * exact stored FP16 norms, with the codec's hash-derived half-cell dither added back at decode.
+ * Its BF16 QK/PV implementation is qualified per output row with cosine > 0.999 and relative
+ * L2 < 0.02 against the independent FP64 oracle at both geometries. When the cache view carries
+ * the residual window's side planes, sink and ring-valid recent keys enter the oracle through
+ * their exact rotated bf16 side rows instead of codec-decoded values.
  *
  * Kernels may select native BF16/FP16/INT8/FP8 operands, internal reductions, staging precision
  * and decomposition. These are qualified implementation profiles, not extra public tensor
@@ -110,11 +138,11 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6) and [256,16,2] (group 8), with
  * scale=1/sqrt(256). q/out are contiguous BF16 [D,Hq,W,B], k/v are contiguous BF16
  * [D,Hkv,W,B], positions are contiguous device I32 [W,B], kv_table_rows is contiguous device I32
- * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, or K8V4. valid_columns is
- * either contiguous device I32 [B] or an empty Tensor meaning every row has W live columns. This
- * dense/masked topology is chosen by the caller and never inferred by copying device metadata to
- * the host. B=1 accepts every positive W in the current prompt/decode domain; B=2..8 accepts
- * W=1..16.
+ * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, K8V4, or HQ-E8-Rice-2B.
+ * valid_columns is either contiguous device I32 [B] or an empty Tensor meaning every row has W live
+ * columns. This dense/masked topology is chosen by the caller and never inferred by copying device
+ * metadata to the host. B=1 accepts every positive W in the current prompt/decode domain; B=2..8
+ * accepts W=1..16.
  *
  * Let Vb be W for dense input or valid_columns[b] otherwise. For live column j<Vb with absolute
  * position p=positions[j,b], query head h attends cache rows [0,p] through table row
@@ -124,7 +152,10 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * through the inert tail; an empty row uses zero positions. Other tail values are safe dummies.
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
- * Attention consumes the paged cache directly. Caller-owned transient storage is bounded by the
+ * Attention consumes the paged cache directly, except that HQ-E8-Rice-2B calls with W>16 first
+ * materialize two rotated BF16 scratch planes over one band of
+ * min(max_visible_keys, kCausalHqPromptScratchBandKeys) keys, plus the online-softmax carry when
+ * the envelope spans more than one band. Caller-owned transient storage is bounded by the
  * capacity query below; implementations that need no partial state return zero capacity.
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is

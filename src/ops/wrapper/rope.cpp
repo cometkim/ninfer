@@ -59,7 +59,7 @@ void require_tensor_layout(const Tensor& tensor, const char* label, std::int32_t
     }
 }
 
-void require_common(const Tensor& positions, int rotary_dim, float theta,
+void require_common(const Tensor& positions, int rotary_dim, const RopeFrequencies& frequencies,
                     DeviceExecutionView execution) {
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument("rope: positive multiprocessor count required");
@@ -67,11 +67,20 @@ void require_common(const Tensor& positions, int rotary_dim, float theta,
     if (positions.dtype != DType::I32) {
         throw std::invalid_argument("rope: positions must be I32");
     }
-    if (!(theta > 0.0f) || !std::isfinite(theta)) {
-        throw std::invalid_argument("rope: theta must be positive and finite");
+    if (!(frequencies.attention_factor > 0.0f) || !std::isfinite(frequencies.attention_factor)) {
+        throw std::invalid_argument("rope: attention factor must be positive and finite");
     }
     if (rotary_dim <= 0 || (rotary_dim & 1) != 0) {
         throw std::invalid_argument("rope: rotary_dim must be positive and even");
+    }
+    if (rotary_dim > 2 * kRopeMaxPairs) {
+        throw std::invalid_argument("rope: rotary_dim exceeds the frequency-table bound");
+    }
+    for (int pair = 0; pair < rotary_dim / 2; ++pair) {
+        if (!(frequencies.inv_frequency[pair] > 0.0) ||
+            !std::isfinite(frequencies.inv_frequency[pair])) {
+            throw std::invalid_argument("rope: inv_frequency entries must be positive and finite");
+        }
     }
 }
 
@@ -102,9 +111,36 @@ void require_model_mode(int axes, int rotary_dim, std::int32_t head_dim) {
 
 } // namespace
 
-void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
-          DeviceExecutionView execution) {
-    require_common(positions, rotary_dim, theta, execution);
+RopeFrequencies rope_linear_frequencies(float theta, int rotary_dim) {
+    if (!(theta > 0.0f) || !std::isfinite(theta)) {
+        throw std::invalid_argument("rope: theta must be positive and finite");
+    }
+    if (rotary_dim <= 0 || (rotary_dim & 1) != 0 || rotary_dim > 2 * kRopeMaxPairs) {
+        throw std::invalid_argument("rope: rotary_dim must be a positive even value <= 256");
+    }
+    RopeFrequencies frequencies;
+    const double base = static_cast<double>(theta);
+    for (int pair = 0; pair < rotary_dim / 2; ++pair) {
+        frequencies.inv_frequency[pair] = std::pow(base, -2.0 * pair / rotary_dim);
+    }
+    return frequencies;
+}
+
+RopeFrequencies rope_vision_frequencies(float theta) {
+    if (!(theta > 0.0f) || !std::isfinite(theta)) {
+        throw std::invalid_argument("rope: theta must be positive and finite");
+    }
+    RopeFrequencies frequencies;
+    const double base = static_cast<double>(theta);
+    for (int pair = 0; pair < 36; ++pair) {
+        frequencies.inv_frequency[pair] = std::pow(base, -2.0 * (pair % 18) / 36.0);
+    }
+    return frequencies;
+}
+
+void rope(const Tensor& positions, int rotary_dim, const RopeFrequencies& frequencies, Tensor& q,
+          Tensor& k, DeviceExecutionView execution) {
+    require_common(positions, rotary_dim, frequencies, execution);
     if (q.dtype != DType::BF16 || k.dtype != DType::BF16) {
         throw std::invalid_argument("rope: q/k must be BF16");
     }
@@ -124,12 +160,12 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
     if (q.data == nullptr || k.data == nullptr) {
         throw std::invalid_argument("rope: q/k data must be non-null");
     }
-    detail::rope_launch(positions, rotary_dim, theta, q, k, execution);
+    detail::rope_launch(positions, rotary_dim, frequencies, q, k, execution);
 }
 
-void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
-          DeviceExecutionView execution) {
-    require_common(positions, rotary_dim, theta, execution);
+void rope(const Tensor& positions, int rotary_dim, const RopeFrequencies& frequencies, Tensor& x,
+          RopeSide side, DeviceExecutionView execution) {
+    require_common(positions, rotary_dim, frequencies, execution);
     if (x.dtype != DType::BF16) { throw std::invalid_argument("rope: tensor must be BF16"); }
     (void)numel_allow_zero(positions, "positions");
     const std::int64_t x_numel  = numel_allow_zero(x, "tensor");
@@ -142,7 +178,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
     if (x_numel == 0) { return; }
     require_positions_storage(positions);
     if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
-    detail::rope_single_launch(positions, rotary_dim, theta, x, execution);
+    detail::rope_single_launch(positions, rotary_dim, frequencies, x, side, execution);
 }
 
 } // namespace ninfer::ops

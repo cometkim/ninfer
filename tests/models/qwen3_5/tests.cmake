@@ -2,6 +2,10 @@ ninfer_add_test(ninfer_qwen3_5_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES ninfer_model_loading)
 
+ninfer_add_test(ninfer_qwen3_5_rope_scaling_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_scaling.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_test(ninfer_qwen3_5_loading_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading.cpp"
   LIBRARIES ninfer_model_loading)
