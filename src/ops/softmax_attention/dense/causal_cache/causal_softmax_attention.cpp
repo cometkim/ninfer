@@ -283,6 +283,13 @@ const Tensor* fusable_gate(const Tensor* gate) {
     return measurement::decode_fusions_enabled() ? gate : nullptr;
 }
 
+// Unfused gate: the gate shares out's element order but may arrive in the model's aggregate
+// [D,Hq,W*B] shape, so it is viewed in out's [D,Hq,W,B] shape before the elementwise op.
+void apply_unfused_gate(const Tensor& gate, Tensor& out, cudaStream_t stream) {
+    const Tensor shaped = gate.view({out.ne[0], out.ne[1], out.ne[2], out.ne[3]});
+    sigmoid_mul(shaped, out, stream);
+}
+
 } // namespace
 
 std::size_t causal_softmax_attention_workspace_capacity_bytes(
@@ -394,7 +401,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     } else {
         throw std::invalid_argument(std::string(op) + ": unsupported KV cache storage");
     }
-    if (gate != nullptr && !applied) sigmoid_mul(*gate, out, execution.stream);
+    if (gate != nullptr && !applied) apply_unfused_gate(*gate, out, execution.stream);
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
@@ -443,7 +450,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     } else {
         throw std::invalid_argument(std::string(op) + ": unsupported KV cache storage");
     }
-    if (gate != nullptr && !applied) sigmoid_mul(*gate, out, execution.stream);
+    if (gate != nullptr && !applied) apply_unfused_gate(*gate, out, execution.stream);
 }
 
 } // namespace ninfer::ops

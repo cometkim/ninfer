@@ -67,6 +67,13 @@ ninfer_add_op_test(ninfer_softmax_attention_test
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/context.cpp"
   LIBRARIES ninfer_ops)
 
+# The gated attention forms with NINFER_BENCH_FUSIONS=0: every route applies the gate as a
+# separate sigmoid_mul, including batched decode/verify rows whose gate keeps the aggregate shape.
+add_test(NAME ninfer_softmax_attention_unfused_gate_test
+         COMMAND ninfer_softmax_attention_test --gate-only)
+set_tests_properties(ninfer_softmax_attention_unfused_gate_test PROPERTIES
+  ENVIRONMENT "NINFER_BENCH_FUSIONS=0" SKIP_RETURN_CODE 77)
+
 ninfer_add_op_test(ninfer_sliding_window_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sliding_window_attention.cpp"
   LIBRARIES ninfer_ops)
