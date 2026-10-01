@@ -192,6 +192,29 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      DeviceExecutionView execution);
 
 /**
+ * Sigmoid-gated forms of causal_softmax_attention and causal_softmax_attention_cached. `gate` is
+ * contiguous BF16 with out's element count and layout; null means the ungated forms above. The
+ * result is out = BF16(attention * sigmoid(gate)) elementwise. Routes that merge split partial
+ * state apply the gate in their output epilogue with the attention value still in FP32 (one
+ * rounding); routes that write the attention directly apply it as a separate sigmoid_mul over
+ * their BF16 output. Every other contract, including CUDA Graph update compatibility, is the
+ * ungated form's; the gate does not change workspace capacity.
+ */
+void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                              const Tensor& positions, const Tensor& valid_columns,
+                              const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
+                              float scale, PagedKVBatchLayerView cache,
+                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                              Tensor& out, const Tensor* gate, DeviceExecutionView execution);
+
+void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
+                                     AttentionHeadGeometry geometry, float scale,
+                                     const PagedKVLayerView& cache,
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                     DeviceExecutionView execution);
+
+/**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
  * head geometry, cache dtype, execution envelope and device SM count are fixed
  * implementation-profile inputs.

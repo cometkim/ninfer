@@ -18,6 +18,8 @@ struct CausalAttentionOperands {
     int visible_capacity;
     int head_dim;
     int query_heads;
+    // Optional sigmoid output gate with out's layout; merge epilogues apply it in their store.
+    const __nv_bfloat16* gate = nullptr;
 };
 
 struct CausalAppendInput {
@@ -48,7 +50,8 @@ struct CausalPartialStorage {
 };
 
 inline CausalAttentionOperands make_causal_operands(const Tensor& q, const Tensor& positions,
-                                                    Tensor& out, float scale, int capacity) {
+                                                    Tensor& out, float scale, int capacity,
+                                                    const Tensor* gate = nullptr) {
     return {static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const std::int32_t*>(positions.data),
             static_cast<__nv_bfloat16*>(out.data),
@@ -57,7 +60,8 @@ inline CausalAttentionOperands make_causal_operands(const Tensor& q, const Tenso
             q.ne[3],
             capacity,
             q.ne[0],
-            q.ne[1]};
+            q.ne[1],
+            gate != nullptr ? static_cast<const __nv_bfloat16*>(gate->data) : nullptr};
 }
 
 template <class Allocator>

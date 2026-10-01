@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/common/causal_operands.h"
 
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
@@ -43,7 +44,9 @@ __launch_bounds__(256) __global__
                                      const float* partial_l, const std::int32_t* positions,
                                      const std::int32_t* valid_columns, std::int32_t tokens,
                                      std::int32_t batch_size, CausalKvPartition partition,
-                                     __nv_bfloat16* out) {
+                                     __nv_bfloat16* out, const __nv_bfloat16* gate) {
+    // Every input is the preceding grouped kernel's partial state or call metadata.
+    pdl::wait_for_dependencies();
     static_assert(Geometry::kHeadDim == kCausalHeadDim);
     static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
     static_assert(!InverseRotation || DChunk == kCausalHeadDim);
@@ -103,10 +106,13 @@ __launch_bounds__(256) __global__
         normalized[tid] = value;
         __syncthreads();
         if (tid < 32)
-            causal_store_inverse_rotated_row<Geometry>(normalized, out, q_head, output_column);
+            causal_store_inverse_rotated_row<Geometry>(normalized, out, q_head, output_column,
+                                                       gate);
     } else {
-        causal_store_output(out + causal_q_index<Geometry>(q_head, d, output_column), value);
+        causal_store_gated_output(out, gate, causal_q_index<Geometry>(q_head, d, output_column),
+                                  value);
     }
+    pdl::publish();
 }
 
 template <class G, class S, bool MultiBatch, bool Masked, bool InverseRotation>
@@ -115,10 +121,11 @@ void launch_causal_natural_merge(const CausalAttentionOperands& p,
                                  CausalPartialView partial, cudaStream_t stream) {
     static_assert(S::kThreads == 256);
     const dim3 grid(G::QHeads, div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
-    causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>
-        <<<grid, S::kThreads, 0, stream>>>(partial.acc, partial.maximum, partial.sum, p.positions,
-                                           valid_columns, p.width, p.batch, partition, p.out);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_dependent(
+        {grid, dim3(S::kThreads), 0, stream},
+        causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>,
+        partial.acc, partial.maximum, partial.sum, p.positions, valid_columns, p.width, p.batch,
+        partition, p.out, p.gate));
 }
 
 } // namespace ninfer::ops::detail

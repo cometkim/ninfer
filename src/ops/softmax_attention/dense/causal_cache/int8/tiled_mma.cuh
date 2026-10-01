@@ -7,13 +7,17 @@
 
 namespace ninfer::ops::detail {
 
-template <typename Geometry, typename Schedule, typename Metadata>
+// Split (the fork's WI-K1a key-range split): grid.z divides each CTA's causal key-tile range
+// into contiguous segments; a segment writes unnormalized FP32 partial state (maximum in natural
+// scaled-score units) for causal_tiled_merge_kernel instead of the output. Segments past the
+// range carry neutral statistics. Without Split the kernel writes the output directly.
+template <typename Geometry, typename Schedule, typename Metadata, bool Split = false>
 __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
-    std::int32_t width) {
+    std::int32_t width, CausalPartialView partial) {
     constexpr int D             = 256;
     constexpr int Br            = Schedule::kQueryRows;
     constexpr int Bc            = Schedule::kKeyRows;
@@ -28,6 +32,9 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     constexpr int WorkerThreads = VWorkerWarps * 32;
     constexpr float Log2E       = kLog2E;
     constexpr unsigned FullMask = 0xffffffffu;
+    // f16-accumulate PV (fork WI-K1b): V is staged times 1/Bc and each tile promotes times Bc.
+    constexpr float PVPromote = static_cast<float>(Bc);
+    constexpr float PVGuard   = 1.0f / static_cast<float>(Bc);
 
     static_assert(GroupKc == 2);
     static_assert(PVNtPerWarp == 8);
@@ -59,7 +66,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const int tokens  = metadata.valid_tokens(width);
     if (q_head >= Geometry::QHeads || q0 >= width) { return; }
     if (q0 >= tokens) {
-        causal_zero_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid, Schedule::kThreads);
+        // Split segments leave dead rows to the merge, which writes them as zero.
+        if constexpr (!Split)
+            causal_zero_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
+                                       Schedule::kThreads);
         return;
     }
     const int base_pos              = positions[0];
@@ -68,6 +78,14 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     const int tile_rows     = min(Br, tokens - q0);
     const int max_query_abs = base_pos + q0 + tile_rows - 1;
     const int key_blocks    = max_query_abs / Bc + 1;
+    int kb_begin            = 0;
+    int kb_end              = key_blocks;
+    if constexpr (Split) {
+        const int splits = static_cast<int>(gridDim.z);
+        const int per    = (key_blocks + splits - 1) / splits;
+        kb_begin         = min(key_blocks, static_cast<int>(blockIdx.z) * per);
+        kb_end           = min(key_blocks, kb_begin + per);
+    }
 
     // Quantize Q cooperatively. One full warp rotates and encodes one D256 row at a time.
     for (int row = warp; row < Br; row += Schedule::kWarps) {
@@ -136,8 +154,10 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
         ninfer::ops::cp_commit();
     };
 
-    issue_kv_tile(0);
-    ninfer::ops::cp_wait<0>();
+    if (kb_begin < kb_end) {
+        issue_kv_tile(kb_begin * Bc);
+        ninfer::ops::cp_wait<0>();
+    }
     __syncthreads();
 
     const int gid      = lane >> 2;
@@ -175,7 +195,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     float running_l0     = 0.0f;
     float running_l1     = 0.0f;
     const float scale_l2 = scale * Log2E;
-    for (int kb = 0; kb < key_blocks; ++kb) {
+    for (int kb = kb_begin; kb < kb_end; ++kb) {
         const int k0 = kb * Bc;
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
@@ -324,7 +344,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                     __half vs     = __float2half_rn(0.0f);
                     if ((lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
                     vs = __shfl_sync(FullMask, vs, grp * 8);
-                    store_vec(dst, int8_kv_dequant_f16x8(&v_i8[key_l * D + d], vs));
+                    store_vec(dst,
+                              int8_kv_dequant_f16x8_guarded(&v_i8[key_l * D + d], vs, PVGuard));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }
@@ -332,7 +353,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
         }
         __syncthreads();
 
-        const bool has_next = kb + 1 < key_blocks;
+        const bool has_next = kb + 1 < kb_end;
         if (has_next) { issue_kv_tile((kb + 1) * Bc); }
 
         const int row_tile = warp % Schedule::kRowTiles;
@@ -348,6 +369,18 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             acc[n][3] *= alpha1;
         }
 
+        // Fork kernel-perf (WI-K1b): PV runs on the f16-accumulate MMA (2x the f32-accumulate
+        // issue rate on GeForce): each key tile accumulates into f16 fragments and promotes once
+        // into the f32 running sum. The staged V carries the 1/Bc guard, so a tile partial stays
+        // within max|v| of the FP16 range; the promotion scales the exact Bc back in the same FFMA
+        // that adds into the running sum. Outputs differ from FP32 accumulation by the FP16
+        // rounding of the per-tile partials.
+        unsigned hacc[PVNtPerWarp][2];
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            hacc[n][0] = 0u;
+            hacc[n][1] = 0u;
+        }
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
             unsigned pf[4];
@@ -363,12 +396,55 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                 const int vcol = global_n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_f16[vrow * D + causal_swizzle(vrow, vcol)]));
-                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                        vf[0], vf[1]);
+                mma_f16_f16acc(hacc[n][0], hacc[n][1], pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
+        }
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const float2 h0 = __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][0]));
+            const float2 h1 = __half22float2(*reinterpret_cast<const __half2*>(&hacc[n][1]));
+            acc[n][0]       = fmaf(PVPromote, h0.x, acc[n][0]);
+            acc[n][1]       = fmaf(PVPromote, h0.y, acc[n][1]);
+            acc[n][2]       = fmaf(PVPromote, h1.x, acc[n][2]);
+            acc[n][3]       = fmaf(PVPromote, h1.y, acc[n][3]);
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
+    }
+
+    if constexpr (Split) {
+        const int split = static_cast<int>(blockIdx.z);
+        if (warp < ProducerWarps && lid == 0) {
+            const int row0 = warp * 16 + gid;
+            const int row1 = row0 + 8;
+            if (row0 < tile_rows) {
+                const auto index = causal_stat_index<Geometry>(q_head, q0 + row0, split, width);
+                partial.maximum[index] = running_m0 * scale;
+                partial.sum[index]     = running_l0;
+            }
+            if (row1 < tile_rows) {
+                const auto index = causal_stat_index<Geometry>(q_head, q0 + row1, split, width);
+                partial.maximum[index] = running_m1 * scale;
+                partial.sum[index]     = running_l1;
+            }
+        }
+        const int row_tile = warp % Schedule::kRowTiles;
+        const int d_slice  = warp / Schedule::kRowTiles;
+        const int row0     = row_tile * 16 + gid;
+        const int row1     = row0 + 8;
+#pragma unroll
+        for (int n = 0; n < PVNtPerWarp; ++n) {
+            const int d0 = (d_slice * PVNtPerWarp + n) * 8 + 2 * lid;
+            if (row0 < tile_rows)
+                causal_store_partial_pair(partial.acc + causal_partial_index<Geometry>(
+                                                            q_head, d0, q0 + row0, split, width),
+                                          acc[n][0], acc[n][1]);
+            if (row1 < tile_rows)
+                causal_store_partial_pair(partial.acc + causal_partial_index<Geometry>(
+                                                            q_head, d0, q0 + row1, split, width),
+                                          acc[n][2], acc[n][3]);
+        }
+        return;
     }
 
     if (warp < ProducerWarps && lid == 0) {

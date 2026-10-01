@@ -11,6 +11,8 @@
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q5/q5_simt_launch.cuh"
 #include "ops/linear/q5/q5_gemv_launch.cuh"
+#include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
+#include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 
 #include <cuda_bf16.h>
 
@@ -213,19 +215,39 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,15]");
 }
 
+// Fork kernel-perf: the T=4 (MTP3 verify) pair keeps the fork's rowsplit SIMT kernels, which
+// measured faster than the unified Q5 direct-SIMT/Q4 SIMT pair inside the verify graph on
+// RTX 5090 (Q5 31.6 vs 35.9 us, Q4 14.3 vs 15.2 us per layer). Both kernels publish at exit
+// after their stores (REVIEW S1); Q4 launches into Q5's drain tail and joins it at exit.
 void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                    Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
-    using Q4Schedule = Q4GdnSimtR8T4Schedule;
-    using Q5Schedule = Q5A16DirectSimtSchedule<1, 4, 4, 4, 10, kHidden, true>;
-    // Q5 and Q4 publish disjoint rows; Q4 joins the Q5 producer at kernel exit.
-    launch_q5_a16_direct_simt<Q5Schedule, true>(q5_linear_operands(x, value_z_weight),
-                                                q5_projection_output(value, z),
-                                                LinearIdentityEpilogue{}, stream);
-    launch_q4_a16_simt<Q4Schedule, false, true, true>(
-        q4_linear_operands(x, qk_weight),
-        LinearBf16StridedOutput{static_cast<__nv_bfloat16*>(qk.data),
-                                static_cast<std::int64_t>(qk.nb[1] / sizeof(__nv_bfloat16)), 0},
-        LinearIdentityEpilogue{}, stream);
+    constexpr std::int32_t kQkRows     = 4096;
+    constexpr std::int32_t kZRows      = 6144;
+    constexpr std::int32_t kValueZRows = kValueRows + kZRows;
+    using Q4Schedule                   = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
+    constexpr int kQ5Threads           = 4 * 32;
+    const dim3 q4_grid(kQkRows / Q4Schedule::kRowsPerCta, 1u, 1u);
+    const dim3 q5_grid(kValueZRows, 1u, 1u);
+    const std::int32_t q4_out_ld = static_cast<std::int32_t>(qk.nb[1] / sizeof(__nv_bfloat16));
+    const std::int32_t q5_out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, 4, 5, kHidden, true, kValueRows,
+                                        Q5Split4StoreEpilogue, true, false>
+        <<<q5_grid, kQ5Threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(value_z_weight.qdata),
+            static_cast<const std::uint8_t*>(value_z_weight.qhigh),
+            static_cast<const std::uint8_t*>(value_z_weight.scales),
+            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
+            kValueZRows, q5_out_ld, kHidden, 4, value_z_weight.padded_shape[1], 5);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_dependent(
+        {q4_grid, dim3(Q4Schedule::kThreads), 0, stream},
+        q4_rowsplit_gemm_simt_kernel<Q4Schedule, true, false, 0, Q4SimtStoreEpilogue, false, true>,
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(qk_weight.qdata),
+        static_cast<const std::uint8_t*>(qk_weight.scales), static_cast<__nv_bfloat16*>(qk.data),
+        nullptr, q4_out_ld, 0, kQkRows, kHidden, 4, qk_weight.padded_shape[1],
+        Q4SimtStoreEpilogue{}));
 }
 
 } // namespace

@@ -3,9 +3,13 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/softmax_attention/common/causal_partition.h"
 
+#include <cstddef>
+
 namespace ninfer::ops::detail {
 
-enum class Nvfp4KvFamily { Grouped, ParallelGrouped, Tiled };
+// SmallT is the fork kernel-perf route (hq/plan.h, linear_kv_small_t_*), taking grouped widths
+// where it measured faster.
+enum class Nvfp4KvFamily { Grouped, ParallelGrouped, Tiled, SmallT };
 
 struct Nvfp4KvCausalPlan {
     static constexpr int kTokenTile = 8;
@@ -13,6 +17,11 @@ struct Nvfp4KvCausalPlan {
     int query_heads, width, batch, query_tile;
     CausalAttentionExecutionEnvelope envelope;
     CausalKvPartition partition;
+    // SmallT family only: split-grid capacity (linear_kv_small_t_splits).
+    int small_t_splits = 0;
+    // Grouped family: small-T partial bytes reserved for sub-envelope calls
+    // (linear_kv_small_t_reserve_bytes).
+    std::size_t small_t_reserve = 0;
 };
 
 Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,

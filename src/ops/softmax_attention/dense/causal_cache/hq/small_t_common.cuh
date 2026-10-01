@@ -7,10 +7,12 @@
 // only what both share: layout constants, device helpers, and the split reducer.
 
 #include "ops/common/math.cuh"
+#include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/softmax_attention/dense/causal_cache/hq/geometry.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kv_cache/hadamard_d256.cuh"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -129,6 +131,22 @@ causal_small_t_quantized_active_splits(int window, int launch_capacity, int toke
     return splits < launch_capacity ? splits : launch_capacity;
 }
 
+// Device split policy shared by one small-T partial kernel and its reducer: the default tiers
+// (BF16 and HQ), the measured INT8 specializations, or the quantized-row variant (FP8, NVFP4 and
+// FP8-K/NVFP4-V).
+enum class SmallTSplitPolicy { Default, Int8, Quantized };
+
+template <typename Geometry, SmallTSplitPolicy Policy>
+__device__ __forceinline__ int causal_small_t_policy_splits(int window, int launch_capacity,
+                                                            int tokens) {
+    if constexpr (Policy == SmallTSplitPolicy::Quantized) {
+        return causal_small_t_quantized_active_splits<Geometry>(window, launch_capacity, tokens);
+    } else {
+        return causal_small_t_active_splits<Geometry, Policy == SmallTSplitPolicy::Int8>(
+            window, launch_capacity, tokens);
+    }
+}
+
 // The narrow HQ tile uses four dimension-sliced warps with a smaller live register set.
 // Supply four CTAs per SM at long windows; linear codecs retain their own split policies.
 template <typename Geometry>
@@ -202,14 +220,21 @@ causal_merge_split_statistics(const float* partial_m, const float* partial_l, in
     return total;
 }
 
-template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset,
-          bool HqNarrow = false>
+// The gate is the op's sigmoid-gated-output input: out[i] = bf16(attn[i] * sigmoid(gate[i])),
+// one rounding (the attention value is not materialized in BF16 before the gate multiplies it;
+// op-development section 6.1). A null gate stores the plain attention. InverseRotation (codecs
+// that store V in the normalized D256 Hadamard frame) normalizes the whole row in one CTA, then
+// one warp rotates it back before the gated store.
+template <typename Geometry, int DChunk, SmallTSplitPolicy SplitPolicy, bool MultiBatch,
+          bool Masked, bool Offset, bool HqNarrow = false, bool InverseRotation = false>
 __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_kernel(
     const float* partial_acc, const float* partial_m, const float* partial_l,
-    const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    const std::int32_t* positions, const std::int32_t* valid_columns, const __nv_bfloat16* gate,
+    std::int32_t tokens, std::int32_t full_width, std::int32_t column_begin,
+    std::int32_t batch_size, std::int32_t split_count, __nv_bfloat16* out) {
+    pdl::sync();
     static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
+    static_assert(!InverseRotation || (DChunk == kCausalHeadDim && !HqNarrow));
 
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
@@ -256,7 +281,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     const int window = last_pos + 1;
     const int active_split_count =
         HqNarrow ? causal_hq_narrow_active_splits<Geometry>(window, split_count)
-                 : causal_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
+                 : causal_small_t_policy_splits<Geometry, SplitPolicy>(window, split_count, tokens);
 
     __shared__ float weights[256], warp_sums[8], scalars[2];
     const float head_l =
@@ -273,7 +298,30 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     }
 
     const float value = (head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    if constexpr (InverseRotation) {
+        __shared__ float normalized[kCausalHeadDim];
+        normalized[tid] = value;
+        __syncthreads();
+        if (tid < 32) {
+            float values[8];
+#pragma unroll
+            for (int r = 0; r < 8; ++r) { values[r] = normalized[tid + 32 * r]; }
+            normalized_hadamard_d256_inplace(values, tid);
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const std::int64_t index =
+                    causal_q_index<Geometry>(q_head, tid + 32 * r, output_column);
+                const float rotated = values[r];
+                out[index]          = __float2bfloat16(
+                    gate == nullptr ? rotated : rotated * sigmoid(__bfloat162float(gate[index])));
+            }
+        }
+    } else {
+        const std::int64_t output_index = causal_q_index<Geometry>(q_head, d, output_column);
+        out[output_index]               = __float2bfloat16(
+            gate == nullptr ? value : value * sigmoid(__bfloat162float(gate[output_index])));
+    }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail::hq

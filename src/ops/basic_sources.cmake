@@ -1,5 +1,6 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/wrapper/qk_norm_rope.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/add_bias.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/argmax.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/cast.cu"
@@ -13,6 +14,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/mtp_round.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/speculative_round.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/position.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/qk_norm_rope.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/prepare_ragged_prefix.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/prepare_masked_block.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/residual_add.cu"

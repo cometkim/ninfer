@@ -2,7 +2,9 @@
 #include "ninfer/ops/softmax_attention.h"
 
 #include "core/layout.h"
+#include "core/measurement_controls.h"
 #include "core/paged_kv_storage.h"
+#include "ninfer/ops/sigmoid_mul.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/fp8/plan.h"
@@ -267,6 +269,27 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     }
 }
 
+void validate_gate(const Tensor* gate, const Tensor& out, const char* op) {
+    if (gate != nullptr && (gate->dtype != DType::BF16 || !gate->is_contiguous() ||
+                            gate->data == nullptr || gate->numel() != out.numel())) {
+        throw std::invalid_argument(std::string(op) +
+                                    ": gate must be contiguous BF16 with out's element count");
+    }
+}
+
+// Output gate fusion: merged routes apply the gate in their output epilogue (one rounding);
+// NINFER_BENCH_FUSIONS=0 hands every route the ungated call and applies a separate sigmoid_mul.
+const Tensor* fusable_gate(const Tensor* gate) {
+    return measurement::decode_fusions_enabled() ? gate : nullptr;
+}
+
+// Unfused gate: the gate shares out's element order but may arrive in the model's aggregate
+// [D,Hq,W*B] shape, so it is viewed in out's [D,Hq,W,B] shape before the elementwise op.
+void apply_unfused_gate(const Tensor& gate, Tensor& out, cudaStream_t stream) {
+    const Tensor shaped = gate.view({out.ne[0], out.ne[1], out.ne[2], out.ne[3]});
+    sigmoid_mul(shaped, out, stream);
+}
+
 } // namespace
 
 std::size_t causal_softmax_attention_workspace_capacity_bytes(
@@ -321,12 +344,23 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution) {
+    causal_softmax_attention(q, k, v, positions, valid_columns, kv_table_rows, geometry, scale,
+                             cache, envelope, workspace, out, nullptr, execution);
+}
+
+void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                              const Tensor& positions, const Tensor& valid_columns,
+                              const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
+                              float scale, PagedKVBatchLayerView cache,
+                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                              Tensor& out, const Tensor* gate, DeviceExecutionView execution) {
     constexpr const char* op = "causal_softmax_attention";
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument(std::string(op) + ": SM count must be positive");
     }
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        geometry, envelope, scale, op);
+    validate_gate(gate, out, op);
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
         throw std::invalid_argument("causal_softmax_attention: k/v must be BF16");
     }
@@ -338,43 +372,36 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
 
+    const Tensor* fused = fusable_gate(gate);
+    bool applied        = false;
     if (cache.storage == KvCacheStorage::BFloat16) {
-        detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                         cache, envelope, workspace, out, execution);
-        return;
+        applied = detail::bf16_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                                   scale, cache, envelope, workspace, out, fused,
+                                                   execution);
+    } else if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+        applied =
+            detail::fp8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                            cache, envelope, workspace, out, fused, execution);
+    } else if (cache.storage == KvCacheStorage::Int8Group64) {
+        applied = detail::int8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                                   scale, cache, envelope, workspace, out, fused,
+                                                   execution);
+    } else if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+        applied = detail::nvfp4_kv_append_attention(q, k, v, positions, valid_columns,
+                                                    kv_table_rows, scale, cache, envelope,
+                                                    workspace, out, fused, execution);
+    } else if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        applied = detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                                   scale, cache, envelope, workspace, out, fused,
+                                                   execution);
+    } else if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        applied =
+            detail::hq_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                           cache, envelope, workspace, out, fused, execution);
+    } else {
+        throw std::invalid_argument(std::string(op) + ": unsupported KV cache storage");
     }
-
-    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
-        detail::fp8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, envelope, workspace, out, execution);
-        return;
-    }
-
-    if (cache.storage == KvCacheStorage::Int8Group64) {
-        detail::int8_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                         cache, envelope, workspace, out, execution);
-        return;
-    }
-
-    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
-        detail::nvfp4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                          cache, envelope, workspace, out, execution);
-        return;
-    }
-
-    if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-        detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                         cache, envelope, workspace, out, execution);
-        return;
-    }
-
-    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
-        detail::hq_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                       cache, envelope, workspace, out, execution);
-        return;
-    }
-
-    throw std::invalid_argument(std::string(op) + ": unsupported KV cache storage");
+    if (gate != nullptr && !applied) apply_unfused_gate(*gate, out, execution.stream);
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
@@ -383,49 +410,47 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      CausalAttentionExecutionEnvelope envelope,
                                      WorkspaceArena& workspace, Tensor& out,
                                      DeviceExecutionView execution) {
+    causal_softmax_attention_cached(q, positions, geometry, scale, cache, envelope, workspace, out,
+                                    nullptr, execution);
+}
+
+void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
+                                     AttentionHeadGeometry geometry, float scale,
+                                     const PagedKVLayerView& cache,
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                     DeviceExecutionView execution) {
     constexpr const char* op = "causal_softmax_attention_cached";
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument(std::string(op) + ": SM count must be positive");
     }
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
+    validate_gate(gate, out, op);
 
+    const Tensor* fused = fusable_gate(gate);
+    bool applied        = false;
     if (cache.storage == KvCacheStorage::BFloat16) {
-        detail::bf16_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                         execution);
-        return;
+        applied = detail::bf16_kv_cached_attention(q, positions, scale, cache, envelope, workspace,
+                                                   out, fused, execution);
+    } else if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+        applied = detail::fp8_kv_cached_attention(q, positions, scale, cache, envelope, workspace,
+                                                  out, fused, execution);
+    } else if (cache.storage == KvCacheStorage::Int8Group64) {
+        applied = detail::int8_kv_cached_attention(q, positions, scale, cache, envelope, workspace,
+                                                   out, fused, execution);
+    } else if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+        applied = detail::nvfp4_kv_cached_attention(q, positions, scale, cache, envelope, workspace,
+                                                    out, fused, execution);
+    } else if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        applied = detail::k8v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace,
+                                                   out, fused, execution);
+    } else if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        applied = detail::hq_kv_cached_attention(q, positions, scale, cache, envelope, workspace,
+                                                 out, fused, execution);
+    } else {
+        throw std::invalid_argument(std::string(op) + ": unsupported KV cache storage");
     }
-
-    if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
-        detail::fp8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                        execution);
-        return;
-    }
-
-    if (cache.storage == KvCacheStorage::Int8Group64) {
-        detail::int8_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                         execution);
-        return;
-    }
-
-    if (cache.storage == KvCacheStorage::Nvfp4Group16) {
-        detail::nvfp4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                          execution);
-        return;
-    }
-
-    if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-        detail::k8v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                         execution);
-        return;
-    }
-
-    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
-        detail::hq_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                       execution);
-        return;
-    }
-
-    throw std::invalid_argument(std::string(op) + ": unsupported KV cache storage");
+    if (gate != nullptr && !applied) apply_unfused_gate(*gate, out, execution.stream);
 }
 
 } // namespace ninfer::ops

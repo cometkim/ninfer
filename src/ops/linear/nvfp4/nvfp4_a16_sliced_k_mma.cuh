@@ -4,6 +4,7 @@
 // in BF16. The global weight divisor is applied to the complete FP32 reduction.
 // Activations remain the represented public BF16 inputs.
 
+#include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
@@ -118,10 +119,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     const int warp_k0                 = warp * kTileK;
     float accumulators[kTokenMmas][4] = {};
 
+    // Weight codes/scales are persistent, so every prologue weight tile is issued before the
+    // producer wait and only the activations follow it. The first commit group then carries all
+    // prologue weight tiles, and each later group still completes its own stage's activations.
+#pragma unroll
+    for (int stage = 0; stage < Schedule::kStages; ++stage) {
+        if (stage < kGroups) stage_codes(stage, stage * kBlockK);
+    }
+    pdl::wait_for_dependencies();
 #pragma unroll
     for (int stage = 0; stage < Schedule::kStages; ++stage) {
         if (stage < kGroups) {
-            stage_codes(stage, stage * kBlockK);
             stage_activation(stage, stage * kBlockK);
             cp_commit();
         }
@@ -247,6 +255,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             }
         }
     }
+    pdl::publish();
 }
 
 } // namespace ninfer::ops::detail

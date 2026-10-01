@@ -8,7 +8,7 @@ void causal_attention_small_t_hq_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, const Tensor* gate,
     std::int32_t multiprocessor_count, cudaStream_t stream) {
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                   static_cast<const __nv_bfloat16*>(v.data)};
@@ -20,6 +20,7 @@ void causal_attention_small_t_hq_launch(
         .width         = width,
         .batch_size    = q.ne[3],
         .multiprocessor_count = multiprocessor_count,
+        .gate                 = gate,
     };
     if (width < 1 || width > hq_token_tile<CausalD256H24Kv4>()) {
         throw std::invalid_argument("causal_attention_small_t_hq_launch: unsupported T");
@@ -42,7 +43,7 @@ void causal_attention_cached_small_t_hq_launch(const Tensor& q, const Tensor& po
                                                float scale, const PagedKVLayerView& cache,
                                                CausalAttentionExecutionEnvelope envelope,
                                                Tensor& partial_acc, Tensor& partial_m,
-                                               Tensor& partial_l, Tensor& out,
+                                               Tensor& partial_l, Tensor& out, const Tensor* gate,
                                                std::int32_t multiprocessor_count,
                                                cudaStream_t stream) {
     const CausalCachedInput input{};
@@ -54,6 +55,7 @@ void causal_attention_cached_small_t_hq_launch(const Tensor& q, const Tensor& po
         .width         = q.ne[2],
         .batch_size    = 1,
         .multiprocessor_count = multiprocessor_count,
+        .gate                 = gate,
     };
     const PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {

@@ -1,4 +1,6 @@
 #include "ops/softmax_attention/dense/causal_cache/k8v4/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/hq/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/hq/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/template_launch.cuh"
@@ -56,13 +58,16 @@ template <class Input>
 void execute_grouped(const Tensor& q, const Tensor& positions, float scale,
                      PagedKVBatchLayerView cache, const Tensor* valid, const Tensor* rows,
                      Input input, const K8V4KvCausalPlan& plan, WorkspaceArena& workspace,
-                     Tensor& out, cudaStream_t stream) {
+                     Tensor& out, const Tensor* gate, cudaStream_t stream) {
     const auto view =
         make_quantized_causal_cache_view<K8V4KvCacheView<Input::writes_cache>>(cache, valid, rows);
     auto scope         = workspace.scope();
+    const auto start   = workspace.used();
     const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
                                                   plan.partition.capacity, plan.batch);
-    const auto p = make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys);
+    pad_linear_kv_small_t_reserve(workspace, workspace.used() - start, plan.small_t_reserve);
+    const auto p =
+        make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys, gate);
     if (plan.query_heads == 24)
         grouped_instance<CausalD256H24Kv4>(p, view, input, plan.partition, partial.view(), stream);
     else
@@ -120,51 +125,67 @@ void execute_parallel(const CausalAttentionOperands& p, K8V4KvReadView cache,
 
 } // namespace
 
-void k8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+bool k8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid, const Tensor& rows,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, DeviceExecutionView execution) {
+                              Tensor& out, const Tensor* gate, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const auto plan           = make_k8v4_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                          execution.multiprocessor_count);
+    // The fork small-T pair appends the new columns itself; its reducer applies the gate.
+    if (plan.family == K8V4KvFamily::SmallT)
+        return linear_kv_small_t_append_attention(q, k, v, positions, valid, rows, scale, cache,
+                                                  envelope, plan.small_t_splits, workspace, out,
+                                                  gate, execution);
     if (plan.family != K8V4KvFamily::Grouped) {
         kv_cache_append_batch_launch(k, v, positions, valid, rows, cache, stream);
-        const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
+        // Both routes write the output through a merge epilogue that applies the gate.
+        const auto p =
+            make_causal_operands(q, positions, out, scale, envelope.max_visible_keys, gate);
         const auto view =
             make_quantized_causal_cache_view<K8V4KvCacheView<false>>(cache, &valid, &rows);
         if (plan.family == K8V4KvFamily::Tiled)
             k8v4_kv_tiled_attention(p, view, plan.partition, workspace, stream);
         else
             execute_parallel(p, view, plan, workspace, stream);
-    } else {
-        execute_grouped(q, positions, scale, cache, &valid, &rows,
-                        CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
-                                          static_cast<const __nv_bfloat16*>(v.data)},
-                        plan, workspace, out, stream);
+        return gate != nullptr;
     }
+    execute_grouped(q, positions, scale, cache, &valid, &rows,
+                    CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                                      static_cast<const __nv_bfloat16*>(v.data)},
+                    plan, workspace, out, gate, stream);
+    return gate != nullptr;
 }
 
-void k8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+bool k8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
                               const PagedKVLayerView& cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, DeviceExecutionView execution) {
+                              Tensor& out, const Tensor* gate, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const auto plan =
         make_k8v4_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
+    if (plan.family == K8V4KvFamily::SmallT)
+        return linear_kv_small_t_cached_attention(q, positions, scale, cache, envelope,
+                                                  plan.small_t_splits, workspace, out, gate,
+                                                  execution);
     const auto view = single_row_paged_kv_batch_view(cache);
-    if (plan.family == K8V4KvFamily::Tiled)
+    if (plan.family == K8V4KvFamily::Tiled) {
         k8v4_kv_tiled_attention(
-            make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
+            make_causal_operands(q, positions, out, scale, envelope.max_visible_keys, gate),
             make_quantized_causal_cache_view<K8V4KvCacheView<false>>(view), plan.partition,
             workspace, stream);
-    else if (plan.family == K8V4KvFamily::ParallelGrouped)
-        execute_parallel(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
-                         make_quantized_causal_cache_view<K8V4KvCacheView<false>>(view), plan,
-                         workspace, stream);
+        return gate != nullptr;
+    }
+    if (plan.family == K8V4KvFamily::ParallelGrouped)
+        execute_parallel(
+            make_causal_operands(q, positions, out, scale, envelope.max_visible_keys, gate),
+            make_quantized_causal_cache_view<K8V4KvCacheView<false>>(view), plan, workspace,
+            stream);
     else
         execute_grouped(q, positions, scale, view, nullptr, nullptr, CausalCachedInput{}, plan,
-                        workspace, out, stream);
+                        workspace, out, gate, stream);
+    return gate != nullptr;
 }
 
 } // namespace ninfer::ops::detail

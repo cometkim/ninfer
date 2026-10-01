@@ -26,4 +26,26 @@ __device__ __forceinline__ int4 int8_kv_dequant_f16x8(const std::int8_t* codes8,
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
+// Fork kernel-perf (WI-K1b): V staged for the f16-accumulate PV product carries the exact
+// power-of-two guard `guard` (1/key-tile), so a key tile's FP16 partial stays within max|v| of the
+// FP16 range however peaked its probability mass is; the promotion multiplies the key-tile size
+// back in FP32. Values below 2^-14/guard become FP16 subnormals.
+__device__ __forceinline__ int4 int8_kv_dequant_f16x8_guarded(const std::int8_t* codes8,
+                                                              __half scale, float guard) {
+    const int2 raw       = load_vec<int2>(codes8);
+    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
+    const __half2 s2     = __halves2half2(scale, scale);
+    const __half2 g2     = __float2half2_rn(guard);
+    unsigned packed[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __half2 code2 =
+            __floats2half2_rn(static_cast<float>(c[2 * i]), static_cast<float>(c[2 * i + 1]));
+        const __half2 value2 = __hmul2(__hmul2(code2, s2), g2);
+        packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
+    }
+    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
+                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
+}
+
 } // namespace ninfer::ops::detail

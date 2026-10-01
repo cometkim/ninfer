@@ -20,11 +20,11 @@ std::int32_t chunk_splits(const HqKvCausalPlan& plan, std::int32_t count,
 
 } // namespace
 
-void hq_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+bool hq_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid, const Tensor& rows,
                             float scale, PagedKVBatchLayerView cache,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                            Tensor& out, DeviceExecutionView execution) {
+                            Tensor& out, const Tensor* gate, DeviceExecutionView execution) {
     const auto plan =
         make_hq_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope, execution.multiprocessor_count);
     if (plan.family == HqKvFamily::Prompt) {
@@ -34,7 +34,7 @@ void hq_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         hq::causal_attention_prompt_hq_launch(
             q, k, v, positions, valid, rows, scale, cache, scratch.k, scratch.v, scratch.carry_acc,
             scratch.carry_m, scratch.carry_l, envelope.max_visible_keys, out, execution.stream);
-        return;
+        return false;
     }
     // The chunked family runs the small-T pair per token-tile chunk over the full tensors; the
     // fused append writes each chunk's own columns.
@@ -45,14 +45,15 @@ void hq_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             workspace, plan.query_heads, count, chunk_splits(plan, count, execution), plan.batch);
         hq::causal_attention_small_t_hq_launch(
             q, k, v, positions, valid, rows, scale, cache, envelope, begin, count, partial.acc,
-            partial.m, partial.l, out, execution.multiprocessor_count, execution.stream);
+            partial.m, partial.l, out, gate, execution.multiprocessor_count, execution.stream);
     }
+    return gate != nullptr;
 }
 
-void hq_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+bool hq_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
                             const PagedKVLayerView& cache,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                            Tensor& out, DeviceExecutionView execution) {
+                            Tensor& out, const Tensor* gate, DeviceExecutionView execution) {
     const auto plan =
         make_hq_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
     if (plan.family == HqKvFamily::Prompt) {
@@ -62,7 +63,7 @@ void hq_kv_cached_attention(const Tensor& q, const Tensor& positions, float scal
         hq::causal_attention_prompt_hq_attention_launch(
             q, positions, scale, cache, scratch.k, scratch.v, scratch.carry_acc, scratch.carry_m,
             scratch.carry_l, envelope.max_visible_keys, out, execution.stream);
-        return;
+        return false;
     }
     for (std::int32_t begin = 0; begin < plan.width; begin += plan.chunk_tokens) {
         const std::int32_t count = std::min(plan.chunk_tokens, plan.width - begin);
@@ -72,10 +73,45 @@ void hq_kv_cached_attention(const Tensor& q, const Tensor& positions, float scal
         Tensor q_chunk = q.slice(2, begin, count);
         Tensor position_chunk = positions.slice(0, begin, count);
         Tensor out_chunk      = out.slice(2, begin, count);
+        // The reducer indexes the gate like its (chunk) output.
+        const Tensor gate_chunk =
+            gate != nullptr
+                ? gate->view({out.ne[0], out.ne[1], out.ne[2], out.ne[3]}).slice(2, begin, count)
+                : Tensor{};
         hq::causal_attention_cached_small_t_hq_launch(
             q_chunk, position_chunk, scale, cache, envelope, partial.acc, partial.m, partial.l,
-            out_chunk, execution.multiprocessor_count, execution.stream);
+            out_chunk, gate != nullptr ? &gate_chunk : nullptr, execution.multiprocessor_count,
+            execution.stream);
     }
+    return gate != nullptr;
+}
+
+bool linear_kv_small_t_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                                        const Tensor& positions, const Tensor& valid,
+                                        const Tensor& rows, float scale,
+                                        PagedKVBatchLayerView cache,
+                                        CausalAttentionExecutionEnvelope envelope, int splits,
+                                        WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                        DeviceExecutionView execution) {
+    auto scope   = workspace.scope();
+    auto partial = hq::allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, q.ne[3]);
+    hq::causal_attention_small_t_linear_launch(
+        q, k, v, positions, valid, rows, scale, cache, envelope, partial.acc, partial.m, partial.l,
+        out, gate, execution.multiprocessor_count, execution.stream);
+    return gate != nullptr;
+}
+
+bool linear_kv_small_t_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+                                        const PagedKVLayerView& cache,
+                                        CausalAttentionExecutionEnvelope envelope, int splits,
+                                        WorkspaceArena& workspace, Tensor& out, const Tensor* gate,
+                                        DeviceExecutionView execution) {
+    auto scope   = workspace.scope();
+    auto partial = hq::allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, 1);
+    hq::causal_attention_cached_small_t_linear_launch(
+        q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out, gate,
+        execution.multiprocessor_count, execution.stream);
+    return gate != nullptr;
 }
 
 } // namespace ninfer::ops::detail

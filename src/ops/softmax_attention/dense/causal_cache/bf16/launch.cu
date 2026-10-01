@@ -67,11 +67,12 @@ template <class Input>
 void execute_grouped(const Tensor& q, Input input, const Tensor& positions, float scale,
                      PagedKVBatchLayerView cache, const Tensor* valid, const Tensor* rows,
                      const Bf16KvCausalPlan& plan, WorkspaceArena& workspace, Tensor& out,
-                     cudaStream_t stream) {
+                     const Tensor* gate, cudaStream_t stream) {
     auto scope   = workspace.scope();
     auto storage = allocate_causal_partials(workspace, plan.query_heads, plan.width,
                                             plan.partition.capacity, plan.batch);
-    const auto p = make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys);
+    const auto p =
+        make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys, gate);
     const auto view    = bf16_kv_cache_view<Input::writes_cache>(cache, valid, rows);
     const auto partial = storage.view();
     if (p.query_heads == 24)
@@ -81,31 +82,33 @@ void execute_grouped(const Tensor& q, Input input, const Tensor& positions, floa
 }
 } // namespace
 
-void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+bool bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, DeviceExecutionView execution) {
+                              Tensor& out, const Tensor* gate, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const auto plan           = make_bf16_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                          execution.multiprocessor_count);
     if (!plan.grouped()) {
+        // The tiled route writes the output directly; the caller applies the gate.
         kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
               bf16_kv_cache_view<false>(cache, &valid_columns, &table_rows), plan, stream);
-    } else {
-        execute_grouped(q,
-                        CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
-                                          static_cast<const __nv_bfloat16*>(v.data)},
-                        positions, scale, cache, &valid_columns, &table_rows, plan, workspace, out,
-                        stream);
+        return false;
     }
+    execute_grouped(q,
+                    CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
+                                      static_cast<const __nv_bfloat16*>(v.data)},
+                    positions, scale, cache, &valid_columns, &table_rows, plan, workspace, out,
+                    gate, stream);
+    return gate != nullptr;
 }
 
-void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
+bool bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float scale,
                               const PagedKVLayerView& cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, DeviceExecutionView execution) {
+                              Tensor& out, const Tensor* gate, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const auto plan =
         make_bf16_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
@@ -113,9 +116,10 @@ void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
     if (!plan.grouped()) {
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
               bf16_kv_cache_view<false>(view), plan, stream);
-    } else {
-        execute_grouped(q, CausalCachedInput{}, positions, scale, view, nullptr, nullptr, plan,
-                        workspace, out, stream);
+        return false;
     }
+    execute_grouped(q, CausalCachedInput{}, positions, scale, view, nullptr, nullptr, plan,
+                    workspace, out, gate, stream);
+    return gate != nullptr;
 }
 } // namespace ninfer::ops::detail
