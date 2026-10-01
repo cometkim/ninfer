@@ -10,6 +10,8 @@
 #include "ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_mma.cuh"
 
+#include <type_traits>
+
 namespace ninfer::ops::detail {
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a16_gemv(const Nvfp4A16Operands& p, Output output, Epilogue epilogue,
@@ -21,10 +23,23 @@ void launch_nvfp4_a16_gemv(const Nvfp4A16Operands& p, Output output, Epilogue ep
     static_assert(Schedule::kStaticK > 0, "SIMT phase specialization requires a static K instance");
     // The A16 decode/small-T families wait on their producer after staging weight data, so they
     // launch as programmatic dependents (no-op attribute when NINFER_BENCH_PDL=0).
-    CUDA_CHECK(pdl::launch_dependent({dim3(static_cast<unsigned>(p.rows / Schedule::kBlockRows)),
-                                      dim3(Schedule::kThreads), 0, stream},
-                                     nvfp4_a16_gemv_kernel<Schedule, Output, Epilogue, Rows>, p.x,
-                                     p.codes, p.scales, p.alpha, output, epilogue, rows, p.rows));
+    const pdl::LaunchConfig launch{dim3(static_cast<unsigned>(p.rows / Schedule::kBlockRows)),
+                                   dim3(Schedule::kThreads), 0, stream};
+    if constexpr (std::is_same_v<Rows, Nvfp4IdentityRows>) {
+        // Fork kernel-perf: identity rows use the fork's kernel shape (see the kernel's comment).
+        CUDA_CHECK(pdl::launch_dependent(
+            launch, nvfp4_a16_gemv_contiguous_kernel<Schedule, Output, Epilogue>, p.x, p.codes,
+            p.scales, p.alpha, epilogue, output));
+    } else if constexpr (requires { requires Rows::kBranchPairs; }) {
+        // Fork kernel-perf: one gate/up pair per warp uses the fork's dedicated pair kernel.
+        CUDA_CHECK(pdl::launch_dependent(
+            launch, nvfp4_a16_gemv_branch_pair_kernel<Schedule, Output, Epilogue>, p.x, p.codes,
+            p.scales, p.alpha, epilogue, output, p.rows));
+    } else {
+        CUDA_CHECK(
+            pdl::launch_dependent(launch, nvfp4_a16_gemv_kernel<Schedule, Output, Epilogue, Rows>,
+                                  p.x, p.codes, p.scales, p.alpha, output, epilogue, rows, p.rows));
+    }
 }
 
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>

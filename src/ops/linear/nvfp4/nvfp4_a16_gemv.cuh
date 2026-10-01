@@ -290,4 +290,107 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     }
     pdl::publish();
 }
+
+// Fork kernel-perf: the T=1 GEMV for contiguous, unpaired rows (identity row policy) keeps the
+// fork's pre-unification kernel shape. Same math, memory accesses and schedule as
+// nvfp4_a16_gemv_kernel: parent rows come straight from the CTA's M128 tile and each row is
+// reduced and finished in turn. With this shape nvcc keeps the unrolled main loop at 127-128
+// registers with more code loads in flight; the unified kernel compiles to 122 and measured
+// 4-8 % lower DRAM throughput on the N=5120 decode projections in the decode graph (sm_120a).
+template <class Schedule, class Output, class Epilogue>
+__global__ __launch_bounds__(
+    Schedule::kThreads,
+    Schedule::
+        kMinBlocksPerSm) void nvfp4_a16_gemv_contiguous_kernel(const __nv_bfloat16* __restrict__ x,
+                                                               const std::
+                                                                   uint8_t* __restrict__ codes,
+                                                               const std::
+                                                                   uint8_t* __restrict__ scales,
+                                                               float alpha, Epilogue epilogue,
+                                                               Output output) {
+    using Geometry = Nvfp4Geometry<128, Schedule::kStaticK>;
+    static_assert(Schedule::kBlockRows % 4 == 0 && 128 % Schedule::kBlockRows == 0);
+    __shared__ Nvfp4A16GemvSharedStorage<Geometry, Schedule> shared;
+    constexpr int kCtasPerM128 = 128 / Schedule::kBlockRows;
+    const int m_tile           = static_cast<int>(blockIdx.x) / kCtasPerM128;
+    const int cta_in_tile      = static_cast<int>(blockIdx.x) - m_tile * kCtasPerM128;
+    const int rmod_base        = cta_in_tile * (Schedule::kBlockRows / 4);
+    stage_nvfp4_scales<Geometry, Schedule>(scales, shared, m_tile, rmod_base);
+    // The staged scales are weights; the activation x is the first producer-dependent read.
+    pdl::wait_for_dependencies();
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
+    const int warp      = static_cast<int>(threadIdx.x) >> 5;
+    const int flat_row0 = warp * Schedule::kRowsPerWarp;
+    int parent_rows[Schedule::kRowsPerWarp];
+#pragma unroll
+    for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+        // Same M128 scale permutation as nvfp4_a16_parent_row for an identity policy.
+        const int flat_row     = flat_row0 + local_row;
+        parent_rows[local_row] = m_tile * 128 + rmod_base + flat_row / 4 + (flat_row & 3) * 32;
+    }
+    float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
+    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, alpha, parent_rows, flat_row0,
+                                           lane, accumulators);
+#pragma unroll
+    for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+        float total = 0.0F;
+#pragma unroll
+        for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain)
+            total += accumulators[local_row][chain];
+        total = warp_reduce_sum(total);
+        if (lane == 0) {
+            const float value[1]{total};
+            linear_finish_row(output, epilogue, parent_rows[local_row], 0, value, 1);
+        }
+    }
+    pdl::publish();
+}
+
+// Fork kernel-perf: the T=1 GEMV for branch pairs (one gate row and its up row, `rows / 2`
+// apart, per warp; the SwiGLU decode) keeps the fork's dedicated pair kernel shape: direct
+// scales, an entry wait, the pair's row from the CTA's M128 tile, and one paired epilogue per
+// warp. Same math and memory accesses as nvfp4_a16_gemv_kernel with Nvfp4SwiGluRows<1>.
+template <class Schedule, class Output, class Epilogue>
+__global__ __launch_bounds__(
+    Schedule::kThreads,
+    Schedule::
+        kMinBlocksPerSm) void nvfp4_a16_gemv_branch_pair_kernel(const __nv_bfloat16* __restrict__ x,
+                                                                const std::
+                                                                    uint8_t* __restrict__ codes,
+                                                                const std::
+                                                                    uint8_t* __restrict__ scales,
+                                                                float alpha, Epilogue epilogue,
+                                                                Output output, int rows) {
+    using Geometry = Nvfp4Geometry<128, Schedule::kStaticK>;
+    static_assert(Schedule::kRowsPerWarp == 2, "one gate/up pair per warp");
+    static_assert(Schedule::kScaleAccess == Nvfp4ScaleAccess::Direct,
+                  "branch pairs read their scales directly");
+    static_assert((Schedule::kWarpsPerCta % 4) == 0 && (128 % Schedule::kWarpsPerCta) == 0);
+    pdl::wait_for_dependencies();
+    __shared__ Nvfp4A16GemvSharedStorage<Geometry, Schedule> shared;
+    constexpr int kCtasPerM128 = 128 / Schedule::kWarpsPerCta;
+    const int block            = static_cast<int>(blockIdx.x);
+    const int m_tile           = block / kCtasPerM128;
+    const int cta_in_tile      = block - m_tile * kCtasPerM128;
+    const int lane             = static_cast<int>(threadIdx.x) & 31;
+    const int warp             = static_cast<int>(threadIdx.x) >> 5;
+    const int flat_pair        = cta_in_tile * Schedule::kWarpsPerCta + warp;
+    const int gate_row         = m_tile * 128 + (flat_pair >> 2) + (flat_pair & 3) * 32;
+    const int parent_rows[Schedule::kRowsPerWarp] = {gate_row, gate_row + rows / 2};
+
+    float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
+    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, alpha, parent_rows,
+                                           warp * Schedule::kRowsPerWarp, lane, accumulators);
+    float gate = 0.0F;
+    float up   = 0.0F;
+#pragma unroll
+    for (int chain = 0; chain < Schedule::kAccumulatorChains; ++chain) {
+        gate += accumulators[0][chain];
+        up += accumulators[1][chain];
+    }
+    gate = warp_reduce_sum(gate);
+    up   = warp_reduce_sum(up);
+    if (lane == 0) { epilogue.apply_pair(output, gate_row, 0, gate, up); }
+    pdl::publish();
+}
 } // namespace ninfer::ops::detail

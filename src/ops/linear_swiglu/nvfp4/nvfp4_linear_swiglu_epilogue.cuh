@@ -6,6 +6,9 @@ namespace ninfer::ops::detail {
 template <int RowsPerBranch>
 struct Nvfp4SwiGluRows {
     static constexpr bool kPaired = true;
+    // Fork kernel-perf: one gate/up row pair per warp selects the fork's dedicated pair kernel
+    // (nvfp4_a16_gemv_branch_pair_kernel) for the T=1 decode.
+    static constexpr bool kBranchPairs = RowsPerBranch == 1;
 
     __device__ __forceinline__ int weight_row(int begin, int row, int rows) const {
         return begin + row % RowsPerBranch + (row >= RowsPerBranch ? rows / 2 : 0);
