@@ -13,6 +13,8 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/hq/plan.h"
+#include "ops/softmax_attention/dense/causal_cache/hq/launch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -296,8 +298,15 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         return detail::nvfp4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                                 execution.multiprocessor_count);
 
-    return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
-                                           execution.multiprocessor_count);
+    if (cache_storage == KvCacheStorage::Fp8KeyNvfp4Value)
+        return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
+                                               execution.multiprocessor_count);
+
+    if (cache_storage == KvCacheStorage::HqE8Rice2B)
+        return detail::hq_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
+                                             execution.multiprocessor_count);
+
+    throw std::invalid_argument("causal_softmax_attention workspace: unsupported KV cache storage");
 }
 
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -347,8 +356,19 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
 
-    detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                                     envelope, workspace, out, execution);
+    if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                         cache, envelope, workspace, out, execution);
+        return;
+    }
+
+    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        detail::hq_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, scale,
+                                       cache, envelope, workspace, out, execution);
+        return;
+    }
+
+    throw std::invalid_argument(std::string(op) + ": unsupported KV cache storage");
 }
 
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
@@ -387,8 +407,19 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         return;
     }
 
-    detail::k8v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
-                                     execution);
+    if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        detail::k8v4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                         execution);
+        return;
+    }
+
+    if (cache.storage == KvCacheStorage::HqE8Rice2B) {
+        detail::hq_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                       execution);
+        return;
+    }
+
+    throw std::invalid_argument(std::string(op) + ": unsupported KV cache storage");
 }
 
 } // namespace ninfer::ops

@@ -19,6 +19,9 @@ int main(int argc, char** argv) {
                 const std::string_view name(argv[++i]);
                 storage     = name == "all" ? std::nullopt
                                             : std::optional(ninfer::test::parse_kv_cache_storage(name));
+                if (storage == ninfer::KvCacheStorage::HqE8Rice2B)
+                    throw std::invalid_argument(
+                        "hq-e8-2b has its own conformance test (ninfer_hq_attention_test)");
                 causal_only = true;
             } else
                 throw std::invalid_argument("invalid attention test option");
